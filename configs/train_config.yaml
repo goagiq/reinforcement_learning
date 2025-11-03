@@ -1,0 +1,98 @@
+# Training Configuration for NT8 RL Trading Strategy
+
+# Model Configuration
+model:
+  algorithm: "PPO"                    # PPO, SAC, DQN
+  learning_rate: 0.0003               # Adam learning rate
+  batch_size: 64                      # Batch size (increase if GPU available)
+  n_steps: 2048                       # Steps per update
+  gamma: 0.99                         # Discount factor
+  gae_lambda: 0.95                    # GAE lambda
+  clip_range: 0.2                     # PPO clip range
+  value_loss_coef: 0.5                # Value function loss coefficient
+  entropy_coef: 0.01                  # Entropy bonus coefficient
+  max_grad_norm: 0.5                  # Gradient clipping
+
+# Environment Configuration
+environment:
+  instrument: "ES"                     # ES or MES
+  timeframes: [1, 5, 15]             # Timeframes in minutes
+  state_features: 200                 # State dimension
+  action_space: "continuous"          # continuous or discrete
+  action_range: [-1.0, 1.0]          # Position size range
+  max_episode_steps: 10000            # Maximum steps per episode (episodes will terminate at this limit)
+                                      # Set to null/None to use full data length (may be very long)
+  lookback_bars: 20                   # Number of historical bars to use in state
+  
+  # Reward function parameters
+  reward:
+    pnl_weight: 1.0                   # PnL contribution to reward
+    transaction_cost: 0.0001          # Transaction cost per trade
+    risk_penalty: 0.5                  # Risk penalty coefficient
+    drawdown_penalty: 0.3             # Drawdown penalty
+
+# Training Configuration
+training:
+  total_timesteps: 1000000            # Total training steps
+  save_freq: 10000                    # Save checkpoint frequency
+  eval_freq: 5000                     # Evaluation frequency
+  device: "cuda"                      # cuda or cpu
+  num_envs: 1                         # Number of parallel environments
+  
+  # Data
+  train_split: 0.8                    # Train/test split
+  validation_split: 0.1               # Validation split
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 50000                   # Steps to wait without improvement
+    min_delta: 0.01                   # Minimum improvement
+
+# Risk Management
+risk_management:
+  max_position_size: 1.0              # Maximum position size (normalized)
+  max_drawdown: 0.20                  # Maximum drawdown (20%)
+  stop_loss_atr_multiplier: 2.0       # Stop loss as multiple of ATR
+  initial_capital: 100000.0          # Starting capital (for paper trading)
+  commission: 2.0                     # Commission per contract per side
+
+# Reasoning Engine (DeepSeek-R1)
+reasoning:
+  enabled: true                       # Enable reasoning layer
+  model: "deepseek-r1:8b"            # Ollama model name
+  pre_trade_validation: true         # Validate before trading
+  confidence_threshold: 0.7           # Minimum confidence to trade
+  timeout: 2.0                        # Reasoning timeout (seconds)
+
+# Logging
+logging:
+  log_dir: "logs"                     # Log directory
+  tensorboard: true                   # Enable TensorBoard
+  verbose: 1                          # Verbosity level (0, 1, 2)
+
+# Live Trading Configuration
+live_trading:
+  enabled: false                      # Enable live trading (USE WITH CAUTION)
+  paper_trading: true                 # Paper trading mode (default)
+
+# Bridge Configuration
+bridge:
+  host: "localhost"                  # NT8 bridge server host
+  port: 8888                         # NT8 bridge server port
+
+# Decision Gate Configuration
+decision_gate:
+  reasoning_weight: 0.4               # Weight for reasoning confidence
+  min_combined_confidence: 0.7        # Minimum confidence to execute trade
+  conflict_reduction_factor: 0.5      # Reduce position size when RL/reasoning disagree
+
+# Continuous Learning Configuration
+continuous_learning:
+  retrain_frequency: 1000            # Retrain every N new experiences
+  min_experiences: 500                # Minimum experiences before retraining
+  evaluation_episodes: 10             # Episodes for model evaluation
+  min_annotated_for_finetune: 100     # Minimum annotated experiences for DeepSeek fine-tuning
+  experience_buffer_size: 10000       # Maximum experiences to store
+  experience_storage: "data/experience_buffer"
+

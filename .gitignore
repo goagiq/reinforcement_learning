@@ -1,0 +1,50 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Node.js dependencies
+node_modules/
+frontend/node_modules/
+
+# User settings (may contain local paths)
+settings.json
+
+# Project-specific exclusions (per user preferences)
+input/
+output/
+cache/
+temp/
+templates/
+test_output/
+Results/
+
+# Model checkpoints and logs (can be large, regenerated)
+models/
+logs/
+
+# Data files (may contain proprietary data)
+data/raw/
+data/processed/
+data/experience_buffer/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Windows
+nul
+
+# Lock files (project-specific, should be committed but listed for clarity)
+# uv.lock - keeping this as it's useful for dependency management
