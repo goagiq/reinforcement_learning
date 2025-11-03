@@ -16,6 +16,11 @@ frontend/node_modules/
 # User settings (may contain local paths)
 settings.json
 
+# Environment variables (may contain sensitive information)
+.env
+.env.local
+.env.*.local
+
 # Project-specific exclusions (per user preferences)
 input/
 output/
