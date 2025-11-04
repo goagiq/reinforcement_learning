@@ -25,6 +25,9 @@ from src.nt8_bridge_server import NT8BridgeServer
 from src.reasoning_engine import ReasoningEngine, MarketState, RLRecommendation, TradeAction
 from src.risk_manager import RiskManager
 from src.drift_monitor import DriftMonitor, TradeMetrics
+from src.decision_gate import DecisionGate
+from src.agentic_swarm import SwarmOrchestrator
+import asyncio
 
 
 class LiveTradingSystem:
@@ -56,8 +59,18 @@ class LiveTradingSystem:
         # Initialize reasoning engine (if enabled)
         if config.get("reasoning", {}).get("enabled", True):
             print("Initializing reasoning engine...")
+            reasoning_config = config.get("reasoning", {})
+            
+            # Get API key from environment variable if not in config
+            import os
+            api_key = reasoning_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
+            
             self.reasoning_engine = ReasoningEngine(
-                model=config["reasoning"]["model"]
+                provider_type=reasoning_config.get("provider", "ollama"),
+                model=reasoning_config.get("model", "deepseek-r1:8b"),
+                api_key=api_key,
+                base_url=reasoning_config.get("base_url"),
+                timeout=int(reasoning_config.get("timeout", 2.0) * 60)  # Convert to seconds
             )
             self.reasoning_enabled = True
         else:
@@ -67,6 +80,43 @@ class LiveTradingSystem:
         # Initialize risk manager
         print("Initializing risk manager...")
         self.risk_manager = RiskManager(config["risk_management"])
+        
+        # Initialize decision gate
+        decision_gate_config = config.get("decision_gate", {
+            "rl_weight": 0.6,
+            "swarm_weight": 0.4,
+            "min_combined_confidence": 0.7,
+            "conflict_reduction_factor": 0.5,
+            "swarm_enabled": True,
+            "swarm_timeout": 20.0,
+            "fallback_to_rl_only": True
+        })
+        self.decision_gate = DecisionGate(decision_gate_config)
+        
+        # Initialize swarm orchestrator (if enabled)
+        swarm_config = config.get("agentic_swarm", {})
+        if swarm_config.get("enabled", True):
+            print("Initializing swarm orchestrator...")
+            try:
+                self.swarm_orchestrator = SwarmOrchestrator(
+                    config=config,
+                    reasoning_engine=self.reasoning_engine if self.reasoning_enabled else None,
+                    risk_manager=self.risk_manager
+                )
+                self.swarm_enabled = True
+                print("✅ Swarm orchestrator enabled")
+            except Exception as e:
+                print(f"⚠️  Failed to initialize swarm orchestrator: {e}")
+                print("   Falling back to RL-only mode")
+                self.swarm_orchestrator = None
+                self.swarm_enabled = False
+        else:
+            self.swarm_orchestrator = None
+            self.swarm_enabled = False
+        
+        # Manual approval tracking
+        self.manual_approval_enabled = config.get("manual_approval", {}).get("enabled", False)
+        self.pending_approvals = []  # Queue of pending trades awaiting approval
         
         # State tracking
         self.current_state = None
@@ -112,6 +162,8 @@ class LiveTradingSystem:
         print("="*60)
         print(f"Model: {self.model_path}")
         print(f"Reasoning: {'Enabled' if self.reasoning_enabled else 'Disabled'}")
+        print(f"Swarm: {'Enabled' if self.swarm_enabled else 'Disabled'}")
+        print(f"Manual Approval: {'Enabled' if self.manual_approval_enabled else 'Disabled'}")
         print(f"Mode: {'LIVE' if self.config.get('live_trading', False) else 'PAPER'}")
         print("="*60 + "\n")
         
@@ -201,83 +253,159 @@ class LiveTradingSystem:
             deterministic=True  # Use mean action for live trading
         )
         
-        # Create RL recommendation object
+        rl_action_value = float(action[0])
+        rl_confidence = min(abs(rl_action_value), 1.0)
+        
+        # Create RL recommendation object for swarm/reasoning
         rl_rec = RLRecommendation(
-            action=TradeAction.BUY if action[0] > 0.1 else (TradeAction.SELL if action[0] < -0.1 else TradeAction.HOLD),
-            confidence=min(abs(action[0]), 1.0)
+            action=TradeAction.BUY if rl_action_value > 0.1 else (TradeAction.SELL if rl_action_value < -0.1 else TradeAction.HOLD),
+            confidence=rl_confidence
         )
         
-        # Reason with DeepSeek (if enabled)
-        final_action = self._validate_with_reasoning(bar, rl_rec, action)
+        # Run swarm analysis (async, with timeout)
+        swarm_recommendation = None
+        if self.swarm_enabled and self.swarm_orchestrator:
+            swarm_recommendation = self._run_swarm_analysis(bar, rl_rec)
         
-        # Apply risk management
+        # Use DecisionGate to combine RL + Swarm
+        decision = self.decision_gate.make_decision(
+            rl_action=rl_action_value,
+            rl_confidence=rl_confidence,
+            swarm_recommendation=swarm_recommendation
+        )
+        
+        # Apply risk management (DecisionGate already handles basic risk, but apply final validation)
         final_action = self.risk_manager.validate_action(
-            final_action,
+            decision.action,
             current_position=self.current_position,
-            market_data=bar
+            market_data={
+                "price": bar.close,
+                "high": bar.high,
+                "low": bar.low,
+                "volume": bar.volume
+            }
         )
+        
+        # Check if should execute
+        if not self.decision_gate.should_execute(decision):
+            print(f"⚠️  Decision rejected: confidence={decision.confidence:.2f} < threshold")
+            self.stats["trades_rejected"] += 1
+            return
+        
+        # Manual approval workflow (if enabled)
+        if self.manual_approval_enabled:
+            if not self._request_manual_approval(decision, bar):
+                print("⚠️  Trade rejected by manual approval")
+                self.stats["trades_rejected"] += 1
+                return
         
         # Execute trade
         if abs(final_action - self.current_position) > 0.01:
             self._execute_trade(final_action, bar)
     
-    def _validate_with_reasoning(
+    def _run_swarm_analysis(
         self,
         bar: MarketBar,
-        rl_rec: RLRecommendation,
-        action_value: np.ndarray
-    ) -> np.ndarray:
+        rl_rec: RLRecommendation
+    ) -> Optional[Dict]:
         """
-        Validate RL recommendation with reasoning engine.
+        Run swarm analysis asynchronously with timeout.
         
         Returns:
-            Validated/adjusted action
+            Swarm recommendation dict or None if failed/timed out
         """
-        if not self.reasoning_enabled:
-            return action_value
+        if not self.swarm_enabled or not self.swarm_orchestrator:
+            return None
         
         try:
-            # Create market state
-            market_state = MarketState(
-                price_data={
+            # Prepare market data for swarm
+            market_data = {
+                "price_data": {
                     "open": bar.open,
                     "high": bar.high,
                     "low": bar.low,
                     "close": bar.close
                 },
-                volume_data={"volume": bar.volume},
-                indicators={},  # Would need to calculate
-                market_regime="trending",  # Would need to detect
-                timestamp=bar.timestamp.isoformat()
+                "volume_data": {"volume": bar.volume},
+                "indicators": {},  # Would need to calculate
+                "market_regime": "trending",  # Would need to detect
+                "timestamp": bar.timestamp.isoformat()
+            }
+            
+            # Prepare RL recommendation for swarm
+            rl_recommendation = {
+                "action": rl_rec.action.name,
+                "confidence": rl_rec.confidence,
+                "reasoning": getattr(rl_rec, "reasoning", None)
+            }
+            
+            # Run swarm analysis with timeout
+            swarm_result = self.swarm_orchestrator.analyze_sync(
+                market_data=market_data,
+                rl_recommendation=rl_recommendation,
+                current_position=self.current_position,
+                timeout=self.decision_gate.swarm_timeout
             )
             
-            # Get reasoning analysis
-            analysis = self.reasoning_engine.pre_trade_analysis(
-                market_state,
-                rl_rec
-            )
+            # Extract recommendation from swarm result
+            if swarm_result.get("status") == "success":
+                recommendation = swarm_result.get("recommendation", {})
+                if recommendation and recommendation.get("action") != "HOLD":
+                    return recommendation
             
-            # Decision gate: Combine RL and reasoning
-            if analysis.recommendation.value == "reject":
-                # Reasoning rejected - use more conservative action
-                adjusted_action = action_value * 0.5  # Reduce position size
-                self.stats["reasoning_disagreements"] += 1
-                print(f"⚠️  Reasoning rejected trade, reducing position size")
-            elif analysis.recommendation.value == "approve":
-                # Reasoning approved - use RL action
-                adjusted_action = action_value
-                self.stats["reasoning_agreements"] += 1
-            else:  # modify
-                # Reasoning suggests modification - blend
-                adjusted_action = action_value * 0.75
-                self.stats["reasoning_disagreements"] += 1
+            # Swarm timed out or failed
+            if swarm_result.get("status") == "timeout":
+                print(f"⚠️  Swarm analysis timed out after {self.decision_gate.swarm_timeout}s")
+            elif swarm_result.get("status") == "error":
+                print(f"⚠️  Swarm analysis error: {swarm_result.get('error', 'Unknown error')}")
             
-            return adjusted_action
+            return None
             
         except Exception as e:
-            print(f"Warning: Reasoning validation failed: {e}")
+            print(f"Warning: Swarm analysis failed: {e}")
             print("  Falling back to RL-only decision")
-            return action_value
+            return None
+    
+    def _request_manual_approval(
+        self,
+        decision: 'DecisionResult',
+        bar: MarketBar
+    ) -> bool:
+        """
+        Request manual approval for trade (if enabled).
+        
+        Args:
+            decision: Decision result from DecisionGate
+            bar: Current market bar
+        
+        Returns:
+            True if approved, False if rejected
+        """
+        # Add to pending approvals queue
+        approval_request = {
+            "timestamp": bar.timestamp.isoformat(),
+            "decision": decision,
+            "bar": {
+                "price": bar.close,
+                "volume": bar.volume
+            },
+            "approved": None  # None = pending, True/False = decision
+        }
+        
+        self.pending_approvals.append(approval_request)
+        
+        # TODO: In production, this would:
+        # 1. Send notification to UI/API
+        # 2. Wait for user response
+        # 3. Return True/False based on user decision
+        
+        # For now, auto-approve (can be changed to require actual approval)
+        print(f"📋 Manual approval request: {decision.action:.2f} @ {bar.close:.2f}")
+        print(f"   RL: {decision.rl_confidence:.2f}, Swarm: {decision.swarm_confidence:.2f}, Combined: {decision.confidence:.2f}")
+        print(f"   Agreement: {decision.agreement}")
+        
+        # Auto-approve for now (set to False to require manual approval)
+        return True
     
     def _execute_trade(self, target_position: float, bar: MarketBar):
         """

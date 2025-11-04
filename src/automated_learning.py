@@ -70,6 +70,21 @@ class AutomatedLearningOrchestrator:
                 except Exception as e:
                     print(f"⚠️  Could not load buffer: {e}")
     
+    def _get_reasoning_engine(self):
+        """Get reasoning engine instance from config"""
+        reasoning_config = self.config.get("reasoning", {})
+        if reasoning_config.get("enabled", True):
+            import os
+            api_key = reasoning_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
+            return ReasoningEngine(
+                provider_type=reasoning_config.get("provider", "ollama"),
+                model=reasoning_config.get("model", "deepseek-r1:8b"),
+                api_key=api_key,
+                base_url=reasoning_config.get("base_url"),
+                timeout=int(reasoning_config.get("timeout", 2.0) * 60)
+            )
+        return None
+    
     def check_and_retrain(self, agent: PPOAgent):
         """
         Check if retraining is needed and trigger if so.
@@ -81,7 +96,7 @@ class AutomatedLearningOrchestrator:
             self.learning_config,
             self.buffer,
             agent,
-            ReasoningEngine()
+            self._get_reasoning_engine()
         )
         
         if pipeline.should_retrain():
@@ -147,7 +162,7 @@ class AutomatedLearningOrchestrator:
             self.learning_config,
             self.buffer,
             None,  # Not needed for DeepSeek
-            ReasoningEngine()
+            self._get_reasoning_engine()
         )
         
         # Check if enough annotated experiences

@@ -61,13 +61,67 @@ risk_management:
   initial_capital: 100000.0          # Starting capital (for paper trading)
   commission: 2.0                     # Commission per contract per side
 
-# Reasoning Engine (DeepSeek-R1)
+# Reasoning Engine (LLM Provider)
 reasoning:
   enabled: true                       # Enable reasoning layer
-  model: "deepseek-r1:8b"            # Ollama model name
+  provider: "ollama"                  # Provider: "ollama", "deepseek_cloud", or "grok"
+  model: "deepseek-r1:8b"            # Model name (provider-specific)
+  api_key: null                       # API key (required for cloud providers, set via environment variable or settings)
+  base_url: null                      # Base URL (optional, uses provider defaults if null)
   pre_trade_validation: true         # Validate before trading
   confidence_threshold: 0.7           # Minimum confidence to trade
   timeout: 2.0                        # Reasoning timeout (seconds)
+
+# Agentic Swarm Configuration
+agentic_swarm:
+  enabled: true                       # Enable agentic swarm system
+  provider: "ollama"                  # Uses existing LLM provider from reasoning config
+  max_handoffs: 10                    # Maximum agent handoffs
+  max_iterations: 15                  # Maximum total iterations
+  execution_timeout: 20.0             # Total execution timeout (seconds)
+  node_timeout: 5.0                   # Per-agent timeout (seconds)
+  cache_ttl: 300                      # Cache TTL (seconds) - 5 minutes
+  
+  # Market Research Agent Configuration
+  market_research:
+    instruments: ["ES", "NQ", "RTY", "YM"]  # Instruments to analyze
+    correlation_window: 20            # Bars for correlation calculation
+    divergence_threshold: 0.1         # Divergence detection threshold
+  
+  # Sentiment Agent Configuration
+  sentiment:
+    sources: ["newsapi"]              # Free sentiment sources
+    newsapi_key: null                  # Set via NEWSAPI_KEY env var
+    sentiment_window: 3600            # Sentiment window (seconds) - 1 hour
+  
+  # Analyst Agent Configuration
+  analyst:
+    deep_reasoning: true              # Enable deep reasoning
+    conflict_detection: true           # Detect conflicts between sources
+  
+  # Recommendation Agent Configuration
+  recommendation:
+    risk_integration: true            # Integrate with RiskManager
+    position_sizing: true             # Calculate position sizes
+
+# Decision Gate Configuration
+decision_gate:
+  rl_weight: 0.6                      # RL agent weight (60%)
+  swarm_weight: 0.4                   # Swarm agent weight (40%)
+  min_combined_confidence: 0.7        # Minimum confidence to execute trade
+  conflict_reduction_factor: 0.5      # Reduce confidence when RL and Swarm disagree
+  swarm_enabled: true                 # Enable swarm integration
+  swarm_timeout: 20.0                  # Swarm execution timeout (seconds)
+  fallback_to_rl_only: true           # Fallback to RL-only if swarm fails
+
+# Manual Approval Configuration
+manual_approval:
+  enabled: false                       # Enable manual approval workflow (requires UI integration)
+  auto_approve_timeout: 30.0          # Auto-approve after timeout (seconds, 0 = no timeout)
+  require_approval_for:               # Require approval for these conditions
+    - "high_risk_trades"               # High risk trades
+    - "conflicting_signals"            # When RL and Swarm disagree
+    - "large_position_sizes"           # Large position sizes (>0.8)
 
 # Logging
 logging:
@@ -85,11 +139,6 @@ bridge:
   host: "localhost"                  # NT8 bridge server host
   port: 8888                         # NT8 bridge server port
 
-# Decision Gate Configuration
-decision_gate:
-  reasoning_weight: 0.4               # Weight for reasoning confidence
-  min_combined_confidence: 0.7        # Minimum confidence to execute trade
-  conflict_reduction_factor: 0.5      # Reduce position size when RL/reasoning disagree
 
 # Continuous Learning Configuration
 continuous_learning:

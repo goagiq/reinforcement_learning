@@ -1,14 +1,14 @@
 """
 Deep Reasoning & Reflection Engine for NT8 RL Trading Strategy
-Uses DeepSeek-R1:8b via Ollama for pre-trade analysis and post-trade reflection.
+Supports multiple LLM providers: Ollama, DeepSeek Cloud API, Grok (xAI)
 """
 
 import json
-import requests
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime
+from src.llm_providers import get_provider, BaseLLMProvider
 
 
 class TradeAction(Enum):
@@ -81,66 +81,70 @@ class ReflectionInsight:
 
 
 class ReasoningEngine:
-    """Deep reasoning and reflection engine using DeepSeek-R1"""
+    """Deep reasoning and reflection engine using configurable LLM providers"""
     
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "deepseek-r1:8b"):
-        self.base_url = base_url
-        self.model = model
-        self.timeout = 600  # seconds - DeepSeek-R1 needs more time for reasoning
-    
-    def _call_ollama(self, prompt: str, system_prompt: Optional[str] = None, stream: bool = False) -> str:
-        """Call Ollama API using chat() endpoint with streaming support"""
-        url = f"{self.base_url}/api/chat"
+    def __init__(
+        self,
+        provider_type: str = "ollama",
+        model: str = "deepseek-r1:8b",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: int = 600
+    ):
+        """
+        Initialize reasoning engine with specified provider.
         
+        Args:
+            provider_type: "ollama", "deepseek_cloud", or "grok"
+            model: Model name (provider-specific)
+            api_key: API key (required for cloud providers)
+            base_url: Base URL (optional, uses defaults if not provided)
+            timeout: Request timeout in seconds
+        """
+        self.provider_type = provider_type.lower()
+        self.model = model
+        self.timeout = timeout
+        
+        # Initialize provider
+        provider_kwargs = {}
+        if self.provider_type == "ollama":
+            provider_kwargs["base_url"] = base_url or "http://localhost:11434"
+        elif self.provider_type in ["deepseek_cloud", "grok"]:
+            if not api_key:
+                raise ValueError(f"api_key is required for {self.provider_type} provider")
+            provider_kwargs["api_key"] = api_key
+            if base_url:
+                provider_kwargs["base_url"] = base_url
+        
+        self.provider = get_provider(self.provider_type, **provider_kwargs)
+    
+    def _call_llm(self, prompt: str, system_prompt: Optional[str] = None, stream: bool = False) -> str:
+        """Call LLM provider using unified interface"""
         # Build messages
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": stream,
-            "options": {
-                "temperature": 0.3,  # Lower temperature for more focused reasoning
-                "top_p": 0.9,
-            }
-        }
+        # Adjust model name for cloud providers if needed
+        model_name = self.model
+        if self.provider_type == "deepseek_cloud":
+            # DeepSeek Cloud uses different model names
+            if "deepseek-r1" in model_name.lower():
+                model_name = "deepseek-chat"  # Use DeepSeek Chat for now (R1 may need different endpoint)
+        elif self.provider_type == "grok":
+            # Grok model names
+            if "grok" not in model_name.lower():
+                model_name = "grok-beta"  # Default Grok model
         
-        try:
-            if stream:
-                # Stream response - no timeout to allow for long reasoning
-                response = requests.post(url, json=payload, timeout=None, stream=True)
-                response.raise_for_status()
-                
-                full_content = ""
-                for line in response.iter_lines():
-                    if line:
-                        try:
-                            chunk = json.loads(line)
-                            if "message" in chunk and "content" in chunk["message"]:
-                                content = chunk["message"]["content"]
-                                full_content += content
-                            if chunk.get("done", False):
-                                break
-                        except json.JSONDecodeError:
-                            continue
-                
-                return full_content
-            else:
-                # Non-streaming response with extended timeout
-                response = requests.post(url, json=payload, timeout=self.timeout)
-                response.raise_for_status()
-                result = response.json()
-                return result.get("message", {}).get("content", "")
-                
-        except requests.exceptions.Timeout:
-            print(f"Warning: Ollama request timed out after {self.timeout}s. DeepSeek-R1 needs time for reasoning.")
-            return ""
-        except requests.exceptions.RequestException as e:
-            print(f"Error calling Ollama: {e}")
-            return ""
+        return self.provider.chat(
+            messages=messages,
+            model=model_name,
+            temperature=0.3,  # Lower temperature for more focused reasoning
+            top_p=0.9,
+            stream=stream,
+            timeout=self.timeout
+        )
     
     def pre_trade_analysis(
         self,
@@ -188,7 +192,7 @@ CONFIDENCE: [0.0-1.0]
 RISK_LEVEL: [LOW/MEDIUM/HIGH]
 """
         
-        response = self._call_ollama(prompt, system_prompt)
+        response = self._call_llm(prompt, system_prompt)
         
         # Parse response
         analysis = self._parse_pre_trade_response(response, rl_recommendation)
@@ -296,7 +300,7 @@ Please reflect and analyze:
 Provide detailed reasoning with specific, actionable insights.
 """
         
-        response = self._call_ollama(prompt, system_prompt)
+        response = self._call_llm(prompt, system_prompt)
         
         # Parse reflection
         insight = self._parse_reflection_response(response, trade_result)
@@ -369,7 +373,7 @@ Classify the market regime:
 Provide reasoning for your classification.
 """
         
-        response = self._call_ollama(prompt, system_prompt)
+        response = self._call_llm(prompt, system_prompt)
         
         # Parse regime analysis
         regime_info = self._parse_regime_response(response)
