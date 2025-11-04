@@ -205,7 +205,7 @@ class TradingEnvironment(gym.Env):
         return features[:expected_size]
     
     def _calculate_reward(self, prev_pnl: float, current_pnl: float) -> float:
-        """Calculate reward based on PnL and risk"""
+        """Calculate reward based on PnL and risk - optimized for learning"""
         # PnL change (normalized by initial capital)
         pnl_change = (current_pnl - prev_pnl) / self.initial_capital
         
@@ -218,28 +218,47 @@ class TradingEnvironment(gym.Env):
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
         
-        # Reward components - focus more on PnL, less on penalties
-        # Reduce penalty weights to allow positive rewards when PnL is positive
+        # OPTIMIZATION 1: Further reduced penalties to allow positive rewards
+        # Risk penalty: Reduced from 0.5 * 0.1 = 0.05 to 0.2 * 0.05 = 0.01
+        # Drawdown penalty: Only penalize if DD > 20% (was 15%), and reduced coefficient
+        risk_penalty_coef = self.reward_config.get("risk_penalty", 0.5) * 0.05  # Further reduced: 0.5 -> 0.025
+        drawdown_penalty_coef = self.reward_config.get("drawdown_penalty", 0.3) * 0.05  # Further reduced: 0.3 -> 0.015
+        
+        # Base reward components - focus heavily on PnL
         reward = (
             self.reward_config["pnl_weight"] * pnl_change
-            - self.reward_config["risk_penalty"] * 0.1 * drawdown  # Reduced drawdown penalty
-            - self.reward_config["drawdown_penalty"] * 0.1 * max(0, self.max_drawdown - 0.15)  # Only penalize if DD > 15%
+            - risk_penalty_coef * drawdown  # Minimal drawdown penalty
+            - drawdown_penalty_coef * max(0, self.max_drawdown - 0.20)  # Only penalize if DD > 20%
         )
         
-        # Transaction cost - only apply a minimal holding cost
-        # Don't penalize every step heavily - this was causing consistent negative rewards
-        if self.state and abs(self.state.position) > 0.01:
-            # Very small holding cost (0.1% of transaction cost per step)
-            holding_cost = self.transaction_cost * 0.001
-            reward -= holding_cost
+        # OPTIMIZATION 2: Add exploration bonus for trading activity
+        if self.state:
+            position_size = abs(self.state.position)
+            if position_size > 0.01:
+                # Small bonus for having a position (encourages exploration)
+                exploration_bonus = 0.0001 * position_size  # Tiny bonus per position size
+                reward += exploration_bonus
+                
+                # Minimal holding cost (reduced further)
+                holding_cost = self.transaction_cost * 0.0005  # Reduced from 0.001 to 0.0005
+                reward -= holding_cost
+            else:
+                # Small penalty for not trading (encourages trading)
+                reward -= 0.00005  # Very small penalty for staying flat
         
-        # Small bonus for positive PnL change to encourage profitable moves
+        # OPTIMIZATION 3: Enhanced profit bonus and reduced loss penalty
         if pnl_change > 0:
-            reward += abs(pnl_change) * 0.1  # Small bonus multiplier for profits
+            # Larger bonus for profits to strongly encourage profitable trades
+            reward += abs(pnl_change) * 0.2  # Increased from 0.1 to 0.2
+        elif pnl_change < 0:
+            # Reduced penalty for losses (learning opportunity)
+            # pnl_change is already negative, so we add back some of the penalty
+            # This reduces the negative impact of losses to encourage learning
+            loss_mitigation = abs(pnl_change) * 0.3  # Reduce loss penalty by 30%
+            reward += loss_mitigation  # Add back some of the loss (reduces penalty)
         
-        # Scale reward moderately (not 100x!) to help with learning
-        # But keep it reasonable - scale by 10 instead of 100
-        reward *= 10.0
+        # OPTIMIZATION 4: Reduced scaling (5x instead of 10x) for more granular learning
+        reward *= 5.0  # Reduced from 10.0 to 5.0
         
         return reward
     

@@ -3,7 +3,7 @@
 # Model Configuration
 model:
   algorithm: "PPO"                    # PPO, SAC, DQN
-  learning_rate: 0.0003               # Adam learning rate
+  learning_rate: 0.0005               # Increased from 0.0003 for faster learning
   batch_size: 128                     # Batch size (increased for Turbo mode - with 50x multiplier = 6400 batch size)
   n_steps: 4096                       # Steps per update (INCREASED from 2048 - larger buffer = more data per update = more GPU work)
   n_epochs: 30                        # Epochs per update (increased from default 10 - more training per update = more GPU work)
@@ -11,7 +11,7 @@ model:
   gae_lambda: 0.95                    # GAE lambda
   clip_range: 0.2                     # PPO clip range
   value_loss_coef: 0.5                # Value function loss coefficient
-  entropy_coef: 0.01                  # Entropy bonus coefficient
+  entropy_coef: 0.025                 # Increased from 0.01 to encourage more exploration (prevents "no trading" convergence)
   max_grad_norm: 0.5                  # Gradient clipping
   
   # Network architecture (for future training - larger model = more VRAM usage)
@@ -28,12 +28,12 @@ environment:
                                       # Set to null/None to use full data length (may be very long)
   lookback_bars: 20                   # Number of historical bars to use in state (NOTE: Increasing this would break existing checkpoints - only change if starting fresh)
   
-  # Reward function parameters
+  # Reward function parameters (optimized for learning)
   reward:
     pnl_weight: 1.0                   # PnL contribution to reward
     transaction_cost: 0.0001          # Transaction cost per trade
-    risk_penalty: 0.5                  # Risk penalty coefficient
-    drawdown_penalty: 0.3             # Drawdown penalty
+    risk_penalty: 0.2                  # Reduced from 0.5 to allow positive rewards
+    drawdown_penalty: 0.1             # Reduced from 0.3 to allow positive rewards
 
 # Training Configuration
 training:
