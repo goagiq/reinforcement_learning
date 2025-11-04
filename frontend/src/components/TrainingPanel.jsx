@@ -110,6 +110,8 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const watchdogIntervalRef = useRef(null)
   const prevMetricsRef = useRef(null) // Store previous metrics for comparison
   const lastPollTimeRef = useRef(Date.now()) // Store last poll time so refresh can update it
+  const startupPhaseRef = useRef(true) // Track if we're in startup phase (first 30 seconds)
+  const startupStartTimeRef = useRef(Date.now()) // Track when polling started
   
   // Keep ref updated without triggering re-renders
   useEffect(() => {
@@ -139,6 +141,9 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [latestCheckpoint, setLatestCheckpoint] = useState(null)
   const [messages, setMessages] = useState([])
   const [ws, setWs] = useState(null)
+  const [trainingMode, setTrainingMode] = useState('quiet') // 'quiet', 'performance', or 'turbo'
+  const [turboModeEnabled, setTurboModeEnabled] = useState(false)
+  const [manualTriggerLoading, setManualTriggerLoading] = useState(false)
   
   // Default reasoning model using universal default setting
   useEffect(() => {
@@ -289,6 +294,58 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     }
   }, [onModelsChange])
 
+  // Load training mode from settings
+  const loadTrainingMode = async () => {
+    try {
+      const response = await axios.get('/api/settings/get')
+      if (response.data.performance_mode) {
+        setTrainingMode(response.data.performance_mode)
+      }
+      // Check for turbo_training_mode - it might be missing if setting wasn't saved yet
+      const turboEnabled = response.data.turbo_training_mode === true
+      setTurboModeEnabled(turboEnabled)
+      
+      console.log('[TrainingPanel] Loaded training mode from settings:', {
+        performance_mode: response.data.performance_mode,
+        turbo_training_mode: response.data.turbo_training_mode,
+        turboEnabled: turboEnabled
+      })
+      
+      // If turbo mode is enabled but not in settings, log a warning
+      if (response.data.turbo_training_mode === undefined && turboEnabled) {
+        console.warn('[TrainingPanel] Turbo mode enabled in UI but not saved in settings.json. Please save settings again.')
+      }
+    } catch (error) {
+      console.error('Failed to load training mode:', error)
+    }
+  }
+  
+  useEffect(() => {
+    loadTrainingMode()
+    
+    // Reload when settings might have changed (listen to storage events)
+    const handleSettingsChange = () => {
+      loadTrainingMode()
+    }
+    
+    window.addEventListener('storage', handleSettingsChange)
+    window.addEventListener('defaultModelChanged', handleSettingsChange)
+    
+    // Also poll settings periodically during training (every 5 seconds)
+    // This ensures the indicator updates when turbo mode is toggled
+    const settingsPollInterval = setInterval(() => {
+      if (training) {
+        loadTrainingMode()
+      }
+    }, 5000)
+    
+    return () => {
+      window.removeEventListener('storage', handleSettingsChange)
+      window.removeEventListener('defaultModelChanged', handleSettingsChange)
+      clearInterval(settingsPollInterval)
+    }
+  }, [training]) // Re-run when training state changes
+  
   // Load available config files on mount
   useEffect(() => {
     const loadConfigs = async () => {
@@ -421,7 +478,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           while (retries <= maxRetries && isMounted) {
             try {
               response = await axios.get('/api/training/status', { 
-                timeout: 5000,
+                timeout: 10000, // Increased to 10 seconds to handle slow backend responses during startup
                 validateStatus: (status) => status < 500 // Don't throw on 4xx, only 5xx
               })
               break // Success, exit retry loop
@@ -446,6 +503,23 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           
           const status = response.data.status
           setTrainingStatus(response.data)
+          
+          // Update training mode from backend if provided (more accurate than settings)
+          if (response.data.training_mode && response.data.training_mode.performance_mode) {
+            const backendMode = response.data.training_mode.performance_mode
+            if (backendMode === 'turbo') {
+              setTurboModeEnabled(true)
+              setTrainingMode('performance') // Keep performance as base, turbo overrides
+            } else {
+              setTrainingMode(backendMode)
+              if (backendMode !== 'turbo') {
+                setTurboModeEnabled(false)
+              }
+            }
+          } else if (status === 'running' || status === 'starting') {
+            // Fallback: refresh from settings if backend doesn't provide mode
+            loadTrainingMode()
+          }
           
           // Update training metrics if available
           // Only update if metrics actually contain data (not empty object during initialization)
@@ -533,14 +607,26 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           // Update last poll time even on error so watchdog knows we're still trying
           lastPollTime = Date.now()
           
+          // Track if we're still in startup phase (first 30 seconds or first 10 polls)
+          const isStartupPhase = Date.now() - startupStartTimeRef.current < 30000 || pollCount < 10
+          startupPhaseRef.current = isStartupPhase
+          
           // Don't stop polling on error - just log it
           if (isMounted) {
             const errorMsg = error.response 
               ? `HTTP ${error.response.status}: ${error.response.statusText}` 
               : error.message || 'Unknown error'
-            console.error(`[TrainingPanel] Failed to check training status (poll #${pollId}):`, errorMsg)
-            if (error.code) {
-              console.error(`[TrainingPanel] Error code:`, error.code)
+            
+            // Only log errors after startup phase to reduce console noise
+            // Timeouts during startup are normal and expected
+            if (!isStartupPhase || error.code !== 'ECONNABORTED') {
+              console.error(`[TrainingPanel] Failed to check training status (poll #${pollId}):`, errorMsg)
+              if (error.code) {
+                console.error(`[TrainingPanel] Error code:`, error.code)
+              }
+            } else {
+              // Debug level for startup timeouts
+              console.debug(`[TrainingPanel] Startup timeout (poll #${pollId}) - will retry`)
             }
             // Still try to update with last known status if available
             // Don't clear metrics - keep showing last known values
@@ -580,6 +666,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
       checkStatus()
       lastPollTime = Date.now()
       lastPollTimeRef.current = lastPollTime
+      startupStartTimeRef.current = Date.now() // Record when polling starts
       
           pollingIntervalRef.current = setInterval(() => {
             if (isMounted) {
@@ -688,6 +775,34 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
       setTraining(false)
     } catch (error) {
       console.error('Failed to stop training:', error)
+    }
+  }
+
+  const handleManualRetrainTrigger = async () => {
+    setManualTriggerLoading(true)
+    try {
+      const response = await axios.post('/api/settings/auto-retrain/trigger-manual')
+      console.log('Manual retrain triggered:', response.data)
+      
+      // Show success message
+      setMessages(prev => [...prev, {
+        status: 'running',
+        message: `✅ Manual retraining triggered: ${response.data.message || 'Success'}. ${response.data.files_found || 0} file(s) found.`
+      }])
+      
+      // If training isn't already running, start checking status
+      if (!training) {
+        setTraining(true)
+      }
+    } catch (error) {
+      console.error('Failed to trigger manual retraining:', error)
+      const errorMessage = error.response?.data?.detail || error.message || 'Unknown error'
+      setMessages(prev => [...prev, {
+        status: 'error',
+        message: `❌ Failed to trigger manual retraining: ${errorMessage}`
+      }])
+    } finally {
+      setManualTriggerLoading(false)
     }
   }
 
@@ -880,7 +995,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           )}
 
           {/* Action Buttons */}
-          <div className="flex gap-4">
+          <div className="flex gap-4 flex-wrap">
             {!training ? (
               <button
                 onClick={handleStartTraining}
@@ -902,6 +1017,26 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 Stop Training
               </button>
             )}
+            
+            {/* Manual Auto-Retrain Trigger Button */}
+            <button
+              onClick={handleManualRetrainTrigger}
+              disabled={manualTriggerLoading}
+              className="px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2"
+              title="Manually trigger auto-retraining with all files in the configured directory (bypasses file detection)"
+            >
+              {manualTriggerLoading ? (
+                <>
+                  <Loader className="w-5 h-5 animate-spin" />
+                  <span>Triggering...</span>
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-5 h-5" />
+                  <span>Trigger Auto-Retrain</span>
+                </>
+              )}
+            </button>
           </div>
         </div>
       </div>
@@ -924,6 +1059,43 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 {msg.message}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* Training Mode Indicator */}
+      {training && (
+        <div className="bg-white rounded-lg shadow p-4 mb-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-semibold text-gray-700">Training Mode:</span>
+              {turboModeEnabled ? (
+                <span className="px-3 py-1.5 bg-gradient-to-r from-yellow-400 to-orange-500 text-white text-sm font-bold rounded-lg shadow-md flex items-center gap-2">
+                  <span>🔥</span>
+                  <span>TURBO MODE</span>
+                  <span className="text-xs opacity-90">(Max GPU)</span>
+                </span>
+              ) : trainingMode === 'performance' ? (
+                <span className="px-3 py-1.5 bg-blue-500 text-white text-sm font-semibold rounded-lg shadow flex items-center gap-2">
+                  <span>🚀</span>
+                  <span>PERFORMANCE</span>
+                </span>
+              ) : (
+                <span className="px-3 py-1.5 bg-gray-500 text-white text-sm font-semibold rounded-lg shadow flex items-center gap-2">
+                  <span>✅</span>
+                  <span>QUIET MODE</span>
+                </span>
+              )}
+            </div>
+            <button
+              onClick={() => {
+                // Open settings by triggering a custom event or navigating
+                window.dispatchEvent(new CustomEvent('openSettings'))
+              }}
+              className="text-xs text-gray-500 hover:text-gray-700 underline"
+            >
+              Change in Settings
+            </button>
           </div>
         </div>
       )}

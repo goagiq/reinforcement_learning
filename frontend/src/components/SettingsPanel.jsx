@@ -5,6 +5,7 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
   const [defaultModel, setDefaultModel] = useState('')
   const [nt8DataPath, setNt8DataPath] = useState('')
   const [performanceMode, setPerformanceMode] = useState('quiet')
+  const [turboTrainingMode, setTurboTrainingMode] = useState(false)
   const [autoRetrainEnabled, setAutoRetrainEnabled] = useState(true)
   const [loading, setLoading] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -28,6 +29,9 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
           if (data.performance_mode) {
             setPerformanceMode(data.performance_mode)
           }
+          if (data.turbo_training_mode !== undefined) {
+            setTurboTrainingMode(data.turbo_training_mode)
+          }
           if (data.auto_retrain_enabled !== undefined) {
             setAutoRetrainEnabled(data.auto_retrain_enabled)
           }
@@ -45,17 +49,29 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
     
     // Save settings to backend
     try {
-      await fetch('/api/settings/set', {
+      const settingsPayload = { 
+        nt8_data_path: nt8DataPath || null,
+        performance_mode: performanceMode,
+        turbo_training_mode: turboTrainingMode,
+        auto_retrain_enabled: autoRetrainEnabled
+      }
+      
+      console.log('[SettingsPanel] Saving settings:', settingsPayload)
+      
+      const response = await fetch('/api/settings/set', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          nt8_data_path: nt8DataPath || null,
-          performance_mode: performanceMode,
-          auto_retrain_enabled: autoRetrainEnabled
-        })
+        body: JSON.stringify(settingsPayload)
       })
+      
+      const result = await response.json()
+      console.log('[SettingsPanel] Settings save response:', result)
+      
+      if (!response.ok) {
+        console.error('[SettingsPanel] Failed to save settings:', result)
+      }
     } catch (error) {
-      console.warn('Could not save settings to backend:', error)
+      console.error('Could not save settings to backend:', error)
     }
     
     // Dispatch custom event to notify other components in the same window
@@ -143,11 +159,45 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
               </label>
             </div>
             <p className="text-sm text-gray-500 mt-2">
-              {performanceMode === 'quiet' 
-                ? "✅ Quiet mode: Uses configured batch size and epochs. Recommended for daytime use when you're using your computer."
-                : "🚀 Performance mode: Doubles batch size and increases epochs for faster training. Use when you're away (e.g., at night)."
+              {turboTrainingMode 
+                ? "⚠️ Turbo mode is enabled - Performance mode setting is overridden"
+                : performanceMode === 'quiet' 
+                  ? "✅ Quiet mode: Uses configured batch size and epochs. Recommended for daytime use when you're using your computer."
+                  : "🚀 Performance mode: Doubles batch size and increases epochs for faster training. Use when you're away (e.g., at night)."
               }
             </p>
+          </div>
+
+          {/* Turbo Training Mode Toggle */}
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              Turbo Training Mode
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="turboTraining"
+                checked={turboTrainingMode}
+                onChange={(e) => setTurboTrainingMode(e.target.checked)}
+                className="w-5 h-5 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
+              />
+              <label htmlFor="turboTraining" className="text-sm text-gray-700 cursor-pointer">
+                Enable Turbo Mode (Maximum GPU Utilization)
+              </label>
+            </div>
+            <p className="text-sm text-gray-500 mt-2">
+              {turboTrainingMode 
+                ? "🔥 Turbo mode: 4x batch size, 2x epochs for maximum GPU utilization. Perfect for overnight training when GPU resources are available. Overrides Performance mode."
+                : "💤 Turbo mode: Disabled. Use Performance mode for faster training."
+              }
+            </p>
+            {turboTrainingMode && (
+              <div className="mt-2 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                <p className="text-sm text-yellow-800">
+                  ⚠️ <strong>Note:</strong> Turbo mode maximizes GPU usage. Ensure your GPU has sufficient VRAM and cooling. Monitor GPU temperature during extended training sessions.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Auto-Retrain Toggle */}

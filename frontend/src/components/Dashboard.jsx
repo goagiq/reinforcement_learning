@@ -15,10 +15,34 @@ const Dashboard = ({ onSetupChange }) => {
   const [ws, setWs] = useState(null)
   const [notifications, setNotifications] = useState([])
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [modelComparison, setModelComparison] = useState(null)
+
+  // Listen for openSettings event from TrainingPanel
+  useEffect(() => {
+    const handleOpenSettings = () => {
+      setSettingsOpen(true)
+    }
+    
+    window.addEventListener('openSettings', handleOpenSettings)
+    
+    return () => {
+      window.removeEventListener('openSettings', handleOpenSettings)
+    }
+  }, [])
 
   useEffect(() => {
     loadModels()
     loadPerformance()
+    loadModelComparison()
+    
+    // Set up periodic refresh of model comparison while training is active
+    // This catches best_model updates that happen during training (not just at the end)
+    const comparisonRefreshInterval = setInterval(() => {
+      // Only refresh if we're on the overview tab and models might be updating
+      if (activeTab === 'overview') {
+        loadModelComparison()
+      }
+    }, 30000) // Refresh every 30 seconds
     
     // Connect to WebSocket with proper error handling
     let websocket = null
@@ -124,6 +148,7 @@ const Dashboard = ({ onSetupChange }) => {
           }
         }
       }
+      clearInterval(comparisonRefreshInterval)
     }
   }, [])
 
@@ -138,6 +163,14 @@ const Dashboard = ({ onSetupChange }) => {
     // Auto-refresh on certain events
     if (data.type === 'training' && data.status === 'completed') {
       loadModels()
+      loadModelComparison() // Refresh model comparison when training completes
+    }
+    // Also refresh when training starts (best_model might be updated during training)
+    if (data.type === 'training' && (data.status === 'running' || data.status === 'started')) {
+      // Refresh comparison after a short delay to allow model files to be written
+      setTimeout(() => {
+        loadModelComparison()
+      }, 2000)
     }
   }
 
@@ -162,6 +195,15 @@ const Dashboard = ({ onSetupChange }) => {
       }
     } catch (error) {
       console.error('Failed to load performance:', error)
+    }
+  }
+
+  const loadModelComparison = async () => {
+    try {
+      const response = await axios.get('/api/models/compare')
+      setModelComparison(response.data)
+    } catch (error) {
+      console.error('Failed to load model comparison:', error)
     }
   }
 
@@ -295,6 +337,175 @@ const Dashboard = ({ onSetupChange }) => {
                 </div>
               </div>
             </div>
+
+            {/* Model Comparison Section */}
+            {modelComparison && (modelComparison.best_model.exists || modelComparison.final_model.exists) && (
+              <div className="bg-white rounded-lg shadow p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-xl font-bold text-gray-800">Model Comparison</h2>
+                  {modelComparison.recommendation && (
+                    <div className="flex items-center gap-2 px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm font-semibold">
+                      <span>⭐ Recommended: {modelComparison.recommendation === 'best_model' ? 'best_model.pt' : 'final_model.pt'}</span>
+                    </div>
+                  )}
+                </div>
+                {modelComparison.recommendation_reason && (
+                  <div className="mb-4 p-3 bg-blue-50 text-blue-800 rounded-lg text-sm">
+                    {modelComparison.recommendation_reason}
+                  </div>
+                )}
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Best Model */}
+                  <div className={`border-2 rounded-lg p-4 ${modelComparison.recommendation === 'best_model' ? 'border-green-500 bg-green-50' : 'border-gray-200'}`}>
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-lg font-semibold text-gray-800">best_model.pt</h3>
+                      {modelComparison.recommendation === 'best_model' && (
+                        <span className="px-2 py-1 bg-green-500 text-white text-xs font-semibold rounded">RECOMMENDED</span>
+                      )}
+                    </div>
+                    
+                    {modelComparison.best_model.exists ? (
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">File Size:</span>
+                          <span className="font-medium">{modelComparison.best_model.file_size_mb} MB</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Created:</span>
+                          <span className="font-medium">
+                            {new Date(modelComparison.best_model.created_at).toLocaleDateString()} {new Date(modelComparison.best_model.created_at).toLocaleTimeString()}
+                          </span>
+                        </div>
+                        {modelComparison.best_model.timestep !== null && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Training Timesteps:</span>
+                            <span className="font-medium">{modelComparison.best_model.timestep?.toLocaleString() || 'N/A'}</span>
+                          </div>
+                        )}
+                        {modelComparison.best_model.episode !== null && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Episodes:</span>
+                            <span className="font-medium">{modelComparison.best_model.episode || 'N/A'}</span>
+                          </div>
+                        )}
+                        {modelComparison.best_model.mean_reward !== null && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Mean Reward:</span>
+                            <span className={`font-medium ${modelComparison.best_model.mean_reward >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {modelComparison.best_model.mean_reward.toFixed(4)}
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Backtest Status:</span>
+                          <span className={`font-medium ${modelComparison.best_model.evaluation_needed ? 'text-orange-600' : 'text-green-600'}`}>
+                            {modelComparison.best_model.evaluation_needed ? '⚠️ Evaluation Needed' : '✅ Evaluated'}
+                          </span>
+                        </div>
+                        {modelComparison.best_model.backtest_results && (
+                          <div className="mt-3 p-2 bg-gray-50 rounded text-xs">
+                            <div className="font-semibold mb-1">Backtest Results:</div>
+                            {modelComparison.best_model.backtest_results.sharpe_ratio !== undefined && (
+                              <div>Sharpe Ratio: {modelComparison.best_model.backtest_results.sharpe_ratio.toFixed(2)}</div>
+                            )}
+                            {modelComparison.best_model.backtest_results.total_return !== undefined && (
+                              <div>Total Return: {(modelComparison.best_model.backtest_results.total_return * 100).toFixed(2)}%</div>
+                            )}
+                          </div>
+                        )}
+                        <div className="mt-3 pt-3 border-t border-gray-200">
+                          <div className="text-xs text-gray-600 mb-1">Use Cases:</div>
+                          <ul className="text-xs text-gray-700 space-y-1">
+                            {modelComparison.use_case_guidance.best_model.recommended_for.map((use, idx) => (
+                              <li key={idx} className="flex items-center gap-1">
+                                <span className="text-green-500">•</span> {use}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-500">Model file not found</div>
+                    )}
+                  </div>
+
+                  {/* Final Model */}
+                  <div className={`border-2 rounded-lg p-4 ${modelComparison.recommendation === 'final_model' ? 'border-green-500 bg-green-50' : 'border-gray-200'}`}>
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-lg font-semibold text-gray-800">final_model.pt</h3>
+                      {modelComparison.recommendation === 'final_model' && (
+                        <span className="px-2 py-1 bg-green-500 text-white text-xs font-semibold rounded">RECOMMENDED</span>
+                      )}
+                    </div>
+                    
+                    {modelComparison.final_model.exists ? (
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">File Size:</span>
+                          <span className="font-medium">{modelComparison.final_model.file_size_mb} MB</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Created:</span>
+                          <span className="font-medium">
+                            {new Date(modelComparison.final_model.created_at).toLocaleDateString()} {new Date(modelComparison.final_model.created_at).toLocaleTimeString()}
+                          </span>
+                        </div>
+                        {modelComparison.final_model.timestep !== null && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Training Timesteps:</span>
+                            <span className="font-medium">{modelComparison.final_model.timestep?.toLocaleString() || 'N/A'}</span>
+                          </div>
+                        )}
+                        {modelComparison.final_model.episode !== null && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Episodes:</span>
+                            <span className="font-medium">{modelComparison.final_model.episode || 'N/A'}</span>
+                          </div>
+                        )}
+                        {modelComparison.final_model.mean_reward !== null && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Mean Reward:</span>
+                            <span className={`font-medium ${modelComparison.final_model.mean_reward >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {modelComparison.final_model.mean_reward.toFixed(4)}
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Backtest Status:</span>
+                          <span className={`font-medium ${modelComparison.final_model.evaluation_needed ? 'text-orange-600' : 'text-green-600'}`}>
+                            {modelComparison.final_model.evaluation_needed ? '⚠️ Evaluation Needed' : '✅ Evaluated'}
+                          </span>
+                        </div>
+                        {modelComparison.final_model.backtest_results && (
+                          <div className="mt-3 p-2 bg-gray-50 rounded text-xs">
+                            <div className="font-semibold mb-1">Backtest Results:</div>
+                            {modelComparison.final_model.backtest_results.sharpe_ratio !== undefined && (
+                              <div>Sharpe Ratio: {modelComparison.final_model.backtest_results.sharpe_ratio.toFixed(2)}</div>
+                            )}
+                            {modelComparison.final_model.backtest_results.total_return !== undefined && (
+                              <div>Total Return: {(modelComparison.final_model.backtest_results.total_return * 100).toFixed(2)}%</div>
+                            )}
+                          </div>
+                        )}
+                        <div className="mt-3 pt-3 border-t border-gray-200">
+                          <div className="text-xs text-gray-600 mb-1">Use Cases:</div>
+                          <ul className="text-xs text-gray-700 space-y-1">
+                            {modelComparison.use_case_guidance.final_model.recommended_for.map((use, idx) => (
+                              <li key={idx} className="flex items-center gap-1">
+                                <span className="text-blue-500">•</span> {use}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-500">Model file not found</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {notifications.length > 0 && (
               <div className="bg-white rounded-lg shadow p-6">

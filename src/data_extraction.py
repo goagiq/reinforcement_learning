@@ -148,10 +148,29 @@ class DataExtractor:
                 # Patterns to match: ES, 1min, .txt or .csv
                 matching_files = []
                 
-                for actual_file in search_path.iterdir():
+                # Get all files once (avoid repeated iterdir calls) and filter early
+                all_files = list(search_path.iterdir())
+                total_files = len(all_files)
+                if total_files > 10:
+                    print(f"  Searching {total_files} files for {instrument} {timeframe}min data...")
+                
+                # Early filter: only files with instrument name and valid extensions
+                relevant_files = []
+                for actual_file in all_files:
                     if not actual_file.is_file():
                         continue
-                    
+                    name_lower = actual_file.name.lower()
+                    ext = actual_file.suffix.lower()
+                    # Quick filter: must have instrument name and be .txt/.csv
+                    if instrument_lower in name_lower and (ext in ['.txt', '.csv'] or name_lower.endswith(('.txt', '.csv', '.cvs.txt', '.csv.txt'))):
+                        relevant_files.append(actual_file)
+                
+                if total_files > 10:
+                    print(f"  Filtered to {len(relevant_files)} relevant files containing '{instrument}'")
+                
+                timeframe_str = str(timeframe)
+                
+                for actual_file in relevant_files:
                     name_lower = actual_file.name.lower()
                     name_no_ext = actual_file.stem.lower()  # filename without extension
                     # Handle double extensions like .cvs.txt
@@ -160,15 +179,6 @@ class DataExtractor:
                         name_base = name_no_ext.rsplit('.', 1)[0]
                     else:
                         name_base = name_no_ext
-                    ext = actual_file.suffix.lower()
-                    
-                    # Must be .txt or .csv (or variations like .cvs.txt)
-                    if ext not in ['.txt', '.csv'] and not name_lower.endswith(('.txt', '.csv', '.cvs.txt', '.csv.txt')):
-                        continue
-                    
-                    # Check if filename contains instrument
-                    if instrument_lower not in name_lower:
-                        continue
                     
                     # Priority 1: Exact match on expected pattern
                     if timeframe_str in name_lower and ('min' in name_lower or 'm' in name_lower):
@@ -208,7 +218,12 @@ class DataExtractor:
                 if matching_files:
                     # Sort by confidence (higher is better)
                     matching_files.sort(key=lambda x: x[1], reverse=True)
-                    return matching_files[0][0]
+                    best_match = matching_files[0][0]
+                    if total_files > 10:
+                        print(f"  ✅ Found {instrument} {timeframe}min data: {best_match.name} (from {total_files} files)")
+                    return best_match
+                elif total_files > 10:
+                    print(f"  ⚠️  No matching file found for {instrument} {timeframe}min in {total_files} files")
             
             return None
         
@@ -322,8 +337,19 @@ class DataExtractor:
             current_section_timeframe = None
             
             try:
+                # For large multi-timeframe files, show progress
+                file_size = filepath.stat().st_size if filepath.exists() else 0
+                is_large_file = file_size > 1_000_000  # > 1MB
+                
                 with open(filepath, 'r', encoding='utf-8') as f:
+                    lines_processed = 0
+                    matching_rows = 0
+                    
                     for line_num, line in enumerate(f, 1):
+                        # Show progress every 100k lines for large files
+                        if is_large_file and line_num % 100000 == 0:
+                            print(f"    Processing {filepath.name}: {line_num:,} lines read, {matching_rows:,} rows matched...")
+                        
                         line = line.strip()
                         if not line:
                             continue
@@ -370,9 +396,13 @@ class DataExtractor:
                                         'close': float(parts[4]),
                                         'volume': float(parts[5]) if len(parts) > 5 else 0.0
                                     })
+                                    matching_rows += 1
                             except (ValueError, IndexError) as e:
                                 # Skip malformed lines
                                 continue
+                
+                if is_large_file:
+                    print(f"    ✅ Finished processing {filepath.name}: {line_num:,} total lines, {matching_rows:,} rows extracted")
                 
                 if data_rows:
                     df = pd.DataFrame(data_rows)

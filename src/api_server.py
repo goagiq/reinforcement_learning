@@ -21,6 +21,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import uvicorn
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -97,6 +98,7 @@ class StatusResponse(BaseModel):
 class SettingsRequest(BaseModel):
     nt8_data_path: Optional[str] = None
     performance_mode: Optional[str] = None  # "quiet" or "performance"
+    turbo_training_mode: Optional[bool] = None  # Enable turbo mode (max GPU usage)
     auto_retrain_enabled: Optional[bool] = None  # Enable/disable auto-retrain
 
 
@@ -386,36 +388,114 @@ def _on_auto_retrain_triggered(files):
     """
     Callback when new data files detected.
     
-    This queues retraining to avoid interrupting existing training.
+    This automatically triggers retraining when new data is available.
     """
-    global active_processes, main_event_loop
+    global active_processes, active_systems, main_event_loop
     
     print(f"\n📁 New data detected: {len(files)} file(s)")
+    print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    for f in files:
+        file_path = Path(f)
+        file_size = file_path.stat().st_size if file_path.exists() else 0
+        print(f"  - {file_path.name} ({file_size:,} bytes)")
     
     # Check if training is already running
-    if "training" in active_processes:
-        print("⚠️  Training already in progress. New data detected but will not retrain yet.")
-        print("   Retraining will be queued after current training completes.")
-        # TODO: Implement queue system
-        return
+    if "training" in active_systems:
+        system = active_systems["training"]
+        thread_alive = system.get("thread") and system["thread"].is_alive()
+        if thread_alive:
+            print("⚠️  Training already in progress. New data detected but will not retrain yet.")
+            print("   Retraining will be queued after current training completes.")
+            # TODO: Implement queue system
+            # For now, just notify
+            if main_event_loop:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        broadcast_message({
+                            "type": "auto_retrain",
+                            "status": "queued",
+                            "message": f"New data detected but training in progress. Will retrain after current training completes.",
+                            "files": [str(f) for f in files]
+                        }),
+                        main_event_loop
+                    )
+                except:
+                    pass
+            return
     
-    # TODO: Trigger retraining here
-    print("🚀 Would trigger retraining here (not implemented yet)")
+    print("🚀 Auto-triggering retraining with new data...")
     
-    # Broadcast message to UI
+    # Find latest checkpoint for resume
+    checkpoint_path = None
+    models_dir = Path("models")
+    if models_dir.exists():
+        checkpoints = sorted(
+            [f for f in models_dir.glob("checkpoint_*.pt")],
+            key=lambda x: int(x.stem.split('_')[1]) if x.stem.split('_')[1].isdigit() else 0,
+            reverse=True
+        )
+        if checkpoints:
+            checkpoint_path = str(checkpoints[0])
+            print(f"   Resuming from: {checkpoint_path}")
+    
+    # Load default config
+    config_path = "configs/train_config.yaml"
+    if not Path(config_path).exists():
+        config_path = "configs/train_config_gpu_optimized.yaml"
+    
+    # Create training request
+    training_request = TrainingRequest(
+        device="cuda",  # Try GPU first, will fallback to CPU if needed
+        config_path=config_path,
+        checkpoint_path=checkpoint_path,
+        total_timesteps=None  # Use config default
+    )
+    
+    # Trigger training asynchronously via the training endpoint logic
     if main_event_loop:
         try:
-            asyncio.run_coroutine_threadsafe(
-                broadcast_message({
+            async def _start_auto_training():
+                from fastapi import BackgroundTasks
+                background_tasks = BackgroundTasks()
+                
+                await broadcast_message({
                     "type": "auto_retrain",
-                    "status": "triggered",
-                    "message": f"New data detected: {len(files)} file(s). Retraining recommended.",
-                    "files": [str(f) for f in files]
-                }),
+                    "status": "triggering",
+                    "message": f"Starting automatic retraining with {len(files)} new file(s)..."
+                })
+                
+                # Call start_training directly (it's an async function)
+                await start_training(training_request, background_tasks)
+            
+            # Schedule training start in the event loop
+            future = asyncio.run_coroutine_threadsafe(
+                _start_auto_training(),
                 main_event_loop
             )
-        except:
-            pass
+            
+            print("✅ Auto-retraining triggered successfully")
+            print("   Training should start shortly...")
+        except Exception as e:
+            print(f"❌ Error triggering auto-retraining: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback: just notify
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_message({
+                        "type": "auto_retrain",
+                        "status": "error",
+                        "message": f"Failed to trigger auto-retraining: {str(e)}",
+                        "files": [str(f) for f in files]
+                    }),
+                    main_event_loop
+                )
+            except:
+                pass
+    else:
+        print("⚠️  Main event loop not available, cannot trigger training automatically")
+        print("   Please start training manually from the UI or use the API endpoint")
 
 
 @app.on_event("startup")
@@ -484,22 +564,45 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
     print(f"{'='*60}\n")
     
     async def _train():
-        print(f"[_train] Starting async training function")
-        await broadcast_message({
-            "type": "training",
-            "status": "starting",
-            "message": "Initializing training..."
-        })
-        print(f"[_train] Broadcast message sent")
+        # Force immediate output to verify function is called
+        print(f"\n{'='*80}")
+        print(f"[_train] ✅✅✅ ASYNC TRAINING FUNCTION CALLED ✅✅✅")
+        print(f"[_train] Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[_train] Process ID: {os.getpid()}")
+        print(f"[_train] Thread ID: {threading.current_thread().ident}")
+        print(f"{'='*80}\n")
+        
+        # Force flush output immediately
+        import sys
+        sys.stdout.flush()
+        
+        try:
+            print(f"[_train] Attempting to send broadcast message...")
+            await broadcast_message({
+                "type": "training",
+                "status": "starting",
+                "message": "Initializing training..."
+            })
+            print(f"[_train] ✅ Broadcast message sent successfully")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"[_train] ❌ ERROR sending broadcast: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
         
         # Load config
-        print(f"[_train] Loading config from: {request.config_path}")
+        print(f"[_train] 📄 Loading config from: {request.config_path}")
         try:
             with open(request.config_path, "r") as f:
                 config = yaml.safe_load(f)
-            print(f"[_train] Config loaded successfully")
+            print(f"[_train] ✅ Config loaded successfully")
+            print(f"[_train]   Instrument: {config.get('environment', {}).get('instrument', 'N/A')}")
+            print(f"[_train]   Timeframes: {config.get('environment', {}).get('timeframes', 'N/A')}")
         except Exception as e:
             print(f"[_train] ❌ ERROR loading config: {e}")
+            import traceback
+            traceback.print_exc()
             raise
         
         if request.total_timesteps:
@@ -577,13 +680,62 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             # Create trainer and train (with optional checkpoint for resume)
             print(f"[_train] 🚀 Creating Trainer with checkpoint: {checkpoint_path_to_use if checkpoint_path_to_use else 'None (fresh start)'}")
             print(f"[_train]   This may take a moment (loading data, creating environment...)")
+            print(f"[_train]   Step 1/4: Starting Trainer initialization...")
+            
+            import time
+            init_start_time = time.time()
+            
             try:
+                # Send progress update
+                await broadcast_message({
+                    "type": "training",
+                    "status": "initializing",
+                    "message": "Loading data files...",
+                    "progress": {"step": "loading_data", "elapsed": 0}
+                })
+                
                 trainer = Trainer(config, checkpoint_path=checkpoint_path_to_use)
-                print(f"[_train] ✅ Trainer created successfully")
+                init_elapsed = time.time() - init_start_time
+                print(f"[_train] ✅ Trainer created successfully (took {init_elapsed:.1f}s)")
+                
+                # Send success update
+                await broadcast_message({
+                    "type": "training",
+                    "status": "initializing",
+                    "message": f"Trainer initialized successfully ({init_elapsed:.1f}s)",
+                    "progress": {"step": "trainer_ready", "elapsed": init_elapsed}
+                })
             except Exception as e:
                 import traceback
-                print(f"[_train] ❌ ERROR creating Trainer: {e}")
-                print(f"[_train]   Traceback:\n{traceback.format_exc()}")
+                error_trace = traceback.format_exc()
+                init_elapsed = time.time() - init_start_time
+                print(f"\n{'='*80}")
+                print(f"[_train] ❌❌❌ ERROR CREATING TRAINER AFTER {init_elapsed:.1f}s ❌❌❌")
+                print(f"[_train] Error: {e}")
+                print(f"[_train] Full traceback:")
+                print(error_trace)
+                print(f"{'='*80}\n")
+                sys.stdout.flush()
+                
+                # Update active_systems to reflect error
+                if "training" in active_systems:
+                    active_systems["training"]["error"] = str(e)
+                    active_systems["training"]["completed"] = True
+                
+                # Send error update
+                try:
+                    await broadcast_message({
+                        "type": "training",
+                        "status": "error",
+                        "message": f"Failed to initialize trainer: {str(e)}",
+                        "error": str(e),
+                        "initialization_time": init_elapsed,
+                        "traceback": error_trace
+                    })
+                except:
+                    pass
+                
+                # Re-raise to be caught by outer try/except
                 raise
             
             resume_msg = f"Resuming from checkpoint: {request.checkpoint_path}" if request.checkpoint_path else "Training started"
@@ -680,13 +832,29 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
-            print(f"❌ ERROR: Failed to start training: {str(e)}")
-            print(f"   Traceback:\n{error_trace}")
-            await broadcast_message({
-                "type": "training",
-                "status": "error",
-                "message": f"Failed to start training: {str(e)}"
-            })
+            print(f"\n{'='*80}")
+            print(f"❌❌❌ FAILED TO START TRAINING ❌❌❌")
+            print(f"Error: {str(e)}")
+            print(f"Full traceback:")
+            print(error_trace)
+            print(f"{'='*80}\n")
+            sys.stdout.flush()
+            
+            # Update active_systems to reflect error
+            if "training" in active_systems:
+                active_systems["training"]["error"] = str(e)
+                active_systems["training"]["completed"] = True
+            
+            try:
+                await broadcast_message({
+                    "type": "training",
+                    "status": "error",
+                    "message": f"Failed to start training: {str(e)}",
+                    "error": str(e),
+                    "traceback": error_trace
+                })
+            except:
+                pass
     
     # Add placeholder entry immediately so status endpoint knows training is starting
     # This prevents race condition where status is checked before _train() completes
@@ -699,9 +867,71 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         "start_time": time.time()  # Track when training started to detect hangs
     }
     
+    print(f"\n{'='*60}")
+    print(f"📤 TRAINING START REQUEST RECEIVED")
+    print(f"   Device: {request.device}")
+    print(f"   Config: {request.config_path}")
+    print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Process ID: {os.getpid()}")
+    print(f"   Thread ID: {threading.current_thread().ident}")
+    print(f"{'='*60}\n")
+    
+    # Force stdout flush to ensure logs appear
+    import sys
+    sys.stdout.flush()
+    
+    # Start the training task immediately using the event loop
+    # BackgroundTasks can be unreliable, so we'll schedule it directly
+    import asyncio
+    try:
+        # Get the current event loop
+        loop = asyncio.get_event_loop()
+        print(f"✅ Got event loop: {loop}")
+        sys.stdout.flush()
+        
+        # Schedule _train() to run immediately
+        # This ensures it actually executes
+        task = loop.create_task(_train())
+        print(f"✅ Created and scheduled asyncio task for _train()")
+        print(f"   Task object: {task}")
+        print(f"   Task done: {task.done()}")
+        print(f"   Task cancelled: {task.cancelled()}")
+        print(f"   Event loop is running: {loop.is_running()}")
+        print(f"   Placeholder entry added to active_systems['training']")
+        sys.stdout.flush()
+        
+        # Give it a moment to start executing
+        await asyncio.sleep(0.1)
+        print(f"   After 0.1s wait - Task done: {task.done()}, cancelled: {task.cancelled()}")
+        if task.done():
+            try:
+                result = task.result()
+                print(f"   Task result: {result}")
+            except Exception as task_error:
+                print(f"   ❌ Task error: {task_error}")
+                import traceback
+                traceback.print_exc()
+        sys.stdout.flush()
+        
+        # Log that we're returning response (task will continue in background)
+        print(f"📤 Returning response - _train() should execute in background")
+        sys.stdout.flush()
+        
+    except Exception as e:
+        print(f"❌ ERROR creating/scheduling asyncio task: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        # Fallback: try background_tasks
+        print(f"   Falling back to BackgroundTasks...")
+        background_tasks.add_task(_train)
+        sys.stdout.flush()
+    
+    # Also add to background_tasks as backup
     background_tasks.add_task(_train)
-    print(f"📤 Training start request queued in background tasks")
-    print(f"   Placeholder entry added to active_systems")
+    print(f"✅ Also added to background_tasks as backup")
+    sys.stdout.flush()
+    
     return {"status": "started", "message": "Training started"}
 
 
@@ -725,6 +955,17 @@ async def training_status():
             print(f"⚠️  WARNING: Training initialization taking too long ({elapsed:.1f}s)")
             print(f"   This may indicate an error during trainer creation")
             print(f"   Check backend logs for errors")
+            
+            # After 5 minutes, suggest stopping and checking logs
+            if elapsed > 300:
+                return {
+                    "status": "error",
+                    "message": f"Training initialization timeout ({elapsed:.0f}s). Likely stuck during data loading. Please stop and check backend console logs.",
+                    "metrics": {},
+                    "error": "Initialization timeout - check backend logs",
+                    "suggestion": "Stop training and check backend console for data loading errors. Large number of files may be causing issues."
+                }
+            
             return {
                 "status": "starting",
                 "message": f"Initializing training... (taking longer than expected: {elapsed:.0f}s)",
@@ -751,12 +992,24 @@ async def training_status():
             if elapsed > 60:
                 print(f"⚠️  WARNING: Training initialization timeout ({elapsed:.1f}s)")
                 print(f"   Thread never started. Check backend logs for Trainer creation errors.")
-                # Clean up stale entry
-                active_systems.pop("training", None)
+                
+                # After 5 minutes, clean up stale entry
+                if elapsed > 300:
+                    print(f"   Cleaning up stale training entry after {elapsed:.0f}s timeout")
+                    active_systems.pop("training", None)
+                    return {
+                        "status": "error",
+                        "message": f"Training initialization failed (timeout after {elapsed:.0f}s). Likely stuck during data loading. Please check backend console logs and stop/restart if needed.",
+                        "metrics": {},
+                        "error": "Initialization timeout",
+                        "suggestion": "With 70+ files, data loading may be very slow. Consider using fewer files or check backend console for errors."
+                    }
+                
                 return {
-                    "status": "error",
-                    "message": f"Training initialization failed (timeout after {elapsed:.0f}s). Check backend console for errors.",
-                    "metrics": {}
+                    "status": "starting",
+                    "message": f"Initializing training... (timeout: {elapsed:.0f}s)",
+                    "metrics": {},
+                    "warning": f"Initialization timeout ({elapsed:.0f}s). Check backend console."
                 }
             
             return {
@@ -768,20 +1021,25 @@ async def training_status():
         active_systems.pop("training", None)
         return {"status": "idle", "message": "Training stopped"}
     
-    # Check if completed flag is set
+    # Check if completed flag is set - clean up immediately
     if system.get("completed", False):
-        if system.get("error"):
-            status_msg = f"Training failed: {system['error']}"
-            active_systems.pop("training", None)
-            return {"status": "error", "message": status_msg}
-        else:
-            # Get final metrics before removing
-            final_metrics = {}
-            trainer = system.get("trainer")
-            if trainer:
-                # Calculate mean without numpy import
-                mean_reward = sum(trainer.episode_rewards) / len(trainer.episode_rewards) if trainer.episode_rewards else 0.0
-                mean_length = sum(trainer.episode_lengths) / len(trainer.episode_lengths) if trainer.episode_lengths else 0.0
+        # Training is done - clean it up immediately
+        thread_alive = system.get("thread") and hasattr(system["thread"], 'is_alive') and system["thread"].is_alive()
+        if not thread_alive:
+            # Thread is dead and training is completed - safe to remove
+            print(f"🧹 Cleaning up completed training entry (thread dead, completed=True)")
+            if system.get("error"):
+                status_msg = f"Training failed: {system['error']}"
+                active_systems.pop("training", None)
+                return {"status": "error", "message": status_msg}
+            else:
+                # Get final metrics before removing
+                final_metrics = {}
+                trainer = system.get("trainer")
+                if trainer:
+                    # Calculate mean without numpy import
+                    mean_reward = sum(trainer.episode_rewards) / len(trainer.episode_rewards) if trainer.episode_rewards else 0.0
+                    mean_length = sum(trainer.episode_lengths) / len(trainer.episode_lengths) if trainer.episode_lengths else 0.0
                 
                 final_metrics = {
                     "total_episodes": trainer.episode,
@@ -857,7 +1115,41 @@ async def training_status():
         # Get latest training metrics if available (from last update)
         if hasattr(trainer, 'last_update_metrics') and trainer.last_update_metrics:
             metrics["training_metrics"] = trainer.last_update_metrics
+        
+        # Include actual training mode being used by the trainer
+        performance_mode = getattr(trainer, 'performance_mode', 'quiet')
+        
+        # Check settings.json for turbo_training_mode to ensure accuracy
+        # Turbo mode overrides performance_mode in settings
+        import json
+        from pathlib import Path
+        settings_file = Path("settings.json")
+        if settings_file.exists():
+            try:
+                with open(settings_file, 'r') as f:
+                    settings = json.load(f)
+                    if settings.get("turbo_training_mode", False):
+                        performance_mode = "turbo"
+            except:
+                pass
+        
+        training_mode_info = {
+            "performance_mode": performance_mode,
+        }
+        
+        # Debug: Log what mode we're reporting
+        if not hasattr(trainer, '_last_logged_mode') or trainer._last_logged_mode != performance_mode:
+            print(f"📊 Training status API: Reporting mode = {performance_mode}")
+            trainer._last_logged_mode = performance_mode
+        
+        return {
+            "status": "running", 
+            "message": "Training in progress",
+            "metrics": metrics,
+            "training_mode": training_mode_info
+        }
     
+    # Fallback if trainer not available yet
     return {
         "status": "running", 
         "message": "Training in progress",
@@ -989,6 +1281,143 @@ async def list_models():
         "trained_count": len(trained_models),
         "ollama_count": len(ollama_models),
         "checkpoint_count": len(checkpoints)
+    }
+
+
+@app.get("/api/models/compare")
+async def compare_models():
+    """Get detailed comparison between best_model and final_model"""
+    models_dir = Path("models")
+    logs_dir = Path("logs")
+    
+    def get_model_info(model_name: str) -> Dict:
+        """Extract comprehensive information about a model"""
+        model_path = models_dir / model_name
+        info = {
+            "exists": False,
+            "name": model_name,
+            "path": str(model_path),
+            "file_size": 0,
+            "file_size_mb": 0,
+            "created_at": None,
+            "modified_at": None,
+            "timestep": None,
+            "episode": None,
+            "mean_reward": None,
+            "episode_count": 0,
+            "backtest_results": None,
+            "evaluation_needed": True
+        }
+        
+        if not model_path.exists():
+            return info
+        
+        info["exists"] = True
+        
+        # File metadata
+        stat = model_path.stat()
+        info["file_size"] = stat.st_size
+        info["file_size_mb"] = round(stat.st_size / (1024 * 1024), 2)
+        info["created_at"] = datetime.fromtimestamp(stat.st_ctime).isoformat()
+        info["modified_at"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        
+        # Try to load checkpoint metadata
+        try:
+            import torch
+            checkpoint = torch.load(str(model_path), map_location='cpu', weights_only=False)
+            
+            info["timestep"] = checkpoint.get("timestep", None)
+            info["episode"] = checkpoint.get("episode", None)
+            episode_rewards = checkpoint.get("episode_rewards", [])
+            episode_lengths = checkpoint.get("episode_lengths", [])
+            
+            if episode_rewards:
+                info["mean_reward"] = round(float(np.mean(episode_rewards)), 4)
+                info["episode_count"] = len(episode_rewards)
+            
+        except Exception as e:
+            # Model exists but can't read metadata
+            pass
+        
+        # Check for backtest/evaluation results
+        # Look for JSON files in logs directory that might contain results
+        if logs_dir.exists():
+            # Check for files matching pattern like "backtest_best_model_*.json" or "evaluation_*.json"
+            for result_file in logs_dir.glob("*backtest*.json"):
+                try:
+                    with open(result_file, 'r') as f:
+                        data = json.load(f)
+                        # Check if this result is for our model
+                        if isinstance(data, dict) and model_name.replace(".pt", "") in str(data):
+                            info["backtest_results"] = data
+                            info["evaluation_needed"] = False
+                            break
+                except:
+                    pass
+            
+            # Also check evaluation files
+            if info["backtest_results"] is None:
+                for result_file in logs_dir.glob("*evaluation*.json"):
+                    try:
+                        with open(result_file, 'r') as f:
+                            data = json.load(f)
+                            if isinstance(data, dict) and model_name.replace(".pt", "") in str(data):
+                                info["backtest_results"] = data
+                                info["evaluation_needed"] = False
+                                break
+                    except:
+                        pass
+        
+        return info
+    
+    # Get info for both models
+    best_model_info = get_model_info("best_model.pt")
+    final_model_info = get_model_info("final_model.pt")
+    
+    # Determine recommendation
+    recommendation = None
+    recommendation_reason = ""
+    
+    if best_model_info["exists"] and final_model_info["exists"]:
+        # Compare timesteps (newer is usually better)
+        if best_model_info["timestep"] and final_model_info["timestep"]:
+            if final_model_info["timestep"] > best_model_info["timestep"]:
+                recommendation = "final_model"
+                recommendation_reason = f"Final model is newer (trained for {final_model_info['timestep']:,} timesteps vs {best_model_info['timestep']:,})"
+            else:
+                recommendation = "best_model"
+                recommendation_reason = f"Best model has the highest training reward during training"
+        elif best_model_info["mean_reward"] is not None:
+            recommendation = "best_model"
+            recommendation_reason = f"Best model had better mean reward ({best_model_info['mean_reward']:.4f}) during training"
+        else:
+            recommendation = "best_model"
+            recommendation_reason = "Best model was selected for performance during training"
+    elif best_model_info["exists"]:
+        recommendation = "best_model"
+        recommendation_reason = "Only best_model is available"
+    elif final_model_info["exists"]:
+        recommendation = "final_model"
+        recommendation_reason = "Only final_model is available"
+    
+    # Use case guidance
+    use_case_guidance = {
+        "best_model": {
+            "recommended_for": ["Live trading", "Production use", "When you want best performance"],
+            "description": "This model achieved the highest mean reward during training. It represents the best-performing checkpoint saved during the training process."
+        },
+        "final_model": {
+            "recommended_for": ["Continuing training", "Latest training state", "When training just completed"],
+            "description": "This model represents the final state after all training is complete. It may not have the best performance, but contains the latest learned weights."
+        }
+    }
+    
+    return {
+        "best_model": best_model_info,
+        "final_model": final_model_info,
+        "recommendation": recommendation,
+        "recommendation_reason": recommendation_reason,
+        "use_case_guidance": use_case_guidance
     }
 
 
@@ -1296,7 +1725,326 @@ async def get_settings():
         except Exception as e:
             return {"status": "error", "message": f"Failed to load settings: {str(e)}"}
     
+    # Ensure default values are present
+    if "turbo_training_mode" not in settings:
+        settings["turbo_training_mode"] = False
+    
     return {"status": "success", **settings}
+
+
+@app.get("/api/settings/auto-retrain-status")
+async def get_auto_retrain_status():
+    """Get auto-retrain monitor status"""
+    global auto_retrain_monitor, active_systems
+    
+    # Check if there's actually a training job running
+    training_job_running = False
+    if "training" in active_systems:
+        system = active_systems["training"]
+        thread = system.get("thread")
+        if thread and hasattr(thread, 'is_alive') and thread.is_alive():
+            training_job_running = True
+    
+    if auto_retrain_monitor:
+        status = auto_retrain_monitor.get_status()
+        
+        # Count total files in directory for better visibility
+        total_files = 0
+        csv_count = 0
+        txt_count = 0
+        if auto_retrain_monitor.nt8_export_path:
+            watch_path = Path(auto_retrain_monitor.nt8_export_path)
+            if watch_path.exists():
+                csv_files = list(watch_path.glob("*.csv"))
+                txt_files = list(watch_path.glob("*.txt"))
+                csv_count = len(csv_files)
+                txt_count = len(txt_files)
+                total_files = csv_count + txt_count
+        
+        # Count known files in cache
+        known_files_count = 0
+        if auto_retrain_monitor.event_handler:
+            known_files_count = len(auto_retrain_monitor.event_handler.known_files)
+        
+        return {
+            "status": "running" if status["running"] else "stopped",
+            "enabled": status["enabled"],
+            "nt8_export_path": status["nt8_export_path"],
+            "files_detected": status["files_detected"],  # New files detected since monitor started
+            "files_detected_description": "New files detected since monitor started (triggers retraining)",
+            "total_files_in_directory": total_files,  # Total CSV/TXT files in directory
+            "csv_files_count": csv_count,
+            "txt_files_count": txt_count,
+            "known_files_count": known_files_count,  # Files already processed (in cache)
+            "last_retrain_trigger": status["last_retrain_trigger"],
+            "running": status["running"],  # Monitor status (file watcher)
+            "monitor_running": status["running"],  # Explicit monitor status
+            "training_job_running": training_job_running,  # Actual training job status
+            "message": "File monitor is active" if status["running"] else "File monitor is stopped"
+        }
+    else:
+        # Check if it should be enabled
+        settings_file = project_root / "settings.json"
+        if settings_file.exists():
+            try:
+                with open(settings_file, 'r') as f:
+                    settings = json.load(f)
+                    if settings.get("auto_retrain_enabled") and settings.get("nt8_data_path"):
+                        return {
+                            "status": "not_started",
+                            "enabled": True,
+                            "nt8_export_path": settings["nt8_data_path"],
+                            "monitor_running": False,
+                            "training_job_running": training_job_running,
+                            "message": "Auto-retrain is configured but monitor not started. Restart the API server to start monitoring."
+                        }
+            except:
+                pass
+        
+        return {
+            "status": "disabled",
+            "enabled": False,
+            "monitor_running": False,
+            "training_job_running": training_job_running,
+            "message": "Auto-retrain monitoring is not enabled or configured"
+        }
+
+
+@app.post("/api/settings/auto-retrain/clear-cache")
+async def clear_auto_retrain_cache():
+    """Clear the known files cache to force re-detection of files"""
+    global auto_retrain_monitor
+    
+    cache_file = project_root / "logs" / "known_files_cache.json"
+    
+    try:
+        if cache_file.exists():
+            cache_file.unlink()
+            print(f"✅ Cleared cache file: {cache_file}")
+        else:
+            print(f"ℹ️  Cache file does not exist: {cache_file}")
+        
+        # Also clear the in-memory cache if monitor is running
+        if auto_retrain_monitor and auto_retrain_monitor.event_handler:
+            auto_retrain_monitor.event_handler.known_files.clear()
+            auto_retrain_monitor.event_handler.pending_files.clear()
+            if auto_retrain_monitor.event_handler.debounce_timer:
+                auto_retrain_monitor.event_handler.debounce_timer.cancel()
+            print("✅ Cleared in-memory cache")
+        
+        return {
+            "status": "success",
+            "message": "Cache cleared successfully",
+            "cache_file": str(cache_file)
+        }
+    except Exception as e:
+        print(f"❌ Error clearing cache: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
+
+
+@app.post("/api/settings/auto-retrain/trigger-manual")
+async def trigger_manual_retrain(background_tasks: BackgroundTasks):
+    """Manually trigger retraining (bypasses file detection)"""
+    global auto_retrain_monitor, active_systems
+    
+    print(f"\n{'='*80}")
+    print(f"🚀 MANUAL RETRAIN TRIGGER CALLED")
+    print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Process ID: {os.getpid()}")
+    print(f"   Thread ID: {threading.current_thread().ident}")
+    print(f"{'='*80}\n")
+    import sys
+    sys.stdout.flush()
+    
+    if not auto_retrain_monitor:
+        print(f"❌ Auto-retrain monitor not initialized")
+        raise HTTPException(status_code=400, detail="Auto-retrain monitor not initialized")
+    
+    if not auto_retrain_monitor.nt8_export_path:
+        print(f"❌ NT8 export path not configured")
+        raise HTTPException(status_code=400, detail="NT8 export path not configured")
+    
+    watch_path = Path(auto_retrain_monitor.nt8_export_path)
+    if not watch_path.exists():
+        print(f"❌ NT8 export path does not exist: {watch_path}")
+        raise HTTPException(status_code=404, detail=f"NT8 export path does not exist: {watch_path}")
+    
+    # Find all CSV and TXT files in the directory
+    csv_files = list(watch_path.glob("*.csv"))
+    txt_files = list(watch_path.glob("*.txt"))
+    all_files = csv_files + txt_files
+    
+    if not all_files:
+        return {
+            "status": "warning",
+            "message": f"No CSV or TXT files found in {watch_path}",
+            "files_found": 0
+        }
+    
+    print(f"🚀 Manual retrain triggered - found {len(all_files)} file(s) in {watch_path}")
+    for f in all_files:
+        print(f"  - {f.name}")
+    
+    # Clean up any stale training entries first
+    global active_systems
+    if "training" in active_systems:
+        system = active_systems["training"]
+        thread_alive = system.get("thread") and hasattr(system["thread"], 'is_alive') and system["thread"].is_alive()
+        completed = system.get("completed", False)
+        
+        print(f"🔍 Checking existing training entry:")
+        print(f"   Thread alive: {thread_alive}")
+        print(f"   Completed: {completed}")
+        
+        if not thread_alive:
+            # Thread is dead - safe to clean up regardless of completed flag
+            print(f"🧹 Cleaning up stale training entry (thread dead)")
+            active_systems.pop("training", None)
+        elif completed and not thread_alive:
+            # Completed and thread dead - definitely safe to remove
+            print(f"🧹 Cleaning up completed training entry")
+            active_systems.pop("training", None)
+        elif thread_alive:
+            # Thread is actually running - can't start new training
+            print(f"⚠️  Training is currently running, cannot start manual retrain")
+            raise HTTPException(status_code=400, detail="Training already in progress. Please stop current training first.")
+    
+    # Instead of using callback (which has BackgroundTasks issues), call start_training directly
+    try:
+        from fastapi import BackgroundTasks as BGTasks
+        from src.api_server import TrainingRequest
+        
+        # Load default config
+        config_path = "configs/train_config.yaml"
+        if not Path(config_path).exists():
+            config_path = "configs/train_config_gpu_optimized.yaml"
+        
+        # Find latest checkpoint for resume
+        checkpoint_path = None
+        models_dir = Path("models")
+        if models_dir.exists():
+            checkpoints = sorted(
+                [f for f in models_dir.glob("checkpoint_*.pt")],
+                key=lambda x: int(x.stem.split('_')[1]) if x.stem.split('_')[1].isdigit() else 0,
+                reverse=True
+            )
+            if checkpoints:
+                checkpoint_path = str(checkpoints[0])
+                print(f"   Will resume from: {checkpoint_path}")
+        
+        # Create training request
+        training_request = TrainingRequest(
+            device="cuda",  # Try GPU first
+            config_path=config_path,
+            checkpoint_path=checkpoint_path,
+            total_timesteps=None
+        )
+        
+        print(f"🚀 Manual retrain - calling start_training() directly")
+        print(f"   Found {len(all_files)} file(s) in directory")
+        print(f"   Using config: {config_path}")
+        print(f"   Checkpoint: {checkpoint_path if checkpoint_path else 'None (fresh start)'}")
+        
+        # Call start_training directly with proper BackgroundTasks
+        try:
+            await start_training(training_request, background_tasks)
+            
+            # Wait a brief moment to catch immediate initialization errors
+            import asyncio
+            await asyncio.sleep(0.5)
+            
+            # Check if training actually started (not just scheduled)
+            if "training" in active_systems:
+                training_status = active_systems["training"]
+                if training_status.get("error"):
+                    # Training failed immediately during initialization
+                    error_msg = training_status.get("error", "Unknown error")
+                    print(f"❌ Training failed immediately: {error_msg}")
+                    raise HTTPException(status_code=500, detail=f"Training failed to start: {error_msg}")
+            
+            return {
+                "status": "success",
+                "message": f"Retraining triggered manually with {len(all_files)} file(s) found in directory",
+                "files_found": len(all_files),
+                "files": [str(f) for f in all_files[:10]],  # Show first 10
+                "note": "Training will use files based on config instrument/timeframes, not all files listed"
+            }
+        except HTTPException:
+            # Re-raise HTTP exceptions (like "training already in progress")
+            raise
+        except Exception as e:
+            # Catch any other errors from start_training
+            error_msg = str(e)
+            print(f"❌ Error calling start_training: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to start training: {error_msg}")
+    except Exception as e:
+        print(f"❌ Error triggering manual retrain: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to trigger retraining: {str(e)}")
+
+
+@app.get("/api/settings/auto-retrain/diagnostics")
+async def get_auto_retrain_diagnostics():
+    """Get detailed diagnostics about auto-retrain monitoring"""
+    global auto_retrain_monitor
+    
+    diagnostics = {
+        "monitor_initialized": auto_retrain_monitor is not None,
+        "cache_file": str(project_root / "logs" / "known_files_cache.json"),
+        "cache_exists": (project_root / "logs" / "known_files_cache.json").exists(),
+    }
+    
+    if auto_retrain_monitor:
+        diagnostics.update({
+            "enabled": auto_retrain_monitor.enabled,
+            "running": auto_retrain_monitor.running,
+            "nt8_export_path": str(auto_retrain_monitor.nt8_export_path),
+            "observer_running": auto_retrain_monitor.observer.is_alive() if auto_retrain_monitor.observer else False,
+            "event_handler_exists": auto_retrain_monitor.event_handler is not None,
+        })
+        
+        # Check if watch path exists
+        if auto_retrain_monitor.nt8_export_path:
+            watch_path = Path(auto_retrain_monitor.nt8_export_path)
+            diagnostics["watch_path_exists"] = watch_path.exists()
+            
+            if watch_path.exists():
+                # Count files in directory
+                csv_files = list(watch_path.glob("*.csv"))
+                txt_files = list(watch_path.glob("*.txt"))
+                diagnostics.update({
+                    "csv_files_count": len(csv_files),
+                    "txt_files_count": len(txt_files),
+                    "total_data_files": len(csv_files) + len(txt_files),
+                    "recent_files": [f.name for f in sorted(csv_files + txt_files, key=lambda x: x.stat().st_mtime, reverse=True)[:10]]
+                })
+                
+                # Check cache contents if it exists
+                if diagnostics["cache_exists"]:
+                    try:
+                        cache_file = project_root / "logs" / "known_files_cache.json"
+                        with open(cache_file, 'r') as f:
+                            cache_data = json.load(f)
+                            diagnostics["cached_files_count"] = len(cache_data.get("files", []))
+                            diagnostics["cached_files_sample"] = list(cache_data.get("files", []))[:10]
+                    except:
+                        diagnostics["cache_read_error"] = True
+            else:
+                diagnostics["watch_path_exists"] = False
+                
+        # Get status from monitor
+        status = auto_retrain_monitor.get_status()
+        diagnostics["monitor_status"] = status
+        
+        # Check pending files if event handler exists
+        if auto_retrain_monitor.event_handler:
+            diagnostics["pending_files_count"] = len(auto_retrain_monitor.event_handler.pending_files)
+            diagnostics["known_files_count"] = len(auto_retrain_monitor.event_handler.known_files)
+    
+    return diagnostics
 
 
 @app.post("/api/settings/set")
@@ -1325,6 +2073,14 @@ async def set_settings(request: SettingsRequest):
             print(f"🔄 Performance mode updated to: {request.performance_mode}")
             print("   Changes will take effect on next training update cycle")
     
+    if request.turbo_training_mode is not None:
+        settings["turbo_training_mode"] = request.turbo_training_mode
+        
+        # Notify active training if running
+        if "training" in active_processes:
+            print(f"🔄 Turbo training mode updated to: {request.turbo_training_mode}")
+            print("   Changes will take effect on next training update cycle")
+    
     if request.auto_retrain_enabled is not None:
         settings["auto_retrain_enabled"] = request.auto_retrain_enabled
         
@@ -1341,10 +2097,17 @@ async def set_settings(request: SettingsRequest):
             )
             auto_retrain_monitor.start()
     
-    # Save
+    # Save settings to file
     try:
         with open(settings_file, "w") as f:
             json.dump(settings, f, indent=2)
+        
+        # Log what was saved for debugging
+        print(f"💾 Settings saved:")
+        print(f"   performance_mode: {settings.get('performance_mode')}")
+        print(f"   turbo_training_mode: {settings.get('turbo_training_mode')}")
+        print(f"   auto_retrain_enabled: {settings.get('auto_retrain_enabled')}")
+        
         return {"status": "success", "message": "Settings saved"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {str(e)}")
@@ -1363,7 +2126,19 @@ async def websocket_endpoint(websocket: WebSocket):
             # Echo back or handle commands
             await websocket.send_json({"type": "echo", "message": data})
     except WebSocketDisconnect:
-        websocket_connections.remove(websocket)
+        # Normal disconnection - client closed connection cleanly
+        pass
+    except Exception as e:
+        # Log unexpected errors but don't crash
+        print(f"⚠️  WebSocket error: {e}")
+    finally:
+        # Always clean up connection, even if it's already removed
+        try:
+            if websocket in websocket_connections:
+                websocket_connections.remove(websocket)
+        except (ValueError, RuntimeError):
+            # Already removed or list modified - ignore
+            pass
 
 
 if __name__ == "__main__":

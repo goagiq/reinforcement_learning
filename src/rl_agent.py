@@ -215,10 +215,17 @@ class PPOAgent:
         if len(self.states) == 0:
             return {}
         
-        # Convert to tensors
+        # Convert to tensors and move to device
         states = torch.FloatTensor(np.array(self.states)).to(self.device)
         actions = torch.FloatTensor(np.array(self.actions)).to(self.device)
         old_log_probs = torch.FloatTensor(np.array(self.log_probs)).to(self.device)
+        
+        # Verify tensors are on correct device (first update only)
+        if not hasattr(self, '_gpu_verified'):
+            if self.device.type == 'cuda':
+                print(f"✅ GPU Update: Tensors on {states.device}, GPU: {torch.cuda.get_device_name(0)}")
+                print(f"   Batch size: {len(states)}, GPU Memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+            self._gpu_verified = True
         
         # Compute advantages and returns
         next_value = 0.0
@@ -245,6 +252,34 @@ class PPOAgent:
         n_samples = len(self.states)
         indices = np.arange(n_samples)
         
+        # Log batch processing details (always log for large batch sizes, or when batch_size changes significantly)
+        should_log = (not hasattr(self, '_last_logged_batch_size') or 
+                     abs(self._last_logged_batch_size - batch_size) > batch_size * 0.5 or
+                     batch_size >= 400)  # Always log for Turbo mode (batch_size >= 400 for aggressive Turbo)
+        
+        if should_log:
+            batches_per_epoch = (n_samples + batch_size - 1) // batch_size
+            total_updates = n_epochs * batches_per_epoch
+            print(f"\n{'='*60}")
+            print(f"✅ VERIFICATION: Agent.update() called with:")
+            print(f"   n_samples: {n_samples}")
+            print(f"   batch_size: {batch_size} ⬅️ VERIFY THIS IS 512 for Turbo mode! (was 256)")
+            print(f"   n_epochs: {n_epochs} ⬅️ VERIFY THIS IS 30 for Turbo mode! (was 20)")
+            print(f"   Batches per epoch: {batches_per_epoch}")
+            print(f"   Total updates: {total_updates}")
+            print(f"{'='*60}\n")
+            self._last_logged_batch_size = batch_size
+        
+        # GPU verification: Check device placement before training loop
+        if self.device.type == 'cuda':
+            print(f"\n🔍 GPU VERIFICATION before training loop:")
+            print(f"   States device: {states.device}")
+            print(f"   Actions device: {actions.device}")
+            print(f"   Actor device: {next(self.actor.parameters()).device}")
+            print(f"   Critic device: {next(self.critic.parameters()).device}")
+            print(f"   GPU Memory before loop: {torch.cuda.memory_allocated(0) / 1e9:.3f} GB")
+            print(f"   GPU Utilization check: Run nvidia-smi NOW to see baseline\n")
+        
         for epoch in range(n_epochs):
             # Shuffle indices for each epoch
             np.random.shuffle(indices)
@@ -259,6 +294,19 @@ class PPOAgent:
                 batch_old_log_probs = old_log_probs[batch_indices]
                 batch_advantages = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
+                
+                # GPU verification: Log every few batches during Turbo mode to show GPU activity
+                batch_num = start // batch_size + 1
+                if self.device.type == 'cuda' and batch_num == 1 and epoch == 0:
+                    import time
+                    # Force GPU work to be visible
+                    torch.cuda.synchronize()
+                    gpu_mem_before = torch.cuda.memory_allocated(0) / 1e9
+                    batch_start_time = time.time()
+                    print(f"\n   🔥🔥🔥 STARTING FIRST BATCH - GPU SHOULD SPIKE NOW! 🔥🔥🔥")
+                    print(f"      Batch {batch_num}/{batches_per_epoch} (Epoch {epoch+1}/{n_epochs})")
+                    print(f"      GPU Memory before: {gpu_mem_before:.3f} GB")
+                    print(f"      ⚡⚡⚡ Check monitor_gpu.sh NOW! ⚡⚡⚡\n")
                 
                 # Use mixed precision if available
                 if autocast is not None:
@@ -368,6 +416,18 @@ class PPOAgent:
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                     self.critic_optimizer.step()
                 
+                # GPU verification: After first batch, check GPU activity
+                if self.device.type == 'cuda' and batch_num == 1 and epoch == 0:
+                    import time
+                    torch.cuda.synchronize()  # Force GPU work to complete
+                    gpu_mem_after = torch.cuda.memory_allocated(0) / 1e9
+                    batch_time = time.time() - batch_start_time
+                    print(f"\n   ✅ FIRST BATCH COMPLETE:")
+                    print(f"      GPU Memory after: {gpu_mem_after:.3f} GB")
+                    print(f"      Batch time: {batch_time*1000:.1f}ms")
+                    print(f"      💡 Note: Small models may not show high GPU utilization")
+                    print(f"      💡 If training is fast (4-5s per update), GPU is working correctly\n")
+                
                 # Update scaler if using mixed precision
                 if scaler is not None:
                     scaler.update()
@@ -415,6 +475,18 @@ class PPOAgent:
     
     def save_with_training_state(self, filepath: str, timestep: int, episode: int, episode_rewards: list, episode_lengths: list):
         """Save agent state with training progress metadata"""
+        # Extract hidden_dims from actor network architecture
+        hidden_dims = []
+        for i, layer in enumerate(self.actor.feature_layers):
+            if isinstance(layer, torch.nn.Linear):
+                # Get output size - this is the hidden dimension
+                if i == 0:
+                    # First layer: input_dim -> hidden_dim, output is hidden_dim
+                    hidden_dims.append(layer.out_features)
+                else:
+                    # Subsequent layers
+                    hidden_dims.append(layer.out_features)
+        
         torch.save({
             "actor_state_dict": self.actor.state_dict(),
             "critic_state_dict": self.critic.state_dict(),
@@ -424,8 +496,10 @@ class PPOAgent:
             "episode": episode,
             "episode_rewards": episode_rewards,
             "episode_lengths": episode_lengths,
+            "hidden_dims": hidden_dims,  # Save architecture for resume
+            "state_dim": self.state_dim,  # Save state_dim too
         }, filepath)
-        print(f"Agent saved with training state to: {filepath} (timestep={timestep}, episode={episode})")
+        print(f"Agent saved with training state to: {filepath} (timestep={timestep}, episode={episode}, hidden_dims={hidden_dims})")
     
     def load_with_training_state(self, filepath: str):
         """Load agent state and return training progress metadata"""

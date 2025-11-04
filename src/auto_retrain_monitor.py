@@ -84,11 +84,17 @@ class NT8DataMonitor(FileSystemEventHandler):
         """Check if file should trigger retraining"""
         # Only watch CSV and TXT files
         if file_path.suffix.lower() not in ['.csv', '.txt']:
+            logger.debug(f"Skipping {file_path.name}: not a CSV or TXT file (ext: {file_path.suffix})")
             return False
         
         # Check if we already processed this file
-        file_key = f"{file_path.stem}_{file_path.stat().st_size}"
-        if file_key in self.known_files:
+        try:
+            file_key = f"{file_path.stem}_{file_path.stat().st_size}"
+            if file_key in self.known_files:
+                logger.debug(f"Skipping {file_path.name}: already processed (key: {file_key})")
+                return False
+        except Exception as e:
+            logger.warning(f"Error checking known files for {file_path.name}: {e}")
             return False
         
         # Check if file is complete (not being written)
@@ -98,11 +104,13 @@ class NT8DataMonitor(FileSystemEventHandler):
             time.sleep(1)
             new_stat = file_path.stat()
             if stat.st_size != new_stat.st_size:
-                logger.info(f"File still being written: {file_path.name}")
+                logger.info(f"File still being written: {file_path.name} (size changed from {stat.st_size} to {new_stat.st_size})")
                 return False
-        except:
+        except Exception as e:
+            logger.warning(f"Error checking file completion for {file_path.name}: {e}")
             return False
         
+        logger.info(f"✅ File should trigger: {file_path.name} (size: {stat.st_size})")
         return True
     
     def on_created(self, event: FileCreatedEvent):
@@ -111,24 +119,33 @@ class NT8DataMonitor(FileSystemEventHandler):
             return
         
         file_path = Path(event.src_path)
+        logger.debug(f"File created event: {file_path.name}")
         
         # Check if this is a data file we care about
         if not self._should_trigger(file_path):
+            logger.debug(f"File {file_path.name} did not pass trigger check")
             return
         
         logger.info(f"📁 New file detected: {file_path.name}")
         
         # Mark as known to avoid duplicate processing
-        file_key = f"{file_path.stem}_{file_path.stat().st_size}"
-        self.known_files.add(file_key)
-        self._save_cache()
+        try:
+            file_key = f"{file_path.stem}_{file_path.stat().st_size}"
+            self.known_files.add(file_key)
+            self._save_cache()
+            logger.info(f"   Marked as known: {file_key}")
+        except Exception as e:
+            logger.error(f"Error marking file as known: {e}")
+            return
         
         # Add to pending files (debounce)
         self.pending_files.add(file_path)
         self.last_event_time[file_path] = time.time()
+        logger.info(f"   Added to pending files (total pending: {len(self.pending_files)})")
         
         # Schedule callback with debounce
         self._schedule_callback()
+        logger.info(f"   Scheduled callback (will trigger in {self.debounce_seconds}s if no more files)")
     
     def on_modified(self, event: FileModifiedEvent):
         """Handle file modification event (in case file is replaced)"""
@@ -164,6 +181,7 @@ class NT8DataMonitor(FileSystemEventHandler):
         # Cancel existing timer if any
         if self.debounce_timer is not None:
             self.debounce_timer.cancel()
+            logger.debug("Cancelled existing debounce timer")
         
         # Schedule new callback
         def debounced_callback():
@@ -172,10 +190,20 @@ class NT8DataMonitor(FileSystemEventHandler):
                 self.pending_files.clear()
                 
                 logger.info(f"🚀 Triggering retrain for {len(files)} new file(s)")
-                self.callback(files)
+                for f in files:
+                    logger.info(f"   - {Path(f).name}")
+                try:
+                    self.callback(files)
+                except Exception as e:
+                    logger.error(f"❌ Error in retrain callback: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            else:
+                logger.debug("Debounce callback called but no pending files or callback available")
         
         self.debounce_timer = threading.Timer(self.debounce_seconds, debounced_callback)
         self.debounce_timer.start()
+        logger.info(f"⏱️  Scheduled retrain callback in {self.debounce_seconds}s (pending: {len(self.pending_files)} file(s))")
 
 
 class AutoRetrainMonitor:
