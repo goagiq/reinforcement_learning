@@ -213,9 +213,9 @@ class Trainer:
         
         # Adaptive Turbo mode: Track multipliers for dynamic adjustment
         # Target: 65% GPU utilization, <8GB VRAM
-        # Start at MAXIMUM since VRAM is only 13% - model is severely underutilized
-        self.turbo_batch_multiplier = 50.0  # Start at MAXIMUM (50x = 3200 batch size for base 64)
-        self.turbo_epoch_multiplier = 5.0   # Start aggressive (5x = 50 epochs)
+        # Start at MAXIMUM since VRAM is only 11-14% - model is severely underutilized
+        self.turbo_batch_multiplier = 50.0  # Start at MAXIMUM (50x = 6400 batch size for base 128)
+        self.turbo_epoch_multiplier = 8.0   # Start VERY aggressive (8x = 240 epochs with base 30)
         self.gpu_target_util = 65.0  # Target GPU utilization %
         self.vram_limit_gb = 8.0    # VRAM limit in GB
         self.max_batch_multiplier = 100.0  # Increased max multiplier (for very small models with lots of VRAM)
@@ -713,7 +713,7 @@ class Trainer:
                                             # Triple the batch multiplier if VRAM is extremely low
                                             self.turbo_batch_multiplier = min(self.max_batch_multiplier, self.turbo_batch_multiplier * 3.0)
                                             # Also increase epochs aggressively (more work per update = more GPU time)
-                                            self.turbo_epoch_multiplier = min(10.0, self.turbo_epoch_multiplier * 2.0)
+                                            self.turbo_epoch_multiplier = min(15.0, self.turbo_epoch_multiplier * 2.5)
                                             if self.turbo_batch_multiplier != old_batch_mult:
                                                 print(f"   📈 TRIPLING batch multiplier: {old_batch_mult:.2f}x → {self.turbo_batch_multiplier:.2f}x")
                                             else:
@@ -726,7 +726,7 @@ class Trainer:
                                             # Double the batch multiplier if VRAM is this low
                                             self.turbo_batch_multiplier = min(self.max_batch_multiplier, self.turbo_batch_multiplier * 2.0)
                                             # Also increase epochs (more work per update)
-                                            self.turbo_epoch_multiplier = min(8.0, self.turbo_epoch_multiplier * 1.5)
+                                            self.turbo_epoch_multiplier = min(12.0, self.turbo_epoch_multiplier * 2.0)
                                             if self.turbo_batch_multiplier != old_batch_mult:
                                                 print(f"   📈 DOUBLING batch multiplier: {old_batch_mult:.2f}x → {self.turbo_batch_multiplier:.2f}x")
                                             else:
