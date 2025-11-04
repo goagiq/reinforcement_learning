@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, List
 import os
 from strands import Agent
 from strands.models.anthropic import AnthropicModel
+from strands.models.ollama import OllamaModel as StrandsOllamaModel
 from src.reasoning_engine import ReasoningEngine
 from src.agentic_swarm.shared_context import SharedContext
 
@@ -63,59 +64,85 @@ class BaseSwarmAgent:
         
         # Get model configuration from config
         provider_config = self.config.get("reasoning", {})
-        model_name = provider_config.get("model", "claude-sonnet-4-20250514")
+        provider_type = provider_config.get("provider", "anthropic").lower()
         
-        # Get API key from environment or config
-        api_key = provider_config.get("api_key") or os.getenv("ANTHROPIC_API_KEY")
-        
-        # Allow skipping API key check ONLY in test/mock mode (for unit tests)
-        # WARNING: This should NEVER be True in production
-        skip_api_check = provider_config.get("skip_api_check", False)
-        
-        # Safety check: Warn if skip_api_check is used outside of test environment
-        if skip_api_check:
-            import sys
-            is_test_env = "pytest" in sys.modules or "unittest" in sys.modules or "test" in sys.argv[0].lower()
-            if not is_test_env:
-                import warnings
-                warnings.warn(
-                    "skip_api_check is enabled but not in test environment! "
-                    "This should only be used for unit tests. API calls will fail.",
-                    UserWarning,
-                    stacklevel=2
-                )
-        
-        if not api_key and not skip_api_check:
-            raise ValueError(
-                "ANTHROPIC_API_KEY not found in environment or config. "
-                "Set ANTHROPIC_API_KEY environment variable or provide in config."
+        # Create model based on provider type
+        if provider_type == "ollama":
+            # Ollama configuration
+            model_name = provider_config.get("model", "deepseek-r1:8b")
+            base_url = provider_config.get("base_url") or "http://localhost:11434"
+            
+            # Allow skipping connection check for tests
+            skip_api_check = provider_config.get("skip_api_check", False)
+            
+            # Create Strands Ollama model
+            # Note: OllamaModel uses 'host' and 'model_id' parameters
+            # It may validate connection during initialization
+            llm_model = StrandsOllamaModel(
+                host=base_url,
+                model_id=model_name,
+                keep_alive=provider_config.get("keep_alive", "5m"),
+                max_tokens=provider_config.get("max_tokens", 4096),
+                temperature=provider_config.get("temperature", 0.7)
             )
-        
-        # Use dummy key ONLY for mocked tests (will fail on real API calls)
-        if not api_key:
+            
+        elif provider_type == "anthropic":
+            # Anthropic configuration
+            model_name = provider_config.get("model", "claude-sonnet-4-20250514")
+            
+            # Get API key from environment or config
+            api_key = provider_config.get("api_key") or os.getenv("ANTHROPIC_API_KEY")
+            
+            # Allow skipping API key check ONLY in test/mock mode (for unit tests)
+            # WARNING: This should NEVER be True in production
+            skip_api_check = provider_config.get("skip_api_check", False)
+            
+            # Safety check: Warn if skip_api_check is used outside of test environment
             if skip_api_check:
-                api_key = "test-api-key"  # Dummy key for mocked tests
-            else:
-                raise ValueError("API key is required for production use")
+                import sys
+                is_test_env = "pytest" in sys.modules or "unittest" in sys.modules or "test" in sys.argv[0].lower()
+                if not is_test_env:
+                    import warnings
+                    warnings.warn(
+                        "skip_api_check is enabled but not in test environment! "
+                        "This should only be used for unit tests. API calls will fail.",
+                        UserWarning,
+                        stacklevel=2
+                    )
+            
+            if not api_key and not skip_api_check:
+                raise ValueError(
+                    "ANTHROPIC_API_KEY not found in environment or config. "
+                    "Set ANTHROPIC_API_KEY environment variable or provide in config."
+                )
+            
+            # Use dummy key ONLY for mocked tests (will fail on real API calls)
+            if not api_key:
+                if skip_api_check:
+                    api_key = "test-api-key"  # Dummy key for mocked tests
+                else:
+                    raise ValueError("API key is required for production use")
+            
+            # Create Strands Anthropic model
+            # Note: AnthropicModel uses client_args for API key and model_id for model selection
+            llm_model = AnthropicModel(
+                client_args={
+                    "api_key": api_key,
+                },
+                model_id=model_name,
+                max_tokens=provider_config.get("max_tokens", 4096),
+                params={
+                    "temperature": provider_config.get("temperature", 0.7),
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported provider type: {provider_type}. Use 'ollama' or 'anthropic'")
         
-        # Create Strands Anthropic model
-        # Note: AnthropicModel uses client_args for API key and model_id for model selection
-        anthropic_model = AnthropicModel(
-            client_args={
-                "api_key": api_key,
-            },
-            model_id=model_name,
-            max_tokens=provider_config.get("max_tokens", 4096),
-            params={
-                "temperature": provider_config.get("temperature", 0.7),
-            }
-        )
-        
-        # Create Strands Agent with Anthropic model
+        # Create Strands Agent with the selected model
         self.agent = Agent(
             name=name,
             system_prompt=system_prompt,
-            model=anthropic_model
+            model=llm_model
         )
         
         # Agent description for swarm coordination

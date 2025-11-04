@@ -15,7 +15,7 @@ class OllamaClient:
         self.base_url = base_url
         self.model = "deepseek-r1:8b"
     
-    def chat(self, messages: List[Dict[str, str]], stream: bool = True, timeout: int = 600) -> str:
+    def chat(self, messages: List[Dict[str, str]], stream: bool = True, timeout: int = 600, keep_alive: str = "10m") -> str:
         """
         Send chat messages to Ollama model with streaming support.
         
@@ -23,6 +23,7 @@ class OllamaClient:
             messages: List of message dicts with 'role' and 'content'
             stream: Whether to stream the response (default: True for better UX)
             timeout: Timeout in seconds (default: 600 for DeepSeek-R1 reasoning)
+            keep_alive: Keep model loaded in memory (default: "10m" for 10 minutes)
         
         Returns:
             Complete response text
@@ -32,6 +33,7 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "stream": stream,
+            "keep_alive": keep_alive,  # Keep model pre-loaded for faster responses
             "options": {
                 "temperature": 0.7,
                 "top_p": 0.9,

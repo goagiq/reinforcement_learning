@@ -47,7 +47,8 @@ class OllamaProvider(BaseLLMProvider):
         temperature: float = 0.3,
         top_p: float = 0.9,
         stream: bool = False,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        keep_alive: str = "10m"  # Keep model loaded in memory (default 10 minutes)
     ) -> str:
         """Call Ollama API"""
         url = f"{self.base_url}/api/chat"
@@ -56,6 +57,7 @@ class OllamaProvider(BaseLLMProvider):
             "model": model,
             "messages": messages,
             "stream": stream,
+            "keep_alive": keep_alive,  # Keep model pre-loaded for faster responses
             "options": {
                 "temperature": temperature,
                 "top_p": top_p,

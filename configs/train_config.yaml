@@ -68,6 +68,7 @@ reasoning:
   model: "deepseek-r1:8b"            # Model name (provider-specific)
   api_key: null                       # API key (required for cloud providers, set via environment variable or settings)
   base_url: null                      # Base URL (optional, uses provider defaults if null)
+  keep_alive: "10m"                   # Keep model loaded in memory (10 minutes) for faster responses
   pre_trade_validation: true         # Validate before trading
   confidence_threshold: 0.7           # Minimum confidence to trade
   timeout: 2.0                        # Reasoning timeout (seconds)
@@ -76,6 +77,7 @@ reasoning:
 agentic_swarm:
   enabled: true                       # Enable agentic swarm system
   provider: "ollama"                  # Uses existing LLM provider from reasoning config
+  keep_alive: "10m"                   # Keep model loaded in memory (10 minutes) for faster responses
   max_handoffs: 10                    # Maximum agent handoffs
   max_iterations: 15                  # Maximum total iterations
   execution_timeout: 20.0             # Total execution timeout (seconds)

@@ -70,7 +70,8 @@ class LiveTradingSystem:
                 model=reasoning_config.get("model", "deepseek-r1:8b"),
                 api_key=api_key,
                 base_url=reasoning_config.get("base_url"),
-                timeout=int(reasoning_config.get("timeout", 2.0) * 60)  # Convert to seconds
+                timeout=int(reasoning_config.get("timeout", 2.0) * 60),  # Convert to seconds
+                keep_alive=reasoning_config.get("keep_alive", "10m")  # Keep model pre-loaded
             )
             self.reasoning_enabled = True
         else:

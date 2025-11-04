@@ -89,7 +89,8 @@ class ReasoningEngine:
         model: str = "deepseek-r1:8b",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        timeout: int = 600
+        timeout: int = 600,
+        keep_alive: str = "10m"  # Keep model loaded in memory (default 10 minutes)
     ):
         """
         Initialize reasoning engine with specified provider.
@@ -98,12 +99,14 @@ class ReasoningEngine:
             provider_type: "ollama", "deepseek_cloud", or "grok"
             model: Model name (provider-specific)
             api_key: API key (required for cloud providers)
-            base_url: Base URL (optional, uses defaults if not provided)
+            base_url: Base URL (optional, uses provider defaults if not provided)
             timeout: Request timeout in seconds
+            keep_alive: Keep model loaded in memory for Ollama (e.g., "10m", "5m", "0" for no keep-alive)
         """
         self.provider_type = provider_type.lower()
         self.model = model
         self.timeout = timeout
+        self.keep_alive = keep_alive
         
         # Initialize provider
         provider_kwargs = {}
@@ -137,14 +140,21 @@ class ReasoningEngine:
             if "grok" not in model_name.lower():
                 model_name = "grok-beta"  # Default Grok model
         
-        return self.provider.chat(
-            messages=messages,
-            model=model_name,
-            temperature=0.3,  # Lower temperature for more focused reasoning
-            top_p=0.9,
-            stream=stream,
-            timeout=self.timeout
-        )
+        # Pass keep_alive for Ollama provider (ignored by other providers)
+        chat_kwargs = {
+            "messages": messages,
+            "model": model_name,
+            "temperature": 0.3,  # Lower temperature for more focused reasoning
+            "top_p": 0.9,
+            "stream": stream,
+            "timeout": self.timeout
+        }
+        
+        # Add keep_alive for Ollama provider
+        if self.provider_type == "ollama":
+            chat_kwargs["keep_alive"] = self.keep_alive
+        
+        return self.provider.chat(**chat_kwargs)
     
     def pre_trade_analysis(
         self,

@@ -83,7 +83,8 @@ class SwarmOrchestrator:
                 model=reasoning_config.get("model", "deepseek-r1:8b"),
                 api_key=api_key,
                 base_url=reasoning_config.get("base_url"),
-                timeout=int(reasoning_config.get("timeout", 2.0) * 60)
+                timeout=int(reasoning_config.get("timeout", 2.0) * 60),
+                keep_alive=reasoning_config.get("keep_alive", "10m")  # Keep model pre-loaded
             )
         else:
             self.reasoning_engine = reasoning_engine
@@ -120,8 +121,12 @@ class SwarmOrchestrator:
     
     def _init_agents(self):
         """Initialize all agents."""
+        # Get reasoning config to pass to agents (includes keep_alive for Ollama)
+        reasoning_config = self.config.get("reasoning", {})
+        
         # Market Research Agent
         market_research_config = self.swarm_config.get("market_research", {})
+        market_research_config["reasoning"] = reasoning_config  # Include reasoning config
         self.market_research_agent = MarketResearchAgent(
             shared_context=self.shared_context,
             market_data_provider=self.market_data_provider,
@@ -131,6 +136,7 @@ class SwarmOrchestrator:
         
         # Sentiment Agent
         sentiment_config = self.swarm_config.get("sentiment", {})
+        sentiment_config["reasoning"] = reasoning_config  # Include reasoning config
         self.sentiment_agent = SentimentAgent(
             shared_context=self.shared_context,
             sentiment_provider=self.sentiment_provider,
@@ -140,6 +146,7 @@ class SwarmOrchestrator:
         
         # Contrarian Agent (runs parallel with MarketResearch and Sentiment)
         contrarian_config = self.swarm_config.get("contrarian", {})
+        contrarian_config["reasoning"] = reasoning_config  # Include reasoning config
         self.contrarian_agent = ContrarianAgent(
             shared_context=self.shared_context,
             market_data_provider=self.market_data_provider,
@@ -149,6 +156,7 @@ class SwarmOrchestrator:
         
         # Analyst Agent
         analyst_config = self.swarm_config.get("analyst", {})
+        analyst_config["reasoning"] = reasoning_config  # Include reasoning config
         self.analyst_agent = AnalystAgent(
             shared_context=self.shared_context,
             reasoning_engine=self.reasoning_engine,
@@ -157,6 +165,7 @@ class SwarmOrchestrator:
         
         # Recommendation Agent
         recommendation_config = self.swarm_config.get("recommendation", {})
+        recommendation_config["reasoning"] = reasoning_config  # Include reasoning config
         self.recommendation_agent = RecommendationAgent(
             shared_context=self.shared_context,
             risk_manager=self.risk_manager,
