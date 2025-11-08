@@ -1,0 +1,90 @@
+{
+  "dashboard": {
+    "title": "Kong Gateway - LLM API Monitoring",
+    "tags": ["kong", "llm", "api-gateway"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Total Requests",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_total[5m]))",
+            "legendFormat": "Total Requests/sec"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Requests per Service",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_total[5m])) by (service)",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_status{code=~\"5..\"}[5m])) / sum(rate(kong_http_requests_total[5m])) * 100",
+            "legendFormat": "Error Rate %"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Request Latency (P95)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(kong_http_requests_latency_ms_bucket[5m])) by (le, service))",
+            "legendFormat": "P95 Latency - {{service}}"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Cache Hit Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_proxy_cache_total{status=\"hit\"}[5m])) / sum(rate(kong_proxy_cache_total[5m])) * 100",
+            "legendFormat": "Cache Hit Rate %"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Rate Limit Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(kong_ratelimiting_usage) by (service)",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Requests per Consumer",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_consumer_total[5m])) by (consumer)",
+            "legendFormat": "{{consumer}}"
+          }
+        ]
+      }
+    ],
+    "refresh": "10s",
+    "schemaVersion": 16,
+    "version": 1
+  }
+}
+

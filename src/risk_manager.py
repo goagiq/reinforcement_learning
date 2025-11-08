@@ -2,12 +2,36 @@
 Risk Management Module
 
 Implements risk controls and position sizing logic.
+Integrates with Monte Carlo risk assessment for advanced risk analysis.
 """
 
 import numpy as np
-from typing import Dict, Optional
+import pandas as pd
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
+import sys
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+try:
+    from src.monte_carlo_risk import MonteCarloRiskAnalyzer, MonteCarloResult
+    MONTE_CARLO_AVAILABLE = True
+except ImportError:
+    MONTE_CARLO_AVAILABLE = False
+    MonteCarloRiskAnalyzer = None
+    MonteCarloResult = None
+
+try:
+    from src.volatility_predictor import VolatilityPredictor, VolatilityForecast
+    VOLATILITY_PREDICTOR_AVAILABLE = True
+except ImportError:
+    VOLATILITY_PREDICTOR_AVAILABLE = False
+    VolatilityPredictor = None
+    VolatilityForecast = None
 
 
 @dataclass
@@ -63,6 +87,28 @@ class RiskManager:
         # Position tracking
         self.current_positions = {}  # instrument -> position_size
         self.total_exposure = 0.0
+        
+        # Monte Carlo risk analyzer (optional)
+        self.monte_carlo_enabled = risk_config.get("monte_carlo_enabled", True)
+        if self.monte_carlo_enabled and MONTE_CARLO_AVAILABLE:
+            self.monte_carlo = MonteCarloRiskAnalyzer(
+                initial_capital=self.initial_capital,
+                n_simulations=risk_config.get("monte_carlo_simulations", 1000),
+                max_position_risk=risk_config.get("max_position_risk", 0.02)
+            )
+        else:
+            self.monte_carlo = None
+        
+        # Volatility predictor (optional)
+        self.volatility_enabled = risk_config.get("volatility_prediction_enabled", True)
+        if self.volatility_enabled and VOLATILITY_PREDICTOR_AVAILABLE:
+            self.volatility_predictor = VolatilityPredictor(
+                lookback_periods=risk_config.get("volatility_lookback", 252),
+                prediction_horizon=risk_config.get("volatility_horizon", 1),
+                volatility_window=risk_config.get("volatility_window", 20)
+            )
+        else:
+            self.volatility_predictor = None
     
     def reset_daily(self):
         """Reset daily limits (call at start of each trading day)"""
@@ -96,18 +142,25 @@ class RiskManager:
         self,
         target_position: float,
         current_position: float,
-        market_data: Optional[Dict] = None
-    ) -> float:
+        market_data: Optional[Dict] = None,
+        price_data: Optional[pd.DataFrame] = None,
+        current_price: Optional[float] = None,
+        use_monte_carlo: bool = True
+    ) -> Tuple[float, Optional[MonteCarloResult]]:
         """
         Validate and adjust trading action based on risk limits.
+        Optionally uses Monte Carlo simulation for risk assessment.
         
         Args:
             target_position: Desired position size from agent
             current_position: Current position size
             market_data: Market data (for stop loss calculation)
+            price_data: Historical price data (for Monte Carlo)
+            current_price: Current market price (for Monte Carlo)
+            use_monte_carlo: Whether to use Monte Carlo risk assessment
         
         Returns:
-            Adjusted position size (may be reduced or set to 0)
+            Tuple of (adjusted_position_size, monte_carlo_result)
         """
         # Reset daily limits if needed
         self.reset_daily()
@@ -115,12 +168,12 @@ class RiskManager:
         # Check drawdown limit
         if self.current_drawdown >= self.limits.max_drawdown:
             print(f"⚠️  Max drawdown reached ({self.current_drawdown:.2%}). Stopping trading.")
-            return 0.0
+            return 0.0, None
         
         # Check daily loss limit
         if self.daily_loss >= self.limits.max_daily_loss:
             print(f"⚠️  Daily loss limit reached ({self.daily_loss:.2%}). Stopping trading.")
-            return 0.0
+            return 0.0, None
         
         # Check position size limit
         target_position = np.clip(
@@ -142,14 +195,174 @@ class RiskManager:
         
         # Check if change is significant
         if abs(position_change) < 0.01:
-            return current_position  # No change needed
+            return current_position, None  # No change needed
         
-        # Additional validation: volatility-based position sizing
-        if market_data:
-            # Could calculate ATR or volatility here
-            # For now, just ensure we don't exceed limits
-            pass
+        # Trend detection and asymmetric risk management for downtrends
+        trend_adjustment = self._detect_trend_and_adjust(
+            target_position,
+            price_data,
+            current_price
+        )
+        target_position = trend_adjustment
         
+        # Volatility-based position adjustment (if available)
+        volatility_multiplier = 1.0
+        volatility_forecast = None
+        if self.volatility_predictor and price_data is not None:
+            try:
+                volatility_forecast = self.volatility_predictor.predict_volatility(price_data, method="adaptive")
+                volatility_multiplier = self.volatility_predictor.get_adaptive_position_multiplier(
+                    target_position, volatility_forecast
+                )
+                # Apply volatility adjustment
+                target_position = target_position * volatility_multiplier
+                if abs(volatility_multiplier - 1.0) > 0.05:  # Significant adjustment
+                    print(f"⚠️  Position adjusted based on volatility: {volatility_multiplier:.2f}x (volatility percentile: {volatility_forecast.volatility_percentile:.1f}%)")
+            except Exception as e:
+                print(f"⚠️  Volatility prediction failed: {e}")
+        
+        # Monte Carlo risk assessment (if available and requested)
+        monte_carlo_result = None
+        if use_monte_carlo and self.monte_carlo and price_data is not None and current_price is not None:
+            try:
+                # Calculate stop loss if available
+                stop_loss = None
+                if market_data:
+                    stop_loss = self.calculate_stop_loss(
+                        current_price, target_position, market_data
+                    )
+                
+                # Run Monte Carlo simulation
+                monte_carlo_result = self.monte_carlo.assess_trade_risk(
+                    current_price=current_price,
+                    proposed_position=target_position,
+                    current_position=current_position,
+                    price_data=price_data,
+                    entry_price=current_price,
+                    stop_loss=stop_loss,
+                    time_horizon=1,
+                    simulate_overnight=True
+                )
+                
+                # Adjust position based on Monte Carlo recommendations
+                if monte_carlo_result.risk_metrics.optimal_position_size < abs(target_position):
+                    # Risk is too high - reduce position size
+                    risk_adjusted_size = monte_carlo_result.risk_metrics.optimal_position_size * np.sign(target_position)
+                    print(f"⚠️  Position reduced based on Monte Carlo risk: {target_position:.2f} → {risk_adjusted_size:.2f}")
+                    target_position = risk_adjusted_size
+                
+                # Additional checks based on risk metrics
+                if monte_carlo_result.risk_metrics.tail_risk > 0.10:  # More than 10% tail risk
+                    print(f"⚠️  High tail risk ({monte_carlo_result.risk_metrics.tail_risk:.1%}). Reducing position.")
+                    target_position *= 0.5  # Reduce by half
+                
+                if monte_carlo_result.risk_metrics.var_99 < -self.initial_capital * 0.05:  # VaR > 5% of capital
+                    print(f"⚠️  High VaR ({monte_carlo_result.risk_metrics.var_99:.0f}). Reducing position.")
+                    target_position *= 0.7  # Reduce by 30%
+                    
+            except Exception as e:
+                print(f"⚠️  Monte Carlo risk assessment failed: {e}")
+                # Continue with basic validation if Monte Carlo fails
+        
+        return target_position, monte_carlo_result
+    
+    def _detect_trend_and_adjust(
+        self,
+        target_position: float,
+        price_data: Optional[pd.DataFrame],
+        current_price: Optional[float]
+    ) -> float:
+        """
+        Detect market trend and apply asymmetric risk management for downtrends.
+        
+        In downtrends:
+        - Reduce long positions by 50-70%
+        - Tighter stop losses (1.5x ATR instead of 2.0x)
+        - Reduce position size more aggressively
+        
+        In uptrends:
+        - Normal position sizing
+        - Standard stop losses
+        
+        Args:
+            target_position: Target position size
+            price_data: Historical price data
+            current_price: Current market price
+        
+        Returns:
+            Adjusted position size
+        """
+        if price_data is None or current_price is None or len(price_data) < 20:
+            # Not enough data to detect trend - return unchanged
+            return target_position
+        
+        try:
+            # Calculate trend indicators
+            # 1. Moving average trend (20-period SMA)
+            if 'close' in price_data.columns:
+                closes = price_data['close'].values
+                if len(closes) >= 20:
+                    sma_20 = np.mean(closes[-20:])
+                    sma_50 = np.mean(closes[-min(50, len(closes)):]) if len(closes) >= 50 else sma_20
+                    
+                    # 2. Price momentum (rate of change)
+                    price_change_20 = (closes[-1] - closes[-20]) / closes[-20] if len(closes) >= 20 else 0.0
+                    price_change_5 = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 5 else 0.0
+                    
+                    # 3. Trend strength (how far price is from moving average)
+                    trend_strength = (current_price - sma_20) / sma_20 if sma_20 > 0 else 0.0
+                    
+                    # Detect downtrend
+                    is_downtrend = (
+                        (current_price < sma_20 and sma_20 < sma_50) or  # Price below both MAs
+                        (price_change_20 < -0.03) or  # 20-period decline > 3%
+                        (price_change_5 < -0.01 and trend_strength < -0.01)  # Recent decline with negative trend
+                    )
+                    
+                    # Detect strong downtrend
+                    is_strong_downtrend = (
+                        (current_price < sma_20 * 0.98) or  # Price 2%+ below SMA
+                        (price_change_20 < -0.05) or  # 20-period decline > 5%
+                        (trend_strength < -0.02)  # Strong negative trend
+                    )
+                    
+                    # Apply asymmetric risk management
+                    if is_downtrend and target_position > 0:
+                        # Long position in downtrend - reduce aggressively
+                        if is_strong_downtrend:
+                            # Strong downtrend: reduce long positions by 70%
+                            reduction = 0.3
+                            print(f"⚠️  Strong downtrend detected. Reducing long position by 70%.")
+                        else:
+                            # Moderate downtrend: reduce long positions by 50%
+                            reduction = 0.5
+                            print(f"⚠️  Downtrend detected. Reducing long position by 50%.")
+                        
+                        adjusted_position = target_position * reduction
+                        return adjusted_position
+                    
+                    elif is_downtrend and target_position < 0:
+                        # Short position in downtrend - allow but slightly reduce (10%) for safety
+                        adjusted_position = target_position * 0.9
+                        if abs(adjusted_position - target_position) > 0.01:
+                            print(f"ℹ️  Downtrend detected. Slightly reducing short position for safety.")
+                        return adjusted_position
+                    
+                    elif not is_downtrend and target_position < 0:
+                        # Short position in uptrend or neutral - reduce by 40%
+                        adjusted_position = target_position * 0.6
+                        print(f"⚠️  Uptrend/neutral market. Reducing short position by 40%.")
+                        return adjusted_position
+                    
+                    # Uptrend with long position - normal sizing (no adjustment)
+                    return target_position
+                
+        except Exception as e:
+            # If trend detection fails, return unchanged position
+            print(f"⚠️  Trend detection failed: {e}. Using original position size.")
+            return target_position
+        
+        # Default: return unchanged
         return target_position
     
     def calculate_stop_loss(

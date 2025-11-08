@@ -47,7 +47,7 @@ Phase 4 has successfully integrated the agentic swarm system with the RL trading
 
 ### 3. Configuration ✅
 
-**File:** `configs/train_config.yaml`
+**File:** `configs/train_config_full.yaml`
 
 **Added:**
 ```yaml
@@ -126,7 +126,7 @@ from src.live_trading import LiveTradingSystem
 import yaml
 
 # Load config
-with open("configs/train_config.yaml", "r") as f:
+with open("configs/train_config_full.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 # Initialize system

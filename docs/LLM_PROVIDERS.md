@@ -10,7 +10,7 @@ The reasoning engine now supports multiple LLM providers for flexibility and per
 
 ## Configuration
 
-Edit `configs/train_config.yaml`:
+Edit `configs/train_config_full.yaml`:
 
 ```yaml
 reasoning:

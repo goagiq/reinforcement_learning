@@ -22,13 +22,16 @@ class NT8BridgeServer:
     
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 8888,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         on_market_data: Optional[Callable] = None,
         on_trade_request: Optional[Callable] = None
     ):
-        self.host = host
-        self.port = port
+        # Allow environment variables to override defaults
+        # This is useful for Docker containers
+        import os
+        self.host = host or os.getenv("NT8_BRIDGE_HOST", "localhost")
+        self.port = port or int(os.getenv("NT8_BRIDGE_PORT", "8888"))
         self.on_market_data = on_market_data  # Callback for market data
         self.on_trade_request = on_trade_request  # Callback for trade requests
         self.socket: Optional[socket.socket] = None

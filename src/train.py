@@ -4,16 +4,23 @@ Training Script for RL Trading Agent
 This script trains the PPO agent on historical trading data.
 
 Usage:
-    python src/train.py --config configs/train_config.yaml
-    python src/train.py --config configs/train_config.yaml --device cuda
+    python src/train.py --config configs/train_config_full.yaml
+    python src/train.py --config configs/train_config_full.yaml --device cuda
 """
+
+import sys
+from pathlib import Path
+
+# Add project root to Python path to allow imports
+project_root = Path(__file__).parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 import argparse
 import yaml
 import os
 import numpy as np
 import torch
-from pathlib import Path
 from datetime import datetime
 import json
 from tqdm import tqdm
@@ -113,6 +120,7 @@ class Trainer:
         
         # Check if we're resuming from checkpoint - if so, load architecture from checkpoint
         checkpoint_hidden_dims = None
+        checkpoint_state_dim = None
         if self.checkpoint_path:
             checkpoint_path_obj = Path(str(self.checkpoint_path).replace('\\', '/'))
             if not checkpoint_path_obj.exists():
@@ -124,10 +132,10 @@ class Trainer:
                     # torch is already imported at the top of the file
                     checkpoint = torch.load(str(checkpoint_path_obj), map_location='cpu', weights_only=False)
                     checkpoint_hidden_dims = checkpoint.get("hidden_dims")
+                    checkpoint_state_dim = checkpoint.get("state_dim")
                     
                     if checkpoint_hidden_dims:
                         print(f"📐 Found architecture in checkpoint: hidden_dims={checkpoint_hidden_dims}")
-                        print(f"   Will use this architecture instead of config to match checkpoint")
                     else:
                         # Try to infer from state_dict shapes (for old checkpoints)
                         print(f"⚠️  Checkpoint doesn't have hidden_dims saved, trying to infer from model weights...")
@@ -150,6 +158,7 @@ class Trainer:
                                 if inferred_dims:
                                     checkpoint_hidden_dims = inferred_dims
                                     print(f"✅ Inferred architecture from checkpoint: hidden_dims={checkpoint_hidden_dims}")
+                                    checkpoint_state_dim = checkpoint.get("state_dim")
                                 else:
                                     print(f"⚠️  Could not infer architecture, will use config/default")
                             else:
@@ -159,13 +168,27 @@ class Trainer:
                     import traceback
                     traceback.print_exc()
                     print(f"   Will use config/default architecture")
+
+        # Determine architecture to use for agent initialization
+        config_hidden_dims = model_config.get("hidden_dims", [256, 256, 128])
+        current_state_dim = self.env.state_dim
+        architecture_matches_config = False
+        if checkpoint_hidden_dims and checkpoint_state_dim is not None:
+            architecture_matches_config = (
+                checkpoint_hidden_dims == config_hidden_dims and
+                checkpoint_state_dim == current_state_dim
+            )
+        elif checkpoint_hidden_dims:
+            architecture_matches_config = checkpoint_hidden_dims == config_hidden_dims
         
-        # Get network architecture - use checkpoint if available, else config, else default
-        if checkpoint_hidden_dims:
+        if self.checkpoint_path and checkpoint_hidden_dims and not architecture_matches_config:
+            print(f"⚠️  Checkpoint architecture differs from config. Initializing agent with config architecture: {config_hidden_dims}")
+            hidden_dims = config_hidden_dims
+        elif checkpoint_hidden_dims:
             hidden_dims = checkpoint_hidden_dims
             print(f"   Using architecture from checkpoint: {hidden_dims}")
         else:
-            hidden_dims = model_config.get("hidden_dims", [256, 256, 128])
+            hidden_dims = config_hidden_dims
             print(f"   Using architecture from config/default: {hidden_dims}")
         
         self.agent = PPOAgent(
@@ -245,7 +268,38 @@ class Trainer:
             if checkpoint_path.exists():
                 print(f"📂 Resuming from checkpoint: {checkpoint_path}")
                 print(f"   Absolute path: {checkpoint_path.resolve()}")
-                timestep, episode, rewards, lengths = self.agent.load_with_training_state(str(checkpoint_path))
+                
+                # Check for architecture mismatch
+                checkpoint = torch.load(str(checkpoint_path), map_location='cpu', weights_only=False)
+                checkpoint_hidden_dims = checkpoint.get("hidden_dims")
+                checkpoint_state_dim = checkpoint.get("state_dim")
+                
+                # Get current architecture
+                current_hidden_dims = model_config.get("hidden_dims", [256, 256, 128])
+                current_state_dim = self.env.state_dim
+                
+                # Check if architectures match
+                architecture_matches = (
+                    checkpoint_hidden_dims == current_hidden_dims and
+                    checkpoint_state_dim == current_state_dim
+                )
+                
+                if not architecture_matches:
+                    print(f"\n⚠️  Architecture mismatch detected!")
+                    print(f"   Checkpoint: state_dim={checkpoint_state_dim}, hidden_dims={checkpoint_hidden_dims}")
+                    print(f"   Current:    state_dim={current_state_dim}, hidden_dims={current_hidden_dims}")
+                    print(f"   🔄 Using transfer learning to preserve learned knowledge...")
+                    
+                    # Use transfer learning
+                    transfer_strategy = config.get("training", {}).get("transfer_strategy", "copy_and_extend")
+                    timestep, episode, rewards, lengths = self.agent.load_with_transfer(
+                        str(checkpoint_path),
+                        transfer_strategy=transfer_strategy
+                    )
+                else:
+                    # Architectures match, use normal loading
+                    timestep, episode, rewards, lengths = self.agent.load_with_training_state(str(checkpoint_path))
+                
                 checkpoint_timestep = timestep
                 self.timestep = timestep
                 self.episode = episode
@@ -963,7 +1017,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/train_config.yaml",
+        default="configs/train_config_full.yaml",
         help="Path to config file"
     )
     parser.add_argument(

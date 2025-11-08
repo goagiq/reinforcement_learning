@@ -65,13 +65,19 @@ class LiveTradingSystem:
             import os
             api_key = reasoning_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
             
+            # Kong Gateway configuration
+            use_kong = reasoning_config.get("use_kong", False)
+            kong_api_key = reasoning_config.get("kong_api_key") or os.getenv("KONG_API_KEY")
+            
             self.reasoning_engine = ReasoningEngine(
                 provider_type=reasoning_config.get("provider", "ollama"),
                 model=reasoning_config.get("model", "deepseek-r1:8b"),
                 api_key=api_key,
                 base_url=reasoning_config.get("base_url"),
                 timeout=int(reasoning_config.get("timeout", 2.0) * 60),  # Convert to seconds
-                keep_alive=reasoning_config.get("keep_alive", "10m")  # Keep model pre-loaded
+                keep_alive=reasoning_config.get("keep_alive", "10m"),  # Keep model pre-loaded
+                use_kong=use_kong,
+                kong_api_key=kong_api_key
             )
             self.reasoning_enabled = True
         else:
@@ -276,7 +282,8 @@ class LiveTradingSystem:
         )
         
         # Apply risk management (DecisionGate already handles basic risk, but apply final validation)
-        final_action = self.risk_manager.validate_action(
+        # Note: validate_action now returns (position, monte_carlo_result)
+        result = self.risk_manager.validate_action(
             decision.action,
             current_position=self.current_position,
             market_data={
@@ -286,6 +293,16 @@ class LiveTradingSystem:
                 "volume": bar.volume
             }
         )
+        
+        # Handle tuple return (position, monte_carlo_result)
+        if isinstance(result, tuple):
+            final_action, monte_carlo_result = result
+            if monte_carlo_result:
+                # Store Monte Carlo results for monitoring
+                self.monte_carlo_result = monte_carlo_result
+        else:
+            # Backward compatibility
+            final_action = result
         
         # Check if should execute
         if not self.decision_gate.should_execute(decision):

@@ -6,7 +6,7 @@ This guide explains the training configuration options and how they affect the R
 
 ## Configuration File
 
-Main configuration: `configs/train_config.yaml`
+Main configuration: `configs/train_config_full.yaml`
 
 ## Key Configuration Sections
 
@@ -329,5 +329,5 @@ environment:
 - `docs/REWARD_FUNCTION.md` - Detailed reward function explanation
 - `docs/HOW_RL_TRADING_WORKS.md` - High-level training explanation
 - `docs/RESUME_TRAINING.md` - Resume training guide
-- `configs/train_config.yaml` - Full configuration file
+- `configs/train_config_full.yaml` - Full configuration file
 

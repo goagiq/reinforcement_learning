@@ -7,6 +7,7 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
   const [performanceMode, setPerformanceMode] = useState('quiet')
   const [turboTrainingMode, setTurboTrainingMode] = useState(false)
   const [autoRetrainEnabled, setAutoRetrainEnabled] = useState(true)
+  const [contrarianEnabled, setContrarianEnabled] = useState(true)
   const [loading, setLoading] = useState(false)
   const [saved, setSaved] = useState(false)
 
@@ -35,6 +36,11 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
           if (data.auto_retrain_enabled !== undefined) {
             setAutoRetrainEnabled(data.auto_retrain_enabled)
           }
+          if (data.contrarian_enabled !== undefined) {
+            setContrarianEnabled(Boolean(data.contrarian_enabled))
+          } else {
+            setContrarianEnabled(true)
+          }
         })
         .catch(() => {
           // Ignore if endpoint doesn't exist yet
@@ -53,7 +59,8 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
         nt8_data_path: nt8DataPath || null,
         performance_mode: performanceMode,
         turbo_training_mode: turboTrainingMode,
-        auto_retrain_enabled: autoRetrainEnabled
+      auto_retrain_enabled: autoRetrainEnabled,
+      contrarian_enabled: contrarianEnabled
       }
       
       console.log('[SettingsPanel] Saving settings:', settingsPayload)
@@ -165,6 +172,30 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
                   ? "✅ Quiet mode: Uses configured batch size and epochs. Recommended for daytime use when you're using your computer."
                   : "🚀 Performance mode: Doubles batch size and increases epochs for faster training. Use when you're away (e.g., at night)."
               }
+            </p>
+          </div>
+
+          {/* Contrarian Agent Toggle */}
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              Contrarian Agent (Warren Buffett Overrides)
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="contrarianAgent"
+                checked={contrarianEnabled}
+                onChange={(e) => setContrarianEnabled(e.target.checked)}
+                className="w-5 h-5 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
+              />
+              <label htmlFor="contrarianAgent" className="text-sm text-gray-700 cursor-pointer">
+                Enable contrarian greed/fear overrides when sentiment extremes are detected
+              </label>
+            </div>
+            <p className="text-sm text-gray-500 mt-2">
+              {contrarianEnabled
+                ? "✅ Contrarian agent can override positions during extreme greed or fear to reduce tail-risk."
+                : "❌ Contrarian overrides disabled. Swarm decisions will not adjust for greed/fear extremes."}
             </p>
           </div>
 

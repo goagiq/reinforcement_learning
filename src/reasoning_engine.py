@@ -90,7 +90,9 @@ class ReasoningEngine:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: int = 600,
-        keep_alive: str = "10m"  # Keep model loaded in memory (default 10 minutes)
+        keep_alive: str = "10m",  # Keep model loaded in memory (default 10 minutes)
+        use_kong: bool = False,  # Route through Kong Gateway
+        kong_api_key: Optional[str] = None  # Kong consumer API key
     ):
         """
         Initialize reasoning engine with specified provider.
@@ -98,25 +100,32 @@ class ReasoningEngine:
         Args:
             provider_type: "ollama", "deepseek_cloud", or "grok"
             model: Model name (provider-specific)
-            api_key: API key (required for cloud providers)
-            base_url: Base URL (optional, uses provider defaults if not provided)
+            api_key: API key (required for cloud providers, unless using Kong)
+            base_url: Base URL (optional, uses provider defaults if not provided, ignored if use_kong=True)
             timeout: Request timeout in seconds
             keep_alive: Keep model loaded in memory for Ollama (e.g., "10m", "5m", "0" for no keep-alive)
+            use_kong: Route requests through Kong Gateway
+            kong_api_key: Kong consumer API key (required if use_kong=True)
         """
         self.provider_type = provider_type.lower()
         self.model = model
         self.timeout = timeout
         self.keep_alive = keep_alive
+        self.use_kong = use_kong
         
         # Initialize provider
-        provider_kwargs = {}
+        provider_kwargs = {
+            "use_kong": use_kong,
+            "kong_api_key": kong_api_key
+        }
+        
         if self.provider_type == "ollama":
             provider_kwargs["base_url"] = base_url or "http://localhost:11434"
         elif self.provider_type in ["deepseek_cloud", "grok"]:
-            if not api_key:
-                raise ValueError(f"api_key is required for {self.provider_type} provider")
+            if not use_kong and not api_key:
+                raise ValueError(f"api_key is required for {self.provider_type} provider (unless using Kong)")
             provider_kwargs["api_key"] = api_key
-            if base_url:
+            if base_url and not use_kong:
                 provider_kwargs["base_url"] = base_url
         
         self.provider = get_provider(self.provider_type, **provider_kwargs)

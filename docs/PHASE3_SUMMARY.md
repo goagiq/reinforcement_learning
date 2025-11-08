@@ -113,7 +113,7 @@ Performance Monitor (Log & Track)
 
 ## Configuration Updates
 
-Added to `configs/train_config.yaml`:
+Added to `configs/train_config_full.yaml`:
 - `live_trading` section - Trading mode settings
 - `bridge` section - NT8 connection settings
 - `decision_gate` section - Decision combination settings
@@ -123,7 +123,7 @@ Added to `configs/train_config.yaml`:
 ### 1. Prepare Model
 ```bash
 # Train model (Phase 2)
-python src/train.py --config configs/train_config.yaml
+python src/train.py --config configs/train_config_full.yaml
 
 # Backtest (Phase 2)
 python src/backtest.py --model models/best_model.pt

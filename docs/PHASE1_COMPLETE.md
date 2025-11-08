@@ -81,7 +81,7 @@ src/
 
 ### 3. Configuration ✅
 
-Added to `configs/train_config.yaml`:
+Added to `configs/train_config_full.yaml`:
 ```yaml
 agentic_swarm:
   enabled: true

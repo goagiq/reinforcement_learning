@@ -1,0 +1,22 @@
+{
+  "alerts": [
+    {
+      "name": "rate_limit_exceeded",
+      "condition": "rate_limit_hits > 10",
+      "action": "log",
+      "description": "Alert when rate limit hits exceed 10% of requests"
+    },
+    {
+      "name": "cost_threshold",
+      "condition": "daily_cost > 100",
+      "action": "notify",
+      "description": "Alert when daily cost exceeds $100"
+    },
+    {
+      "name": "provider_failure",
+      "condition": "error_rate > 5%",
+      "action": "notify",
+      "description": "Alert when provider error rate exceeds 5%"
+    }
+  ]
+}

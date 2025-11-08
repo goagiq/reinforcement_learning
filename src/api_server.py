@@ -7,13 +7,14 @@ Provides REST API and WebSocket endpoints to control all system operations.
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import yaml
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from datetime import datetime
 
 # Add project root to path
@@ -22,6 +23,7 @@ sys.path.insert(0, str(project_root))
 
 import uvicorn
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -39,17 +41,65 @@ from src.monitoring import PerformanceMonitor
 from src.model_versioning import ModelVersionManager
 from src.auto_retrain_monitor import AutoRetrainMonitor
 
+# Monte Carlo risk assessment
+try:
+    from src.monte_carlo_risk import (
+        MonteCarloRiskAnalyzer,
+        MonteCarloResult,
+        assess_position_risk
+    )
+    MONTE_CARLO_AVAILABLE = True
+except ImportError:
+    MONTE_CARLO_AVAILABLE = False
+    MonteCarloRiskAnalyzer = None
+
+# Volatility prediction
+try:
+    from src.volatility_predictor import (
+        VolatilityPredictor,
+        VolatilityForecast,
+        predict_volatility
+    )
+    VOLATILITY_PREDICTOR_AVAILABLE = True
+except ImportError:
+    VOLATILITY_PREDICTOR_AVAILABLE = False
+    VolatilityPredictor = None
+    VolatilityForecast = None
+
+# Scenario simulation
+try:
+    from src.scenario_simulator import (
+        ScenarioSimulator,
+        ScenarioResult,
+        StressTestResult,
+        ParameterSensitivityResult,
+        MarketRegime,
+        run_robustness_test
+    )
+    SCENARIO_SIMULATOR_AVAILABLE = True
+except ImportError:
+    SCENARIO_SIMULATOR_AVAILABLE = False
+    ScenarioSimulator = None
+    ScenarioResult = None
+    MarketRegime = None
+
 
 app = FastAPI(title="NT8 RL Trading System API")
 
 # CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Note: If using Kong Gateway, CORS can be handled by Kong's CORS plugin
+# This middleware remains for backward compatibility (direct access to FastAPI)
+# Set DISABLE_FASTAPI_CORS=true to disable CORS in FastAPI when using Kong
+DISABLE_FASTAPI_CORS = os.getenv("DISABLE_FASTAPI_CORS", "false").lower() == "true"
+
+if not DISABLE_FASTAPI_CORS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # In production, restrict to your frontend domain
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Global state
 active_processes: Dict[str, subprocess.Popen] = {}
@@ -62,31 +112,34 @@ auto_retrain_monitor: Optional[AutoRetrainMonitor] = None
 # Pydantic models
 class SetupCheckResponse(BaseModel):
     venv_exists: bool
+    venv_type: Optional[str] = None  # "uv", "venv", "virtualenv", "conda", etc.
     dependencies_installed: bool
     data_directory_exists: bool
     config_exists: bool
     ready: bool
     issues: List[str]
+    venv_message: Optional[str] = None  # Suggested command to create venv
 
 
 class TrainingRequest(BaseModel):
     device: str = "cpu"
     total_timesteps: Optional[int] = None
-    config_path: str = "configs/train_config.yaml"
+    config_path: str = "configs/train_config_full.yaml"
     reasoning_model: Optional[str] = None
     checkpoint_path: Optional[str] = None  # Resume from checkpoint
+    transfer_strategy: Optional[str] = None  # Transfer learning strategy: "copy_and_extend", "interpolate", "zero_pad"
 
 
 class BacktestRequest(BaseModel):
     model_path: str
     episodes: int = 20
-    config_path: str = "configs/train_config.yaml"
+    config_path: str = "configs/train_config_full.yaml"
 
 
 class LiveTradingRequest(BaseModel):
     model_path: str
     paper_trading: bool = True
-    config_path: str = "configs/train_config.yaml"
+    config_path: str = "configs/train_config_full.yaml"
 
 
 class StatusResponse(BaseModel):
@@ -100,6 +153,57 @@ class SettingsRequest(BaseModel):
     performance_mode: Optional[str] = None  # "quiet" or "performance"
     turbo_training_mode: Optional[bool] = None  # Enable turbo mode (max GPU usage)
     auto_retrain_enabled: Optional[bool] = None  # Enable/disable auto-retrain
+    contrarian_enabled: Optional[bool] = None  # Enable/disable contrarian agent in swarm
+
+
+class PromoteModelRequest(BaseModel):
+    source_path: str
+    target_name: Optional[str] = "best_model.pt"
+    overwrite: bool = True
+
+
+class MonteCarloRiskRequest(BaseModel):
+    """Request for Monte Carlo risk assessment"""
+    current_price: float
+    proposed_position: float  # Position size (-1.0 to 1.0)
+    current_position: float = 0.0  # Current position size
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    time_horizon: int = 1  # Number of periods to simulate
+    n_simulations: int = 1000
+    simulate_overnight: bool = True
+
+
+class VolatilityPredictionRequest(BaseModel):
+    """Request for volatility prediction"""
+    method: str = "adaptive"  # "adaptive", "ewma", "historical_mean"
+    lookback_periods: int = 252
+    prediction_horizon: int = 1
+
+
+class ScenarioSimulationRequest(BaseModel):
+    """Request for scenario simulation"""
+    scenarios: List[str] = ["normal", "trending_up", "trending_down", "ranging", "high_volatility", "low_volatility"]
+    intensity: float = 1.0  # Intensity multiplier for scenarios
+    use_rl_agent: bool = False  # Whether to use RL agent for backtesting
+    model_path: Optional[str] = None  # Optional model path for backtesting
+
+
+class StressTestRequest(BaseModel):
+    """Request for stress testing"""
+    scenarios: List[str] = ["crash", "flash_crash", "high_volatility", "gap_event"]
+    intensity: float = 2.0  # Higher intensity for stress tests
+    model_path: Optional[str] = None
+
+
+class ParameterSensitivityRequest(BaseModel):
+    """Request for parameter sensitivity analysis"""
+    parameter_name: str
+    parameter_values: List[float]
+    base_parameters: Dict[str, Any] = {}
+    regime: str = "normal"
+    model_path: Optional[str] = None
 
 
 # Helper function to send WebSocket messages
@@ -122,55 +226,258 @@ async def root():
     return {"message": "NT8 RL Trading System API", "version": "1.0.0"}
 
 
+@app.get("/api/monitoring/metrics")
+async def get_kong_metrics():
+    """Get Kong Gateway metrics summary"""
+    try:
+        import requests
+        
+        # Fetch Prometheus metrics from Kong
+        metrics_url = "http://localhost:8301/metrics"
+        response = requests.get(metrics_url, timeout=5)
+        
+        if response.status_code != 200:
+            return {
+                "status": "error",
+                "error": f"Failed to fetch metrics: HTTP {response.status_code}",
+                "metrics_url": metrics_url
+            }
+        
+        metrics_text = response.text
+        
+        # Parse key metrics
+        metrics = {
+            "raw_metrics_url": metrics_url,
+            "summary": {}
+        }
+        
+        # Extract request counts
+        for line in metrics_text.split('\n'):
+            if line.startswith('kong_http_requests_total') and '{' in line and not line.startswith('#'):
+                # Parse: kong_http_requests_total{service="anthropic-service"} 123
+                try:
+                    if 'service=' in line:
+                        service = line.split('service="')[1].split('"')[0]
+                        count = line.split()[-1]
+                        if service not in metrics["summary"]:
+                            metrics["summary"][service] = {}
+                        metrics["summary"][service]["total_requests"] = int(count)
+                except:
+                    pass
+        
+        return {
+            "status": "ok",
+            "metrics": metrics,
+            "note": "Full metrics available at http://localhost:8301/metrics"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "note": "Kong Gateway may not be running or accessible"
+        }
+
+
+@app.get("/api/monitoring/health")
+async def get_kong_health():
+    """Get Kong Gateway health status"""
+    try:
+        import requests
+        
+        # Check Kong admin API
+        response = requests.get("http://localhost:8301/", timeout=2)
+        kong_healthy = response.status_code == 200
+        
+        # Check metrics endpoint
+        metrics_response = requests.get("http://localhost:8301/metrics", timeout=2)
+        metrics_available = metrics_response.status_code == 200
+        
+        return {
+            "kong_status": "healthy" if kong_healthy else "unhealthy",
+            "metrics_available": metrics_available,
+            "kong_admin_url": "http://localhost:8301",
+            "metrics_url": "http://localhost:8301/metrics"
+        }
+    except Exception as e:
+        return {
+            "kong_status": "unreachable",
+            "error": str(e),
+            "note": "Kong Gateway may not be running"
+        }
+
+
+@app.get("/api/monitoring/services")
+async def get_kong_services():
+    """Get Kong Gateway services status"""
+    try:
+        import requests
+        
+        # Get all services
+        response = requests.get("http://localhost:8301/services", timeout=5)
+        
+        if response.status_code != 200:
+            return {
+                "status": "error",
+                "error": f"Failed to fetch services: HTTP {response.status_code}"
+            }
+        
+        services_data = response.json()
+        services = []
+        
+        for service in services_data.get("data", []):
+            service_info = {
+                "name": service.get("name"),
+                "url": service.get("url"),
+                "enabled": service.get("enabled", True),
+                "port": service.get("port"),
+                "host": service.get("host")
+            }
+            services.append(service_info)
+        
+        return {
+            "status": "ok",
+            "services": services,
+            "count": len(services)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "note": "Kong Gateway may not be running"
+        }
+
+
+def detect_venv_type_backend():
+    """Detect the type of virtual environment being used (backend version)"""
+    in_venv = sys.prefix != sys.base_prefix
+    venv_type = None
+    venv_message = None
+    
+    if in_venv:
+        # Check for uv virtual environment
+        venv_path = Path(sys.prefix)
+        pyvenv_cfg = venv_path / "pyvenv.cfg"
+        
+        if pyvenv_cfg.exists():
+            try:
+                with open(pyvenv_cfg, 'r') as f:
+                    content = f.read()
+                    if 'uv' in content.lower() or 'AppData\\Roaming\\uv' in content or '/uv/python' in content:
+                        venv_type = "uv"
+                        venv_message = "Using uv virtual environment"
+                    else:
+                        venv_type = "venv"
+                        venv_message = "Using standard virtual environment"
+            except:
+                venv_type = "venv"
+                venv_message = "Using virtual environment"
+        else:
+            # Could be conda or other
+            if 'conda' in sys.prefix.lower():
+                venv_type = "conda"
+                venv_message = "Using conda environment"
+            else:
+                venv_type = "unknown"
+                venv_message = "Using virtual environment"
+    
+    # Check if uv is available
+    uv_available = False
+    try:
+        result = subprocess.run(["uv", "--version"], capture_output=True, timeout=2)
+        uv_available = result.returncode == 0
+    except:
+        pass
+    
+    venv_dir_exists = Path(".venv").exists() or Path("venv").exists()
+    venv_exists = in_venv or venv_dir_exists
+    
+    # Set default message if venv doesn't exist
+    if not venv_exists:
+        if uv_available:
+            venv_message = "uv venv"
+        else:
+            venv_message = "python -m venv .venv"
+    
+    return {
+        "venv_exists": venv_exists,
+        "venv_type": venv_type,
+        "venv_message": venv_message,
+        "uv_available": uv_available
+    }
+
 @app.get("/api/setup/check", response_model=SetupCheckResponse)
 async def check_setup():
     """Check if environment is properly set up"""
     issues = []
     
-    # Check virtual environment - multiple methods:
-    # 1. Check if we're already running in a venv (sys.prefix != sys.base_prefix)
-    #    This works for venv, virtualenv, uv, conda, etc.
-    # 2. Check for .venv or venv directories
-    in_venv = sys.prefix != sys.base_prefix
-    venv_dir_exists = Path(".venv").exists() or Path("venv").exists()
-    venv_exists = in_venv or venv_dir_exists
+    # Detect virtual environment
+    venv_info = detect_venv_type_backend()
+    venv_exists = venv_info["venv_exists"]
+    venv_type = venv_info["venv_type"]
+    venv_message = venv_info["venv_message"]
     
-    # Check dependencies (simplified - check if key packages are importable)
+    # Check dependencies - check all critical packages
     dependencies_installed = True
-    try:
-        import torch
-        import gymnasium
-        import stable_baselines3
-    except ImportError:
-        dependencies_installed = False
-        issues.append("Required dependencies not installed. Run: pip install -r requirements.txt OR uv pip install -r requirements.txt")
+    missing_deps = []
+    
+    critical_packages = {
+        "torch": "PyTorch",
+        "gymnasium": "Gymnasium",
+        "stable_baselines3": "Stable-Baselines3",
+        "fastapi": "FastAPI",
+        "uvicorn": "Uvicorn",
+        "anthropic": "Anthropic",
+        "ollama": "Ollama"
+    }
+    
+    for module, name in critical_packages.items():
+        try:
+            __import__(module)
+        except ImportError as e:
+            missing_deps.append(name)
+            dependencies_installed = False
+            # Log for debugging
+            print(f"⚠ Missing dependency: {name} ({module}) - {str(e)}")
+    
+    if not dependencies_installed:
+        if venv_info["uv_available"] or venv_type == "uv":
+            issues.append(f"Missing dependencies: {', '.join(missing_deps)}. Run: uv pip install -r requirements.txt or uv sync")
+        else:
+            issues.append(f"Missing dependencies: {', '.join(missing_deps)}. Run: pip install -r requirements.txt")
     
     # Only warn about venv if dependencies aren't installed
     # (if dependencies work, environment is fine regardless of venv detection)
     if not venv_exists and not dependencies_installed:
-        issues.append("Virtual environment not detected. Recommended: python -m venv .venv OR uv venv")
+        if venv_info["uv_available"]:
+            issues.append(f"Virtual environment not detected. Recommended: {venv_message}")
+        else:
+            issues.append(f"Virtual environment not detected. Recommended: {venv_message}")
     
     # Check data directory
     data_dir = Path("data/raw")
     data_directory_exists = data_dir.exists()
     if not data_directory_exists:
-        issues.append(f"Data directory not found: {data_dir}")
+        # Don't make this a blocking issue - data can be uploaded later
+        # issues.append(f"Data directory not found: {data_dir}")
+        pass
     
     # Check config
-    config_path = Path("configs/train_config.yaml")
+    config_path = Path("configs/train_config_full.yaml")
     config_exists = config_path.exists()
     if not config_exists:
-        issues.append(f"Config file not found: {config_path}")
+        issues.append(f"Config file not found: {config_path}. Create it from configs/train_config.yaml.example if needed.")
     
     ready = len(issues) == 0
     
     return SetupCheckResponse(
         venv_exists=venv_exists,
+        venv_type=venv_type,
         dependencies_installed=dependencies_installed,
         data_directory_exists=data_directory_exists,
         config_exists=config_exists,
         ready=ready,
-        issues=issues
+        issues=issues,
+        venv_message=venv_message
     )
 
 
@@ -184,6 +491,9 @@ async def install_dependencies(background_tasks: BackgroundTasks):
             "progress": 0
         })
         
+        venv_info = detect_venv_type_backend()
+        use_uv = venv_info["uv_available"] or venv_info["venv_type"] == "uv"
+        
         # Find Python executable
         venv_python = Path(".venv/Scripts/python.exe") if os.name == "nt" else Path(".venv/bin/python")
         if not venv_python.exists():
@@ -192,21 +502,63 @@ async def install_dependencies(background_tasks: BackgroundTasks):
             venv_python = sys.executable
         
         try:
-            proc = subprocess.Popen(
-                [str(venv_python), "-m", "pip", "install", "-r", "requirements.txt"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            for line in proc.stdout:
+            if use_uv:
+                # Use uv pip install
                 await broadcast_message({
                     "type": "setup",
-                    "message": line.strip(),
-                    "progress": None
+                    "message": "Using uv to install dependencies...",
+                    "progress": 10
                 })
+                proc = subprocess.Popen(
+                    ["uv", "pip", "install", "-r", "requirements.txt"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(project_root)
+                )
+            else:
+                # Use standard pip
+                await broadcast_message({
+                    "type": "setup",
+                    "message": "Using pip to install dependencies...",
+                    "progress": 10
+                })
+                proc = subprocess.Popen(
+                    [str(venv_python), "-m", "pip", "install", "-r", "requirements.txt"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(project_root),
+                    bufsize=1,
+                    universal_newlines=True
+                )
             
+            # Read output asynchronously
+            import asyncio
+            output_lines = []
+            
+            async def read_output():
+                while True:
+                    line = proc.stdout.readline()
+                    if not line and proc.poll() is not None:
+                        break
+                    if line:
+                        line = line.strip()
+                        if line:
+                            output_lines.append(line)
+                            await broadcast_message({
+                                "type": "setup",
+                                "message": line,
+                                "progress": None
+                            })
+                    await asyncio.sleep(0.1)  # Small delay to prevent tight loop
+            
+            # Start reading output
+            read_task = asyncio.create_task(read_output())
+            
+            # Wait for process to complete
             proc.wait()
+            await read_task
             
             if proc.returncode == 0:
                 await broadcast_message({
@@ -216,11 +568,11 @@ async def install_dependencies(background_tasks: BackgroundTasks):
                     "progress": 100
                 })
             else:
-                error = proc.stderr.read()
+                error_output = '\n'.join(output_lines[-10:]) if output_lines else "No output captured"
                 await broadcast_message({
                     "type": "setup",
                     "status": "error",
-                    "message": f"Installation failed: {error}",
+                    "message": f"Installation failed (return code: {proc.returncode}): {error_output}",
                     "progress": 0
                 })
         except Exception as e:
@@ -324,6 +676,43 @@ async def list_configs():
         import traceback
         traceback.print_exc()
         return {"configs": [], "error": str(e)}
+
+@app.get("/api/config/read")
+async def read_config(path: str):
+    """Read a config file and return its contents"""
+    try:
+        from pathlib import Path
+        import yaml
+        
+        # Resolve config path
+        config_file = Path(str(path).replace('\\', '/'))
+        if not config_file.exists():
+            # Try relative to project root
+            project_root = Path(__file__).parent.parent
+            config_file = project_root / str(path).replace('\\', '/').lstrip('/')
+        
+        if not config_file.exists():
+            return {
+                "error": "Config file not found",
+                "path": path
+            }
+        
+        # Read and parse YAML
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        return {
+            "path": str(config_file),
+            "exists": True,
+            "config": config
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "path": path
+        }
 
 @app.get("/api/system/cuda-status")
 async def get_cuda_status():
@@ -439,9 +828,9 @@ def _on_auto_retrain_triggered(files):
             print(f"   Resuming from: {checkpoint_path}")
     
     # Load default config
-    config_path = "configs/train_config.yaml"
+    config_path = "configs/train_config_full.yaml"
     if not Path(config_path).exists():
-        config_path = "configs/train_config_gpu_optimized.yaml"
+        config_path = "configs/train_config_gpu.yaml"
     
     # Create training request
     training_request = TrainingRequest(
@@ -646,6 +1035,13 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         # Update reasoning model if provided
         if request.reasoning_model:
             config["reasoning"]["model"] = request.reasoning_model
+        
+        # Update transfer strategy if provided (for transfer learning)
+        if request.transfer_strategy:
+            if "training" not in config:
+                config["training"] = {}
+            config["training"]["transfer_strategy"] = request.transfer_strategy
+            print(f"[_train] Transfer learning strategy: {request.transfer_strategy}")
         
         try:
             # Log checkpoint path being used
@@ -1284,6 +1680,131 @@ async def list_models():
     }
 
 
+@app.get("/api/models/checkpoint/info")
+async def get_checkpoint_info(checkpoint_path: str):
+    """Get architecture and training info for a checkpoint"""
+    try:
+        from pathlib import Path
+        import torch
+        
+        # Validate input
+        if not checkpoint_path or checkpoint_path in ['none', 'latest']:
+            return {
+                "error": "Invalid checkpoint path",
+                "path": checkpoint_path,
+                "message": "Checkpoint path cannot be 'none' or 'latest'"
+            }
+        
+        # Resolve checkpoint path
+        checkpoint_file = Path(str(checkpoint_path).replace('\\', '/'))
+        if not checkpoint_file.exists():
+            # Try relative to project root
+            project_root = Path(__file__).parent.parent
+            checkpoint_file = project_root / str(checkpoint_path).replace('\\', '/').lstrip('/')
+        
+        if not checkpoint_file.exists():
+            # Return 200 with error JSON instead of 404
+            return {
+                "error": "Checkpoint not found",
+                "path": checkpoint_path,
+                "exists": False,
+                "message": f"Checkpoint file not found: {checkpoint_path}"
+            }
+        
+        # Load checkpoint
+        checkpoint = torch.load(str(checkpoint_file), map_location='cpu', weights_only=False)
+        
+        # Extract architecture info
+        hidden_dims = checkpoint.get("hidden_dims", None)
+        state_dim = checkpoint.get("state_dim", None)
+        timestep = checkpoint.get("timestep", 0)
+        episode = checkpoint.get("episode", 0)
+        
+        # If not in checkpoint metadata, try to infer from state dict
+        if hidden_dims is None and "actor_state_dict" in checkpoint:
+            actor_state = checkpoint["actor_state_dict"]
+            inferred_dims = []
+            
+            # Infer from feature_layers
+            layer_idx = 0
+            while f"feature_layers.{layer_idx}.weight" in actor_state:
+                layer_shape = actor_state[f"feature_layers.{layer_idx}.weight"].shape
+                inferred_dims.append(layer_shape[0])
+                layer_idx += 3  # Skip ReLU and Dropout
+            
+            if inferred_dims:
+                hidden_dims = inferred_dims
+                # Get state_dim from first layer
+                if "feature_layers.0.weight" in actor_state:
+                    state_dim = actor_state["feature_layers.0.weight"].shape[1]
+        
+        return {
+            "path": str(checkpoint_file),
+            "exists": True,
+            "architecture": {
+                "hidden_dims": hidden_dims,
+                "state_dim": state_dim
+            },
+            "training": {
+                "timestep": timestep,
+                "episode": episode
+            },
+            "has_architecture": hidden_dims is not None and state_dim is not None
+        }
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"⚠️  Error loading checkpoint info for '{checkpoint_path}': {e}")
+        print(error_trace)
+        return {
+            "error": str(e),
+            "path": checkpoint_path,
+            "exists": False,
+            "message": f"Error loading checkpoint: {str(e)}"
+        }
+
+
+@app.post("/api/models/promote")
+async def promote_model(request: PromoteModelRequest):
+    """Promote a checkpoint to a named model file (default: best_model.pt)"""
+    try:
+        if not request.source_path or request.source_path in {"none"}:
+            raise HTTPException(status_code=400, detail="Invalid source checkpoint path")
+
+        # Resolve source path (handle absolute or relative)
+        source = Path(str(request.source_path).replace("\\", "/"))
+        if not source.exists():
+            source = project_root / str(request.source_path).replace("\\", "/").lstrip("/")
+
+        if not source.exists():
+            raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.source_path}")
+
+        if not source.is_file():
+            raise HTTPException(status_code=400, detail=f"Source is not a file: {source}")
+
+        models_dir = project_root / "models"
+        models_dir.mkdir(exist_ok=True)
+
+        target_name = request.target_name or "best_model.pt"
+        target = models_dir / target_name
+
+        if target.exists() and not request.overwrite:
+            raise HTTPException(status_code=409, detail=f"Target already exists: {target}")
+
+        shutil.copy2(source, target)
+
+        return {
+            "status": "success",
+            "message": f"Promoted {source.name} to {target.name}",
+            "source": str(source),
+            "target": str(target)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to promote checkpoint: {e}")
+
+
 @app.get("/api/models/compare")
 async def compare_models():
     """Get detailed comparison between best_model and final_model"""
@@ -1646,7 +2167,7 @@ async def start_continuous_learning(background_tasks: BackgroundTasks):
         })
         
         try:
-            config_path = Path("configs/train_config.yaml")
+            config_path = Path("configs/train_config_full.yaml")
             with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
             
@@ -1728,6 +2249,8 @@ async def get_settings():
     # Ensure default values are present
     if "turbo_training_mode" not in settings:
         settings["turbo_training_mode"] = False
+    if "contrarian_enabled" not in settings:
+        settings["contrarian_enabled"] = True
     
     return {"status": "success", **settings}
 
@@ -1915,9 +2438,9 @@ async def trigger_manual_retrain(background_tasks: BackgroundTasks):
         from src.api_server import TrainingRequest
         
         # Load default config
-        config_path = "configs/train_config.yaml"
+        config_path = "configs/train_config_full.yaml"
         if not Path(config_path).exists():
-            config_path = "configs/train_config_gpu_optimized.yaml"
+            config_path = "configs/train_config_gpu.yaml"
         
         # Find latest checkpoint for resume
         checkpoint_path = None
@@ -2097,6 +2620,10 @@ async def set_settings(request: SettingsRequest):
             )
             auto_retrain_monitor.start()
     
+    if request.contrarian_enabled is not None:
+        settings["contrarian_enabled"] = request.contrarian_enabled
+        print(f"🔁 Contrarian agent enabled: {request.contrarian_enabled}")
+    
     # Save settings to file
     try:
         with open(settings_file, "w") as f:
@@ -2107,6 +2634,7 @@ async def set_settings(request: SettingsRequest):
         print(f"   performance_mode: {settings.get('performance_mode')}")
         print(f"   turbo_training_mode: {settings.get('turbo_training_mode')}")
         print(f"   auto_retrain_enabled: {settings.get('auto_retrain_enabled')}")
+        print(f"   contrarian_enabled: {settings.get('contrarian_enabled')}")
         
         return {"status": "success", "message": "Settings saved"}
     except Exception as e:
@@ -2139,6 +2667,675 @@ async def websocket_endpoint(websocket: WebSocket):
         except (ValueError, RuntimeError):
             # Already removed or list modified - ignore
             pass
+
+
+# Monte Carlo Risk Assessment Endpoints
+@app.post("/api/risk/monte-carlo")
+async def assess_monte_carlo_risk(request: MonteCarloRiskRequest):
+    """
+    Assess trade risk using Monte Carlo simulation.
+    
+    Returns risk metrics including VaR, expected PnL, win probability, and optimal position size.
+    """
+    if not MONTE_CARLO_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Monte Carlo risk assessment not available. Ensure scipy is installed."
+        )
+    
+    try:
+        # Load price data for volatility estimation
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        # Try to find recent price data
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            # Use most recent file
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except Exception as e:
+                print(f"Warning: Could not load price data: {e}")
+        
+        if price_data is None or len(price_data) < 10:
+            # Use synthetic data if no real data available
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
+            synthetic_prices = request.current_price * (1 + np.random.randn(100).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 100)
+            })
+        
+        # Create analyzer
+        analyzer = MonteCarloRiskAnalyzer(
+            initial_capital=100000.0,  # Default, can be made configurable
+            n_simulations=request.n_simulations,
+            max_position_risk=0.02
+        )
+        
+        # Run risk assessment
+        result = analyzer.assess_trade_risk(
+            current_price=request.current_price,
+            proposed_position=request.proposed_position,
+            current_position=request.current_position,
+            price_data=price_data,
+            entry_price=request.entry_price or request.current_price,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            time_horizon=request.time_horizon,
+            simulate_overnight=request.simulate_overnight
+        )
+        
+        # Return results
+        return {
+            "status": "success",
+            "risk_metrics": {
+                "expected_pnl": result.risk_metrics.expected_pnl,
+                "expected_return": result.risk_metrics.expected_return,
+                "var_95": result.risk_metrics.var_95,
+                "var_99": result.risk_metrics.var_99,
+                "cvar_95": result.risk_metrics.cvar_95,
+                "max_drawdown": result.risk_metrics.max_drawdown,
+                "win_probability": result.risk_metrics.win_probability,
+                "tail_risk": result.risk_metrics.tail_risk,
+                "optimal_position_size": result.risk_metrics.optimal_position_size
+            },
+            "simulation_config": result.simulation_config,
+            "scenario_stats": {
+                "min_pnl": float(np.min(result.scenario_pnls)),
+                "max_pnl": float(np.max(result.scenario_pnls)),
+                "median_pnl": float(np.median(result.scenario_pnls)),
+                "std_pnl": float(np.std(result.scenario_pnls)),
+                "percentile_5": float(np.percentile(result.scenario_pnls, 5)),
+                "percentile_25": float(np.percentile(result.scenario_pnls, 25)),
+                "percentile_75": float(np.percentile(result.scenario_pnls, 75)),
+                "percentile_95": float(np.percentile(result.scenario_pnls, 95))
+            },
+            "recommendation": _get_risk_recommendation(result.risk_metrics)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Monte Carlo risk assessment failed: {str(e)}"
+        )
+
+
+@app.post("/api/risk/scenario-analysis")
+async def scenario_analysis(request: MonteCarloRiskRequest):
+    """
+    Analyze trade under different market scenarios.
+    
+    Scenarios: normal, high_volatility, trending, ranging
+    """
+    if not MONTE_CARLO_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Monte Carlo risk assessment not available"
+        )
+    
+    try:
+        # Load price data
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except:
+                pass
+        
+        if price_data is None or len(price_data) < 10:
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
+            synthetic_prices = request.current_price * (1 + np.random.randn(100).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 100)
+            })
+        
+        analyzer = MonteCarloRiskAnalyzer(
+            initial_capital=100000.0,
+            n_simulations=request.n_simulations
+        )
+        
+        scenarios = analyzer.scenario_analysis(
+            current_price=request.current_price,
+            position_size=request.proposed_position,
+            price_data=price_data,
+            scenarios=["normal", "high_volatility", "trending", "ranging"]
+        )
+        
+        # Format results
+        scenario_results = {}
+        for scenario_name, scenario_result in scenarios.items():
+            scenario_results[scenario_name] = {
+                "expected_pnl": scenario_result.risk_metrics.expected_pnl,
+                "var_95": scenario_result.risk_metrics.var_95,
+                "win_probability": scenario_result.risk_metrics.win_probability,
+                "tail_risk": scenario_result.risk_metrics.tail_risk,
+                "max_drawdown": scenario_result.risk_metrics.max_drawdown
+            }
+        
+        return {
+            "status": "success",
+            "scenarios": scenario_results,
+            "recommendation": _get_scenario_recommendation(scenario_results)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Scenario analysis failed: {str(e)}"
+        )
+
+
+def _get_risk_recommendation(metrics) -> str:
+    """Get human-readable risk recommendation"""
+    if metrics.tail_risk > 0.10:
+        return "HIGH_RISK - Tail risk too high, reduce position size"
+    elif metrics.var_99 < -5000:  # VaR > $5000
+        return "MODERATE_RISK - Significant downside risk, consider reducing position"
+    elif metrics.win_probability < 0.45:
+        return "POOR_EDGE - Win probability below 50%, reconsider trade"
+    elif metrics.optimal_position_size < abs(metrics.optimal_position_size) * 0.7:
+        return "POSITION_REDUCED - Optimal position size is smaller than proposed"
+    else:
+        return "ACCEPTABLE_RISK - Risk metrics within acceptable range"
+
+
+def _get_scenario_recommendation(scenarios: Dict) -> str:
+    """Get recommendation based on scenario analysis"""
+    high_vol_risk = scenarios.get("high_volatility", {}).get("tail_risk", 0)
+    normal_win_prob = scenarios.get("normal", {}).get("win_probability", 0)
+    
+    if high_vol_risk > 0.15:
+        return "CAUTION - High volatility scenario shows significant tail risk"
+    elif normal_win_prob < 0.50:
+        return "WEAK_EDGE - Win probability below 50% in normal market conditions"
+    else:
+        return "ROBUST - Trade shows acceptable risk across scenarios"
+
+
+# Volatility Prediction Endpoints
+@app.post("/api/volatility/predict")
+async def predict_volatility_endpoint(request: VolatilityPredictionRequest):
+    """
+    Predict future volatility using historical price data.
+    
+    Returns volatility forecasts and trading recommendations.
+    """
+    if not VOLATILITY_PREDICTOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Volatility prediction not available"
+        )
+    
+    try:
+        # Load price data
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except Exception as e:
+                print(f"Warning: Could not load price data: {e}")
+        
+        if price_data is None or len(price_data) < 10:
+            # Use synthetic data if no real data available
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
+            base_price = 5000.0
+            synthetic_prices = base_price * (1 + np.random.randn(100).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 100)
+            })
+        
+        # Create predictor
+        predictor = VolatilityPredictor(
+            lookback_periods=request.lookback_periods,
+            prediction_horizon=request.prediction_horizon,
+            volatility_window=20
+        )
+        
+        # Predict volatility
+        forecast = predictor.predict_volatility(price_data, method=request.method)
+        
+        # Return results
+        return {
+            "status": "success",
+            "current_volatility": forecast.current_volatility,
+            "predicted_volatility": forecast.predicted_volatility,
+            "predicted_volatility_5period": forecast.predicted_volatility_5period,
+            "predicted_volatility_20period": forecast.predicted_volatility_20period,
+            "volatility_trend": forecast.volatility_trend,
+            "confidence": forecast.confidence,
+            "volatility_percentile": forecast.volatility_percentile,
+            "gap_risk_probability": forecast.gap_risk_probability,
+            "recommendations": forecast.recommendations,
+            "prediction_method": request.method
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Volatility prediction failed: {str(e)}"
+        )
+
+
+class AdaptiveSizingRequest(BaseModel):
+    """Request for adaptive position sizing"""
+    base_position: float
+    current_price: Optional[float] = None
+
+
+@app.post("/api/volatility/adaptive-sizing")
+async def get_adaptive_position_sizing(request: AdaptiveSizingRequest):
+    """
+    Get adaptive position size multiplier based on predicted volatility.
+    
+    Args:
+        base_position: Base position size from RL agent (-1.0 to 1.0)
+        current_price: Current market price (optional, for context)
+    """
+    if not VOLATILITY_PREDICTOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Volatility prediction not available"
+        )
+    
+    try:
+        # Load price data
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except:
+                pass
+        
+        if price_data is None or len(price_data) < 10:
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
+            base_price = request.current_price or 5000.0
+            synthetic_prices = base_price * (1 + np.random.randn(100).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 100)
+            })
+        
+        predictor = VolatilityPredictor()
+        forecast = predictor.predict_volatility(price_data, method="adaptive")
+        
+        multiplier = predictor.get_adaptive_position_multiplier(request.base_position, forecast)
+        stop_loss_multiplier = predictor.get_adaptive_stop_loss_multiplier(1.0, forecast)
+        
+        adjusted_position = request.base_position * multiplier
+        
+        return {
+            "status": "success",
+            "base_position": request.base_position,
+            "adjusted_position": adjusted_position,
+            "position_multiplier": multiplier,
+            "stop_loss_multiplier": stop_loss_multiplier,
+            "volatility_percentile": forecast.volatility_percentile,
+            "volatility_trend": forecast.volatility_trend,
+            "recommendations": forecast.recommendations
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Adaptive sizing calculation failed: {str(e)}"
+        )
+
+
+# Scenario Simulation Endpoints
+@app.post("/api/scenario/robustness-test")
+async def run_robustness_test_endpoint(request: ScenarioSimulationRequest):
+    """
+    Run robustness test across multiple market scenarios.
+    
+    Tests strategy performance under different market conditions.
+    """
+    if not SCENARIO_SIMULATOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Scenario simulator not available"
+        )
+    
+    try:
+        # Load price data
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except Exception as e:
+                print(f"Warning: Could not load price data: {e}")
+        
+        if price_data is None or len(price_data) < 10:
+            # Use synthetic data if no real data available
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=200, freq='D')
+            base_price = 5000.0
+            synthetic_prices = base_price * (1 + np.random.randn(200).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 200)
+            })
+        
+        # Create simulator
+        simulator = ScenarioSimulator(price_data, initial_capital=100000.0)
+        
+        # Check if RL agent backtesting is requested
+        use_rl_agent = request.use_rl_agent
+        model_path = request.model_path
+        
+        # Create backtest function
+        if use_rl_agent:
+            # Use RL agent backtesting
+            rl_backtest_func = ScenarioSimulator.create_rl_agent_backtest_func(
+                model_path=model_path,
+                n_episodes=1
+            )
+            backtest_func = lambda data, **kwargs: rl_backtest_func(
+                data,
+                timeframes=[1, 5, 15],
+                initial_capital=100000.0,
+                transaction_cost=0.0001
+            )
+        else:
+            # Use simple backtest
+            backtest_func = None
+        
+        # Map scenario names to MarketRegime
+        regime_map = {
+            "normal": MarketRegime.NORMAL,
+            "trending_up": MarketRegime.TRENDING_UP,
+            "trending_down": MarketRegime.TRENDING_DOWN,
+            "ranging": MarketRegime.RANGING,
+            "high_volatility": MarketRegime.HIGH_VOLATILITY,
+            "low_volatility": MarketRegime.LOW_VOLATILITY,
+            "gap_event": MarketRegime.GAP_EVENT,
+            "low_liquidity": MarketRegime.LOW_LIQUIDITY,
+            "crash": MarketRegime.CRASH,
+            "flash_crash": MarketRegime.FLASH_CRASH
+        }
+        
+        # Run scenarios
+        scenario_results = []
+        for scenario_name in request.scenarios:
+            if scenario_name not in regime_map:
+                continue
+            
+            regime = regime_map[scenario_name]
+            result = simulator.simulate_scenario(
+                scenario_name=scenario_name,
+                regime=regime,
+                intensity=request.intensity,
+                backtest_func=backtest_func
+            )
+            
+            # Convert to dict
+            scenario_results.append({
+                "scenario_name": result.scenario_name,
+                "market_regime": result.market_regime,
+                "total_return": result.total_return,
+                "sharpe_ratio": result.sharpe_ratio,
+                "max_drawdown": result.max_drawdown,
+                "win_rate": result.win_rate,
+                "profit_factor": result.profit_factor,
+                "total_trades": result.total_trades,
+                "winning_trades": result.winning_trades,
+                "losing_trades": result.losing_trades,
+                "avg_win": result.avg_win,
+                "avg_loss": result.avg_loss,
+                "largest_win": result.largest_win,
+                "largest_loss": result.largest_loss,
+                "total_pnl": result.total_pnl,
+                "volatility": result.volatility,
+                "calmar_ratio": result.calmar_ratio
+            })
+        
+        return {
+            "status": "success",
+            "scenarios": scenario_results,
+            "summary": {
+                "total_scenarios": len(scenario_results),
+                "average_return": float(np.mean([r["total_return"] for r in scenario_results])) if scenario_results else 0.0,
+                "average_sharpe": float(np.mean([r["sharpe_ratio"] for r in scenario_results])) if scenario_results else 0.0,
+                "worst_drawdown": float(min([r["max_drawdown"] for r in scenario_results])) if scenario_results else 0.0
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Robustness test failed: {str(e)}"
+        )
+
+
+@app.post("/api/scenario/stress-test")
+async def run_stress_test_endpoint(request: StressTestRequest):
+    """
+    Run stress test under extreme market conditions.
+    
+    Tests strategy resilience under severe market stress.
+    """
+    if not SCENARIO_SIMULATOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Scenario simulator not available"
+        )
+    
+    try:
+        # Load price data
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except:
+                pass
+        
+        if price_data is None or len(price_data) < 10:
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=200, freq='D')
+            base_price = 5000.0
+            synthetic_prices = base_price * (1 + np.random.randn(200).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 200)
+            })
+        
+        simulator = ScenarioSimulator(price_data, initial_capital=100000.0)
+        
+        # Map scenarios
+        regime_map = {
+            "crash": MarketRegime.CRASH,
+            "flash_crash": MarketRegime.FLASH_CRASH,
+            "high_volatility": MarketRegime.HIGH_VOLATILITY,
+            "gap_event": MarketRegime.GAP_EVENT
+        }
+        
+        # Create stress test scenarios
+        stress_scenarios = [
+            (name, regime_map[name], request.intensity)
+            for name in request.scenarios
+            if name in regime_map
+        ]
+        
+        # Run stress tests
+        stress_results = simulator.run_stress_test(stress_scenarios)
+        
+        # Convert to dict
+        results = []
+        for result in stress_results:
+            results.append({
+                "scenario_name": result.scenario_name,
+                "max_drawdown": result.max_drawdown,
+                "recovery_time": result.recovery_time,
+                "worst_case_loss": result.worst_case_loss,
+                "survived": result.survived,
+                "equity_at_min": result.equity_at_min,
+                "details": result.details
+            })
+        
+        return {
+            "status": "success",
+            "stress_tests": results,
+            "summary": {
+                "total_tests": len(results),
+                "survived_count": sum(1 for r in results if r["survived"]),
+                "worst_drawdown": min([r["max_drawdown"] for r in results]) if results else 0.0,
+                "avg_recovery_time": float(np.mean([r["recovery_time"] for r in results])) if results else 0.0
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Stress test failed: {str(e)}"
+        )
+
+
+@app.post("/api/scenario/parameter-sensitivity")
+async def run_parameter_sensitivity_endpoint(request: ParameterSensitivityRequest):
+    """
+    Analyze parameter sensitivity.
+    
+    Tests how strategy performance varies with different parameter values.
+    """
+    if not SCENARIO_SIMULATOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Scenario simulator not available"
+        )
+    
+    try:
+        # Load price data
+        data_dir = Path("data/raw")
+        price_data = None
+        
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                df = pd.read_csv(latest_file)
+                if 'close' in df.columns:
+                    price_data = df
+            except:
+                pass
+        
+        if price_data is None or len(price_data) < 10:
+            import numpy as np
+            dates = pd.date_range(end=datetime.now(), periods=200, freq='D')
+            base_price = 5000.0
+            synthetic_prices = base_price * (1 + np.random.randn(200).cumsum() * 0.01)
+            price_data = pd.DataFrame({
+                'close': synthetic_prices,
+                'open': synthetic_prices,
+                'high': synthetic_prices * 1.01,
+                'low': synthetic_prices * 0.99,
+                'volume': np.random.randint(1000, 10000, 200)
+            })
+        
+        simulator = ScenarioSimulator(price_data, initial_capital=100000.0)
+        
+        # Map regime
+        regime_map = {
+            "normal": MarketRegime.NORMAL,
+            "trending_up": MarketRegime.TRENDING_UP,
+            "high_volatility": MarketRegime.HIGH_VOLATILITY
+        }
+        regime = regime_map.get(request.regime, MarketRegime.NORMAL)
+        
+        # Simple backtest function (placeholder)
+        def simple_backtest(data, **params):
+            returns = data['close'].pct_change().fillna(0)
+            equity_curve = 100000.0 * (1 + returns).cumprod()
+            trades = []
+            for i in range(10, len(data), 20):
+                entry = data['close'].iloc[i]
+                exit = data['close'].iloc[min(i+10, len(data)-1)]
+                trades.append((exit - entry) / entry)
+            return {
+                'equity_curve': equity_curve.tolist(),
+                'trades': trades
+            }
+        
+        # Run sensitivity analysis
+        sensitivity_result = simulator.parameter_sensitivity_analysis(
+            parameter_name=request.parameter_name,
+            parameter_values=request.parameter_values,
+            backtest_func=simple_backtest,
+            base_params=request.base_parameters,
+            regime=regime
+        )
+        
+        return {
+            "status": "success",
+            "parameter_name": sensitivity_result.parameter_name,
+            "parameter_values": sensitivity_result.parameter_values,
+            "performance_metrics": sensitivity_result.performance_metrics,
+            "optimal_value": sensitivity_result.optimal_value,
+            "sensitivity_score": sensitivity_result.sensitivity_score,
+            "recommendations": sensitivity_result.recommendations
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Parameter sensitivity analysis failed: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

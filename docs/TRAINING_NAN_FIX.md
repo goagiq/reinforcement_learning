@@ -18,7 +18,7 @@ to satisfy the constraint Real(), but found invalid values: tensor([..., nan, ..
 We implemented **multiple layers of protection**:
 
 ### 1. Disabled Mixed Precision by Default
-Changed `configs/train_config_gpu_optimized.yaml`:
+Changed `configs/train_config_gpu.yaml`:
 ```yaml
 use_mixed_precision: false  # DISABLED - Can cause NaN issues
 ```
@@ -56,7 +56,7 @@ ratio = torch.clamp(ratio, min=1e-8, max=1e8)  # Prevent overflow
 
 If you really want the extra 2x speedup (for a total of ~6x), you can enable it:
 
-1. Edit `configs/train_config_gpu_optimized.yaml`
+1. Edit `configs/train_config_gpu.yaml`
 2. Set `use_mixed_precision: true`
 3. The NaN protection code will still work, but training might be slower to converge or need tuning
 

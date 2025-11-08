@@ -1,9 +1,11 @@
 """
 LLM Provider Abstraction Layer
 Supports multiple providers: Ollama, DeepSeek Cloud API, Grok (xAI)
+Supports routing through Kong Gateway
 """
 
 import json
+import os
 import requests
 from typing import Dict, List, Optional
 from enum import Enum
@@ -37,8 +39,24 @@ class BaseLLMProvider(ABC):
 class OllamaProvider(BaseLLMProvider):
     """Ollama local provider"""
     
-    def __init__(self, base_url: str = "http://localhost:11434"):
-        self.base_url = base_url
+    def __init__(self, base_url: str = "http://localhost:11434", use_kong: bool = False, kong_api_key: Optional[str] = None):
+        """
+        Initialize Ollama provider.
+        
+        Args:
+            base_url: Ollama base URL (ignored if use_kong=True)
+            use_kong: Route requests through Kong Gateway
+            kong_api_key: Kong consumer API key (required if use_kong=True)
+        """
+        self.use_kong = use_kong
+        if use_kong:
+            self.base_url = os.getenv("KONG_BASE_URL", "http://localhost:8300")
+            self.kong_api_key = kong_api_key or os.getenv("KONG_OLLAMA_KEY") or os.getenv("KONG_API_KEY")
+            if not self.kong_api_key:
+                raise ValueError("Kong API key required when use_kong=True. Set KONG_OLLAMA_KEY or KONG_API_KEY")
+        else:
+            self.base_url = base_url
+            self.kong_api_key = None
     
     def chat(
         self,
@@ -50,8 +68,11 @@ class OllamaProvider(BaseLLMProvider):
         timeout: Optional[int] = None,
         keep_alive: str = "10m"  # Keep model loaded in memory (default 10 minutes)
     ) -> str:
-        """Call Ollama API"""
-        url = f"{self.base_url}/api/chat"
+        """Call Ollama API (directly or through Kong)"""
+        if self.use_kong:
+            url = f"{self.base_url}/llm/ollama/api/chat"
+        else:
+            url = f"{self.base_url}/api/chat"
         
         payload = {
             "model": model,
@@ -65,8 +86,12 @@ class OllamaProvider(BaseLLMProvider):
         }
         
         try:
+            headers = {}
+            if self.use_kong and self.kong_api_key:
+                headers["apikey"] = self.kong_api_key
+            
             if stream:
-                response = requests.post(url, json=payload, timeout=None, stream=True)
+                response = requests.post(url, json=payload, headers=headers, timeout=None, stream=True)
                 response.raise_for_status()
                 
                 full_content = ""
@@ -83,7 +108,7 @@ class OllamaProvider(BaseLLMProvider):
                 
                 return full_content
             else:
-                response = requests.post(url, json=payload, timeout=timeout or 600)
+                response = requests.post(url, json=payload, headers=headers, timeout=timeout or 600)
                 response.raise_for_status()
                 result = response.json()
                 return result.get("message", {}).get("content", "")
@@ -99,9 +124,26 @@ class OllamaProvider(BaseLLMProvider):
 class DeepSeekCloudProvider(BaseLLMProvider):
     """DeepSeek Cloud API provider"""
     
-    def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com"):
+    def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com", use_kong: bool = False, kong_api_key: Optional[str] = None):
+        """
+        Initialize DeepSeek Cloud provider.
+        
+        Args:
+            api_key: DeepSeek Cloud API key (required)
+            base_url: DeepSeek base URL (ignored if use_kong=True)
+            use_kong: Route requests through Kong Gateway
+            kong_api_key: Kong consumer API key (required if use_kong=True)
+        """
         self.api_key = api_key
-        self.base_url = base_url
+        self.use_kong = use_kong
+        if use_kong:
+            self.base_url = os.getenv("KONG_BASE_URL", "http://localhost:8300")
+            self.kong_api_key = kong_api_key or os.getenv("KONG_DEEPSEEK_KEY") or os.getenv("KONG_API_KEY")
+            if not self.kong_api_key:
+                raise ValueError("Kong API key required when use_kong=True. Set KONG_DEEPSEEK_KEY or KONG_API_KEY")
+        else:
+            self.base_url = base_url
+            self.kong_api_key = None
     
     def chat(
         self,
@@ -112,13 +154,23 @@ class DeepSeekCloudProvider(BaseLLMProvider):
         stream: bool = False,
         timeout: Optional[int] = None
     ) -> str:
-        """Call DeepSeek Cloud API"""
-        url = f"{self.base_url}/v1/chat/completions"
+        """Call DeepSeek Cloud API (directly or through Kong)"""
+        if self.use_kong:
+            url = f"{self.base_url}/llm/deepseek/v1/chat/completions"
+        else:
+            url = f"{self.base_url}/v1/chat/completions"
         
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        
+        if self.use_kong:
+            # Use Kong API key for authentication
+            if self.kong_api_key:
+                headers["apikey"] = self.kong_api_key
+        else:
+            # Use DeepSeek API key for direct calls
+            headers["Authorization"] = f"Bearer {self.api_key}"
         
         payload = {
             "model": model,
@@ -169,9 +221,26 @@ class DeepSeekCloudProvider(BaseLLMProvider):
 class GrokProvider(BaseLLMProvider):
     """Grok (xAI) API provider"""
     
-    def __init__(self, api_key: str, base_url: str = "https://api.x.ai"):
+    def __init__(self, api_key: str, base_url: str = "https://api.x.ai", use_kong: bool = False, kong_api_key: Optional[str] = None):
+        """
+        Initialize Grok provider.
+        
+        Args:
+            api_key: Grok API key (required)
+            base_url: Grok base URL (ignored if use_kong=True)
+            use_kong: Route requests through Kong Gateway
+            kong_api_key: Kong consumer API key (required if use_kong=True)
+        """
         self.api_key = api_key
-        self.base_url = base_url
+        self.use_kong = use_kong
+        if use_kong:
+            self.base_url = os.getenv("KONG_BASE_URL", "http://localhost:8300")
+            self.kong_api_key = kong_api_key or os.getenv("KONG_GROK_KEY") or os.getenv("KONG_API_KEY")
+            if not self.kong_api_key:
+                raise ValueError("Kong API key required when use_kong=True. Set KONG_GROK_KEY or KONG_API_KEY")
+        else:
+            self.base_url = base_url
+            self.kong_api_key = None
     
     def chat(
         self,
@@ -182,13 +251,23 @@ class GrokProvider(BaseLLMProvider):
         stream: bool = False,
         timeout: Optional[int] = None
     ) -> str:
-        """Call Grok API"""
-        url = f"{self.base_url}/v1/chat/completions"
+        """Call Grok API (directly or through Kong)"""
+        if self.use_kong:
+            url = f"{self.base_url}/llm/grok/v1/chat/completions"
+        else:
+            url = f"{self.base_url}/v1/chat/completions"
         
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        
+        if self.use_kong:
+            # Use Kong API key for authentication
+            if self.kong_api_key:
+                headers["apikey"] = self.kong_api_key
+        else:
+            # Use Grok API key for direct calls
+            headers["Authorization"] = f"Bearer {self.api_key}"
         
         payload = {
             "model": model,
@@ -246,32 +325,34 @@ def get_provider(provider_type: str, **kwargs) -> BaseLLMProvider:
     Args:
         provider_type: "ollama", "deepseek_cloud", or "grok"
         **kwargs: Provider-specific configuration
-            - For Ollama: base_url (optional, default: http://localhost:11434)
-            - For DeepSeek Cloud: api_key (required), base_url (optional)
-            - For Grok: api_key (required), base_url (optional)
+            - For Ollama: base_url (optional, default: http://localhost:11434), use_kong (optional), kong_api_key (optional)
+            - For DeepSeek Cloud: api_key (required), base_url (optional), use_kong (optional), kong_api_key (optional)
+            - For Grok: api_key (required), base_url (optional), use_kong (optional), kong_api_key (optional)
     
     Returns:
         BaseLLMProvider instance
     """
     provider_type = provider_type.lower()
+    use_kong = kwargs.get("use_kong", False)
+    kong_api_key = kwargs.get("kong_api_key")
     
     if provider_type == LLMProvider.OLLAMA.value:
         base_url = kwargs.get("base_url", "http://localhost:11434")
-        return OllamaProvider(base_url=base_url)
+        return OllamaProvider(base_url=base_url, use_kong=use_kong, kong_api_key=kong_api_key)
     
     elif provider_type == LLMProvider.DEEPSEEK_CLOUD.value:
         api_key = kwargs.get("api_key")
-        if not api_key:
-            raise ValueError("api_key is required for DeepSeek Cloud provider")
+        if not api_key and not use_kong:
+            raise ValueError("api_key is required for DeepSeek Cloud provider (unless using Kong)")
         base_url = kwargs.get("base_url", "https://api.deepseek.com")
-        return DeepSeekCloudProvider(api_key=api_key, base_url=base_url)
+        return DeepSeekCloudProvider(api_key=api_key or "", base_url=base_url, use_kong=use_kong, kong_api_key=kong_api_key)
     
     elif provider_type == LLMProvider.GROK.value:
         api_key = kwargs.get("api_key")
-        if not api_key:
-            raise ValueError("api_key is required for Grok provider")
+        if not api_key and not use_kong:
+            raise ValueError("api_key is required for Grok provider (unless using Kong)")
         base_url = kwargs.get("base_url", "https://api.x.ai")
-        return GrokProvider(api_key=api_key, base_url=base_url)
+        return GrokProvider(api_key=api_key or "", base_url=base_url, use_kong=use_kong, kong_api_key=kong_api_key)
     
     else:
         raise ValueError(f"Unknown provider type: {provider_type}. Supported: ollama, deepseek_cloud, grok")

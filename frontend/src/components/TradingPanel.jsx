@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react'
 import axios from 'axios'
 import { Play, Square, Loader, CheckCircle, AlertCircle, Server } from 'lucide-react'
 import { getDefaultModel, sortModelsWithDefaultFirst, isDefaultModel } from '../utils/modelUtils'
+import MonteCarloRiskPanel from './MonteCarloRiskPanel'
+import VolatilityPanel from './VolatilityPanel'
 
 const TradingPanel = ({ models }) => {
   const [selectedModel, setSelectedModel] = useState('')
@@ -460,6 +462,16 @@ const TradingPanel = ({ models }) => {
           )}
         </div>
       </div>
+
+      {/* Volatility Prediction & Adaptive Risk Management */}
+      <VolatilityPanel />
+
+      {/* Monte Carlo Risk Assessment */}
+      <MonteCarloRiskPanel
+        currentPrice={5000} // Example price - in production, this would come from market data
+        proposedPosition={0.5} // Example position - in production, this would come from RL agent
+        currentPosition={0.0}
+      />
 
       {/* Trading Log */}
       {messages.length > 0 && (

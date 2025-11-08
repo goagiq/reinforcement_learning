@@ -76,13 +76,20 @@ class AutomatedLearningOrchestrator:
         if reasoning_config.get("enabled", True):
             import os
             api_key = reasoning_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
+            
+            # Kong Gateway configuration
+            use_kong = reasoning_config.get("use_kong", False)
+            kong_api_key = reasoning_config.get("kong_api_key") or os.getenv("KONG_API_KEY")
+            
             return ReasoningEngine(
                 provider_type=reasoning_config.get("provider", "ollama"),
                 model=reasoning_config.get("model", "deepseek-r1:8b"),
                 api_key=api_key,
                 base_url=reasoning_config.get("base_url"),
                 timeout=int(reasoning_config.get("timeout", 2.0) * 60),
-                keep_alive=reasoning_config.get("keep_alive", "10m")  # Keep model pre-loaded
+                keep_alive=reasoning_config.get("keep_alive", "10m"),  # Keep model pre-loaded
+                use_kong=use_kong,
+                kong_api_key=kong_api_key
             )
         return None
     

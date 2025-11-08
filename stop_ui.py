@@ -1,10 +1,14 @@
 """
 Stop script for NT8 RL Trading System Production UI
 
-Kills all processes listening on ports 3200 (frontend) and 8200 (backend).
+Stops:
+1. Kong Gateway (via Docker Compose, optional)
+2. Processes on ports 3200 (frontend) and 8200 (backend)
 
 Usage:
-    python stop_ui.py
+    python stop_ui.py              # Stop FastAPI and Frontend only
+    python stop_ui.py --kong       # Also stop Kong Gateway
+    python stop_ui.py --all        # Stop everything including Kong
 
 Or on Linux/Mac:
     ./stop_ui.py  (if executable permissions are set)
@@ -15,6 +19,7 @@ import sys
 import os
 import time
 import argparse
+import requests
 from pathlib import Path
 
 
@@ -170,13 +175,132 @@ def get_process_name(pid):
     return "Unknown"
 
 
+def check_kong_running():
+    """Check if Kong Gateway is running"""
+    try:
+        response = requests.get("http://localhost:8301/", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def check_prometheus_running():
+    """Check if Prometheus is running"""
+    try:
+        response = requests.get("http://localhost:9090/-/ready", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def check_grafana_running():
+    """Check if Grafana is running"""
+    try:
+        response = requests.get("http://localhost:3000/api/health", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def stop_monitoring():
+    """Stop Prometheus and Grafana monitoring services"""
+    kong_dir = Path("kong")
+    docker_compose_file = kong_dir / "docker-compose-prometheus.yml"
+    
+    if not docker_compose_file.exists():
+        print("⚠ Monitoring configuration not found at kong/docker-compose-prometheus.yml")
+        return False
+    
+    if not check_prometheus_running() and not check_grafana_running():
+        print("✓ Monitoring services (Prometheus/Grafana) are not running")
+        return True
+    
+    print("Stopping monitoring services (Prometheus & Grafana)...")
+    
+    try:
+        result = subprocess.run(
+            ["docker-compose", "-f", "docker-compose-prometheus.yml", "down"],
+            cwd=str(kong_dir),
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            print(f"⚠ WARNING: Failed to stop monitoring services")
+            print(f"  Error: {result.stderr}")
+            print("  You can stop monitoring manually with: cd kong && docker-compose -f docker-compose-prometheus.yml down")
+            return False
+        
+        print("✓ Monitoring services stopped")
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print("⚠ WARNING: Timeout stopping monitoring services")
+        print("  You can stop monitoring manually with: cd kong && docker-compose -f docker-compose-prometheus.yml down")
+        return False
+    except FileNotFoundError:
+        print("⚠ WARNING: docker-compose command not found")
+        print("  You can stop monitoring manually with: cd kong && docker-compose -f docker-compose-prometheus.yml down")
+        return False
+    except Exception as e:
+        print(f"⚠ WARNING: Error stopping monitoring services: {e}")
+        print("  You can stop monitoring manually with: cd kong && docker-compose -f docker-compose-prometheus.yml down")
+        return False
+
+def stop_kong():
+    """Stop Kong Gateway using Docker Compose"""
+    kong_dir = Path("kong")
+    docker_compose_file = kong_dir / "docker-compose.yml"
+    
+    if not docker_compose_file.exists():
+        print("⚠ Kong configuration not found at kong/docker-compose.yml")
+        return False
+    
+    if not check_kong_running():
+        print("✓ Kong Gateway is not running")
+        return True
+    
+    print("Stopping Kong Gateway...")
+    
+    try:
+        result = subprocess.run(
+            ["docker-compose", "down"],
+            cwd=str(kong_dir),
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            print(f"⚠ WARNING: Failed to stop Kong Gateway")
+            print(f"  Error: {result.stderr}")
+            print("  You can stop Kong manually with: cd kong && docker-compose down")
+            return False
+        
+        print("✓ Kong Gateway stopped")
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print("⚠ WARNING: Timeout stopping Kong Gateway")
+        print("  You can stop Kong manually with: cd kong && docker-compose down")
+        return False
+    except FileNotFoundError:
+        print("⚠ WARNING: docker-compose command not found")
+        print("  You can stop Kong manually with: cd kong && docker-compose down")
+        return False
+    except Exception as e:
+        print(f"⚠ WARNING: Error stopping Kong Gateway: {e}")
+        print("  You can stop Kong manually with: cd kong && docker-compose down")
+        return False
+
 def main():
     parser = argparse.ArgumentParser(
         description="Stop NT8 RL Trading System UI servers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python stop_ui.py              # Interactive mode (asks for confirmation)
+    python stop_ui.py              # Stop FastAPI and Frontend only
+    python stop_ui.py --kong       # Also stop Kong Gateway
+    python stop_ui.py --monitoring # Also stop Prometheus & Grafana
+    python stop_ui.py --all        # Stop everything (Kong + Monitoring)
     python stop_ui.py --yes        # Non-interactive (auto-confirms)
     python stop_ui.py -y           # Short form
         """
@@ -185,6 +309,21 @@ Examples:
         '-y', '--yes',
         action='store_true',
         help='Auto-confirm without prompting'
+    )
+    parser.add_argument(
+        '--kong',
+        action='store_true',
+        help='Also stop Kong Gateway'
+    )
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='Stop everything including Kong Gateway and monitoring services'
+    )
+    parser.add_argument(
+        '--monitoring',
+        action='store_true',
+        help='Also stop Prometheus and Grafana monitoring services'
     )
     parser.add_argument(
         '--ports',
@@ -200,6 +339,40 @@ Examples:
     print("NT8 RL Trading System - Stop UI Servers")
     print("=" * 60)
     print()
+    
+    # Stop Kong if requested
+    stop_kong_flag = args.kong or args.all
+    if stop_kong_flag:
+        if not args.yes:
+            try:
+                response = input("Stop Kong Gateway? [Y/n]: ").strip().lower()
+                if response and response != 'y' and response != 'yes':
+                    print("  Skipping Kong Gateway")
+                    stop_kong_flag = False
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return
+        
+        if stop_kong_flag:
+            stop_kong()
+            print()
+    
+    # Stop monitoring services if requested
+    stop_monitoring_flag = args.monitoring or args.all
+    if stop_monitoring_flag:
+        if not args.yes:
+            try:
+                response = input("Stop monitoring services (Prometheus/Grafana)? [Y/n]: ").strip().lower()
+                if response and response != 'y' and response != 'yes':
+                    print("  Skipping monitoring services")
+                    stop_monitoring_flag = False
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return
+        
+        if stop_monitoring_flag:
+            stop_monitoring()
+            print()
     
     ports = args.ports
     all_pids = []
@@ -278,6 +451,14 @@ Examples:
     if all_free:
         print("=" * 60)
         print("✓ All servers stopped successfully")
+        if stop_kong_flag:
+            print("✓ Kong Gateway stopped")
+        elif check_kong_running():
+            print("ℹ Kong Gateway is still running (use --kong to stop it)")
+        if stop_monitoring_flag:
+            print("✓ Monitoring services stopped")
+        elif check_prometheus_running() or check_grafana_running():
+            print("ℹ Monitoring services are still running (use --monitoring to stop them)")
         print("=" * 60)
     else:
         print("⚠ Some processes may still be running")
@@ -293,6 +474,18 @@ Examples:
                     print(f"    taskkill /F /PID {' /PID '.join(map(str, remaining))}")
                 else:
                     print(f"    kill -9 {' '.join(map(str, remaining))}")
+        
+        if not stop_kong_flag and check_kong_running():
+            print()
+            print("ℹ Kong Gateway is still running")
+            print("  Stop it with: python stop_ui.py --kong")
+            print("  Or manually: cd kong && docker-compose down")
+        
+        if not stop_monitoring_flag and (check_prometheus_running() or check_grafana_running()):
+            print()
+            print("ℹ Monitoring services are still running")
+            print("  Stop them with: python stop_ui.py --monitoring")
+            print("  Or manually: cd kong && docker-compose -f docker-compose-prometheus.yml down")
 
 
 if __name__ == "__main__":

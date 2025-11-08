@@ -1,0 +1,138 @@
+_format_version: "3.0"
+_transform: true
+
+# Services for LLM Providers
+services:
+  # Anthropic Service
+  - name: anthropic-service
+    url: https://api.anthropic.com
+    routes:
+      - name: anthropic-route
+        paths:
+          - /llm/anthropic
+        strip_path: true
+        methods:
+          - GET
+          - POST
+    plugins:
+      - name: key-auth
+      - name: rate-limiting
+        config:
+          minute: 1000
+          hour: 10000
+          day: 100000
+          policy: local
+
+  # DeepSeek Cloud Service
+  - name: deepseek-service
+    url: https://api.deepseek.com
+    routes:
+      - name: deepseek-route
+        paths:
+          - /llm/deepseek
+        strip_path: true
+        methods:
+          - GET
+          - POST
+    plugins:
+      - name: key-auth
+      - name: rate-limiting
+        config:
+          minute: 2000
+          hour: 20000
+          day: 200000
+          policy: local
+
+  # Grok (xAI) Service
+  - name: grok-service
+    url: https://api.x.ai
+    routes:
+      - name: grok-route
+        paths:
+          - /llm/grok
+        strip_path: true
+        methods:
+          - GET
+          - POST
+    plugins:
+      - name: key-auth
+      - name: rate-limiting
+        config:
+          minute: 1500
+          hour: 15000
+          day: 150000
+          policy: local
+
+  # Ollama Service (Local)
+  - name: ollama-service
+    url: http://host.docker.internal:11434
+    routes:
+      - name: ollama-route
+        paths:
+          - /llm/ollama
+        strip_path: true
+        methods:
+          - GET
+          - POST
+    plugins:
+      - name: key-auth
+      - name: rate-limiting
+        config:
+          minute: 5000
+          hour: 50000
+          day: 500000
+          policy: local
+
+  # FastAPI Service
+  - name: fastapi-service
+    url: http://host.docker.internal:8200
+    routes:
+      - name: fastapi-route
+        paths:
+          - /api
+        strip_path: false
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - PATCH
+    plugins:
+      - name: key-auth
+      - name: rate-limiting
+        config:
+          minute: 10000
+          hour: 100000
+          day: 1000000
+          policy: local
+
+# Consumers
+consumers:
+  - username: reasoning-engine-consumer
+    keyauth_credentials:
+      - key: rQhK3Uq5L0cBMUEXXOn78lCOq7jXDYgo0NIhNeH_AYs
+    tags:
+      - reasoning-engine
+      - llm-consumer
+
+  - username: swarm-agent-consumer
+    keyauth_credentials:
+      - key: W-1--OrRPg-J6JmYZKM_lk5AjeNo-cICkFEL5ieihnw
+    tags:
+      - swarm-agent
+      - llm-consumer
+
+  - username: query-deepseek-consumer
+    keyauth_credentials:
+      - key: guqhYjH70oDGQn6uiBPCn1tpt4ZGP8Qlmh3CyU933Rs
+    tags:
+      - query-deepseek
+      - llm-consumer
+
+  - username: admin-consumer
+    keyauth_credentials:
+      - key: EhJ2T5SpLeqUAaFxkBwoWcnlg1T_5AappZ9VOhXzgXI
+    tags:
+      - admin
+      - full-access
+

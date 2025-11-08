@@ -157,7 +157,7 @@ This decoupled architecture allows:
 
 ## Configuration
 
-All agents use configuration from `configs/train_config.yaml`:
+All agents use configuration from `configs/train_config_full.yaml`:
 ```yaml
 agentic_swarm:
   market_research:

@@ -1,0 +1,78 @@
+services:
+  # Main application service
+  nt8-rl-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nt8-rl-app
+    ports:
+      - "8200:8200"  # FastAPI backend
+      - "3200:3200"  # Frontend dev server
+      - "8888:8888"  # NT8 Bridge Server (for NT8 strategy to connect)
+    volumes:
+      # Models directory (local storage on laptop)
+      - ./models:/app/models
+      # Data directory
+      - ./data:/app/data
+      # Logs directory
+      - ./logs:/app/logs
+      # NinjaTrader export directory (Windows path mapped for reading new training files)
+      # Note: Use forward slashes or double backslashes for Windows paths
+      - "C:/Users/sovan/Documents/NinjaTrader 8/export:/app/nt8_export:ro"
+      # Configuration files
+      - ./configs:/app/configs:ro
+    environment:
+      # Python environment
+      - PYTHONUNBUFFERED=1
+      # NT8 Bridge Server settings (bind to 0.0.0.0 to accept connections from host)
+      - NT8_BRIDGE_HOST=0.0.0.0
+      - NT8_BRIDGE_PORT=8888
+      # If bridge server runs on host, use this instead:
+      # - NT8_BRIDGE_HOST=host.docker.internal
+      # - NT8_BRIDGE_PORT=8888
+      # Kong Gateway settings (optional - if Kong runs on host)
+      - KONG_PROXY=http://host.docker.internal:8300
+      - KONG_ADMIN=http://host.docker.internal:8301
+      # CORS settings
+      - DISABLE_FASTAPI_CORS=false
+      # Data paths
+      - DATA_DIR=/app/data
+      - MODELS_DIR=/app/models
+      - NT8_EXPORT_DIR=/app/nt8_export
+    extra_hosts:
+      # Allow container to access host services (Windows/Mac)
+      - "host.docker.internal:host-gateway"
+    networks:
+      - nt8-rl-net
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    # Use host network mode on Linux for better NT8 connectivity
+    # network_mode: "host"  # Uncomment on Linux if needed
+
+  # Frontend service (optional - can run separately)
+  # Uncomment if you want frontend in a separate container
+  # nt8-rl-frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile.frontend
+  #   container_name: nt8-rl-frontend
+  #   ports:
+  #     - "3200:3200"
+  #   volumes:
+  #     - ./frontend:/app
+  #     - /app/node_modules
+  #   environment:
+  #     - VITE_API_URL=http://host.docker.internal:8200
+  #   networks:
+  #     - nt8-rl-net
+  #   depends_on:
+  #     - nt8-rl-app
+
+networks:
+  nt8-rl-net:
+    driver: bridge
+
+# Note: Kong Gateway and monitoring services should be started separately
+# using the docker-compose files in the kong/ directory
+

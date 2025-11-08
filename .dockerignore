@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+*.log
+logs/*.log
+
+# Data (will be mounted as volumes - exclude large files but keep structure)
+data/raw/*.csv
+data/processed/*.csv
+data/experience_buffer/*.pkl
+models/*.pt
+models/*.pth
+
+# Documentation (not needed in container)
+docs/
+*.md
+!README.md
+!README_DOCKER.md
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker-compose*.yml
+docker-compose*.yaml
+Dockerfile*
+.dockerignore
+
+# Kong (separate container)
+kong/
+
+# Tests
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Misc
+*.tmp
+*.bak
+*.swp
+.cache/
+
+# Build artifacts
+*.pyc
+*.pyo
+*.pyd

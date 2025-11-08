@@ -124,7 +124,7 @@ python src/automated_learning.py --mode finetune
 from src.model_evaluation import ModelEvaluator
 import yaml
 
-config = yaml.safe_load(open("configs/train_config.yaml"))
+config = yaml.safe_load(open("configs/train_config_full.yaml"))
 evaluator = ModelEvaluator(config)
 
 # Evaluate a model
@@ -174,7 +174,7 @@ manager.print_status()
 
 ## Configuration
 
-Add to `configs/train_config.yaml`:
+Add to `configs/train_config_full.yaml`:
 
 ```yaml
 continuous_learning:

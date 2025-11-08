@@ -1,0 +1,56 @@
+{
+  "dashboard": {
+    "title": "Kong Gateway - LLM API Monitoring",
+    "tags": ["kong", "llm", "api-gateway"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Total Requests",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_total[5m]))",
+            "legendFormat": "Total Requests/sec"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Requests per Service",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_total[5m])) by (service)",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_http_requests_status{code=~\"5..\"}[5m])) / sum(rate(kong_http_requests_total[5m])) * 100",
+            "legendFormat": "Error Rate %"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Cache Hit Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(kong_proxy_cache_total{status=\"hit\"}[5m])) / sum(rate(kong_proxy_cache_total[5m])) * 100",
+            "legendFormat": "Cache Hit Rate %"
+          }
+        ]
+      }
+    ],
+    "refresh": "10s",
+    "schemaVersion": 16,
+    "version": 1
+  }
+}

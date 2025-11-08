@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: kong-postgres
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong
+      POSTGRES_DB: kong
+    ports:
+      - "5434:5432"  # Use 5434 to avoid conflict with existing PostgreSQL (5432) and pgvector (5433)
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kong"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kong-net
+
+  kong-migrations:
+    image: kong:3.5
+    container_name: kong-migrations
+    command: kong migrations bootstrap
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: postgres
+      KONG_PG_PORT: 5432
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_PG_DATABASE: kong
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - kong-net
+    restart: on-failure
+
+  kong:
+    image: kong:3.5
+    container_name: kong-gateway
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: postgres
+      KONG_PG_PORT: 5432
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_PG_DATABASE: kong
+      
+      # Kong configuration
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8301
+      KONG_PROXY_LISTEN: 0.0.0.0:8300
+      
+      # Enable plugins (proxy-cache is bundled, retry is not available in Kong 3.5)
+      KONG_PLUGINS: bundled,proxy-cache
+      
+      # Proxy cache shared dictionary (required for proxy-cache plugin)
+      KONG_NGINX_HTTP_LUA_SHARED_DICT: kong_cache 128m
+      
+      # Use database mode (easier for initial setup)
+      # Can switch to DB-less mode later with KONG_DATABASE: "off" and KONG_DECLARATIVE_CONFIG
+    ports:
+      - "8300:8300"  # Proxy port
+      - "8301:8301"  # Admin API port
+    volumes:
+      - ./kong.yml:/usr/local/kong/kong.yml:ro
+    depends_on:
+      - postgres
+      - kong-migrations
+    networks:
+      - kong-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+networks:
+  kong-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+

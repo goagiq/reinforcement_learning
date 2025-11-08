@@ -1,10 +1,67 @@
 [project]
 name = "nt8-rl"
 version = "0.1.0"
-description = "Add your description here"
+description = "NT8 RL Trading Strategy - Reinforcement Learning Trading System"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    # Core ML/RL Framework
+    "torch>=2.6.0",  # PyTorch (CUDA version available: install with --index-url for GPU support)
+    "torchvision>=0.21.0",
+    "torchaudio>=2.6.0",
+    "gymnasium>=0.29.0",
+    "stable-baselines3>=2.0.0",
+    "sb3-contrib>=2.0.0",
+    
+    # Data Processing
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+    
+    # Technical Analysis
+    "ta>=0.10.2",
+    "pandas-ta>=0.3.14b",
+    
+    # Communication
+    "requests>=2.31.0",
+    "httpx>=0.24.0",
+    "websockets>=12.0",
+    
+    # Monitoring & Logging
+    "tensorboard>=2.13.0",
+    "wandb>=0.15.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "watchdog>=3.0.0",
+    
+    # Web Framework (for Production UI)
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+    "psutil>=5.9.0",
+    
+    # Agentic Swarm (Multi-Agent System)
+    "strands-agents",
+    "strands-agents-tools",
+    "anthropic>=0.40.0",  # Anthropic Claude API client
+    "ollama>=0.3.0",      # Ollama Python client
+    
+    # Testing (optional, but included for development)
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    
+    # Code Quality (optional, but included for development)
+    "black>=23.7.0",
+    "flake8>=6.1.0",
+    "mypy>=1.5.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

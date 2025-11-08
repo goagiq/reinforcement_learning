@@ -328,11 +328,19 @@ Format your recommendation with:
             }
             
             # Validate with RiskManager
-            validated_value = self.risk_manager.validate_action(
+            # Note: validate_action now returns (position, monte_carlo_result)
+            result = self.risk_manager.validate_action(
                 target_position=action_value,
                 current_position=current_position,
                 market_data=market_data_dict
             )
+            
+            # Handle tuple return (position, monte_carlo_result)
+            if isinstance(result, tuple):
+                validated_value, _ = result  # Ignore monte_carlo_result for now
+            else:
+                # Backward compatibility
+                validated_value = result
             
             # Update recommendation based on risk manager
             recommendation["position_size"] = abs(validated_value)

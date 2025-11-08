@@ -9,10 +9,27 @@ from typing import Dict, List, Optional
 
 
 class OllamaClient:
-    """Client for interacting with Ollama API."""
+    """Client for interacting with Ollama API (directly or through Kong)."""
     
-    def __init__(self, base_url: str = "http://localhost:11434"):
-        self.base_url = base_url
+    def __init__(self, base_url: str = "http://localhost:11434", use_kong: bool = False, kong_api_key: str = None):
+        """
+        Initialize Ollama client.
+        
+        Args:
+            base_url: Ollama base URL (ignored if use_kong=True)
+            use_kong: Route requests through Kong Gateway
+            kong_api_key: Kong consumer API key (required if use_kong=True)
+        """
+        import os
+        self.use_kong = use_kong
+        if use_kong:
+            self.base_url = os.getenv("KONG_BASE_URL", "http://localhost:8300")
+            self.kong_api_key = kong_api_key or os.getenv("KONG_OLLAMA_KEY") or os.getenv("KONG_API_KEY")
+            if not self.kong_api_key:
+                raise ValueError("Kong API key required when use_kong=True. Set KONG_OLLAMA_KEY or KONG_API_KEY")
+        else:
+            self.base_url = base_url
+            self.kong_api_key = None
         self.model = "deepseek-r1:8b"
     
     def chat(self, messages: List[Dict[str, str]], stream: bool = True, timeout: int = 600, keep_alive: str = "10m") -> str:
@@ -28,7 +45,10 @@ class OllamaClient:
         Returns:
             Complete response text
         """
-        url = f"{self.base_url}/api/chat"
+        if self.use_kong:
+            url = f"{self.base_url}/llm/ollama/api/chat"
+        else:
+            url = f"{self.base_url}/api/chat"
         payload = {
             "model": self.model,
             "messages": messages,
@@ -42,6 +62,10 @@ class OllamaClient:
         }
         
         try:
+            headers = {}
+            if self.use_kong and self.kong_api_key:
+                headers["apikey"] = self.kong_api_key
+            
             if stream:
                 # Stream response for better UX with longer timeout
                 # DeepSeek-R1 needs time for reasoning, so we disable timeout for stream
@@ -50,7 +74,8 @@ class OllamaClient:
                 
                 response = requests.post(
                     url, 
-                    json=payload, 
+                    json=payload,
+                    headers=headers,
                     timeout=None,  # No timeout - let it stream
                     stream=True
                 )
@@ -93,7 +118,7 @@ class OllamaClient:
             else:
                 # Non-streaming response with longer timeout
                 print("⏳ Generating response (this may take 2-5 minutes for DeepSeek-R1)...")
-                response = requests.post(url, json=payload, timeout=timeout)
+                response = requests.post(url, json=payload, headers=headers, timeout=timeout)
                 response.raise_for_status()
                 result = response.json()
                 return result.get("message", {}).get("content", "")

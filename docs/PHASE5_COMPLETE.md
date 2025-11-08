@@ -140,7 +140,7 @@ pytest tests/test_swarm_performance.py -v
 
 ### Run Benchmark
 ```bash
-python scripts/benchmark_swarm.py --config configs/train_config.yaml --iterations 20
+python scripts/benchmark_swarm.py --config configs/train_config_full.yaml --iterations 20
 ```
 
 ## Test Coverage

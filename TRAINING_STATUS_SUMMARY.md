@@ -68,7 +68,7 @@ Entropy:       3.41 → 3.42   (Stable)
 # Training stops at any point
 # Resume from latest checkpoint:
 python src/train.py \
-  --config configs/train_config_gpu_optimized.yaml \
+  --config configs/train_config_gpu.yaml \
   --device cuda \
   --checkpoint models/checkpoint_30000.pt
 

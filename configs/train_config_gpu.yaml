@@ -23,7 +23,7 @@ model:
 environment:
   instrument: "ES"                     # ES or MES
   timeframes: [1, 5, 15]             # Timeframes in minutes
-  state_features: 150                 # Reduced from 200 - fewer features = faster
+  state_features: 900                 # Must match environment state_dim (15 features * 3 timeframes * 20 lookback = 900)
   action_space: "continuous"          # continuous or discrete
   action_range: [-1.0, 1.0]          # Position size range
   
@@ -88,6 +88,15 @@ reasoning:
   pre_trade_validation: true         # Validate before trading
   confidence_threshold: 0.7           # Minimum confidence to trade
   timeout: 2.0                        # Reasoning timeout (seconds)
+
+# Agentic Swarm Configuration (used in live trading/backtests)
+agentic_swarm:
+  enabled: true                       # Enable agentic swarm system
+  execution_timeout: 20.0             # Total execution timeout (seconds)
+  contrarian:
+    enabled: true                     # Enable Warren Buffett-style contrarian agent
+    greed_threshold_percentile: 90    # Top 10% sentiment/volatility = greed
+    fear_threshold_percentile: 10     # Bottom 10% sentiment/volatility = fear
 
 # Logging
 logging:

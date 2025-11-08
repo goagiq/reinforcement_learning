@@ -42,7 +42,7 @@ elif pnl_change < 0:
 reward *= 5.0                                           # Moderate scaling
 ```
 
-### 2. Training Configuration (`configs/train_config.yaml`)
+### 2. Training Configuration (`configs/train_config_full.yaml`)
 
 **Key Changes:**
 - ✅ **Learning rate:** 0.0003 → **0.0005** (faster learning, more responsive)

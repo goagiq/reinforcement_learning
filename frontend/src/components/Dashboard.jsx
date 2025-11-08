@@ -5,7 +5,8 @@ import BacktestPanel from './BacktestPanel'
 import TradingPanel from './TradingPanel'
 import MonitoringPanel from './MonitoringPanel'
 import SettingsPanel from './SettingsPanel'
-import { Activity, Brain, TrendingUp, Play, Settings, BarChart3 } from 'lucide-react'
+import ScenarioSimulationPanel from './ScenarioSimulationPanel'
+import { Activity, Brain, TrendingUp, Play, Settings, BarChart3, TestTube } from 'lucide-react'
 import { getDefaultModel, isDefaultModel } from '../utils/modelUtils'
 
 const Dashboard = ({ onSetupChange }) => {
@@ -211,6 +212,7 @@ const Dashboard = ({ onSetupChange }) => {
     { id: 'overview', label: 'Overview', icon: Activity },
     { id: 'training', label: 'Training', icon: Brain },
     { id: 'backtest', label: 'Backtest', icon: BarChart3 },
+    { id: 'scenarios', label: 'Scenarios', icon: TestTube },
     { id: 'trading', label: 'Trading', icon: Play },
     { id: 'monitoring', label: 'Monitoring', icon: TrendingUp },
   ]
@@ -539,6 +541,10 @@ const Dashboard = ({ onSetupChange }) => {
 
         {activeTab === 'backtest' && (
           <BacktestPanel models={models} />
+        )}
+
+        {activeTab === 'scenarios' && (
+          <ScenarioSimulationPanel />
         )}
 
         {activeTab === 'trading' && (

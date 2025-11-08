@@ -8,6 +8,8 @@ Coordinates execution of all agents with proper handoff logic.
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import asyncio
+import json
+from pathlib import Path
 from src.agentic_swarm.shared_context import SharedContext
 from src.agentic_swarm.config_loader import SwarmConfigLoader
 from src.agentic_swarm.agents import (
@@ -78,13 +80,19 @@ class SwarmOrchestrator:
             import os
             api_key = reasoning_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
             
+            # Kong Gateway configuration
+            use_kong = reasoning_config.get("use_kong", False)
+            kong_api_key = reasoning_config.get("kong_api_key") or os.getenv("KONG_API_KEY")
+            
             self.reasoning_engine = ReasoningEngine(
                 provider_type=reasoning_config.get("provider", "ollama"),
                 model=reasoning_config.get("model", "deepseek-r1:8b"),
                 api_key=api_key,
                 base_url=reasoning_config.get("base_url"),
                 timeout=int(reasoning_config.get("timeout", 2.0) * 60),
-                keep_alive=reasoning_config.get("keep_alive", "10m")  # Keep model pre-loaded
+                keep_alive=reasoning_config.get("keep_alive", "10m"),  # Keep model pre-loaded
+                use_kong=use_kong,
+                kong_api_key=kong_api_key
             )
         else:
             self.reasoning_engine = reasoning_engine
@@ -145,14 +153,22 @@ class SwarmOrchestrator:
         )
         
         # Contrarian Agent (runs parallel with MarketResearch and Sentiment)
-        contrarian_config = self.swarm_config.get("contrarian", {})
+        contrarian_config = dict(self.swarm_config.get("contrarian", {}))
         contrarian_config["reasoning"] = reasoning_config  # Include reasoning config
-        self.contrarian_agent = ContrarianAgent(
-            shared_context=self.shared_context,
-            market_data_provider=self.market_data_provider,
-            reasoning_engine=self.reasoning_engine,
-            config=contrarian_config
-        )
+        override = self._load_contrarian_enabled_setting()
+        if override is not None:
+            contrarian_config["enabled"] = override
+        self.contrarian_enabled = contrarian_config.get("enabled", True)
+        
+        if self.contrarian_enabled:
+            self.contrarian_agent = ContrarianAgent(
+                shared_context=self.shared_context,
+                market_data_provider=self.market_data_provider,
+                reasoning_engine=self.reasoning_engine,
+                config=contrarian_config
+            )
+        else:
+            self.contrarian_agent = None
         
         # Analyst Agent
         analyst_config = self.swarm_config.get("analyst", {})
@@ -177,11 +193,30 @@ class SwarmOrchestrator:
         self.agents = [
             self.market_research_agent,
             self.sentiment_agent,
-            self.contrarian_agent,
+        ]
+        if self.contrarian_agent:
+            self.agents.append(self.contrarian_agent)
+        self.agents.extend([
             self.analyst_agent,
             self.recommendation_agent
-        ]
+        ])
     
+    def _load_contrarian_enabled_setting(self) -> Optional[bool]:
+        """Load contrarian enabled flag from settings.json if present."""
+        settings_file = Path("settings.json")
+        if not settings_file.exists():
+            return None
+        
+        try:
+            with open(settings_file, "r") as f:
+                settings = json.load(f)
+            if "contrarian_enabled" in settings:
+                return bool(settings["contrarian_enabled"])
+        except Exception:
+            pass
+        
+        return None
+
     async def analyze(
         self,
         market_data: Dict[str, Any],
@@ -284,16 +319,28 @@ class SwarmOrchestrator:
         sentiment_task = asyncio.create_task(
             asyncio.to_thread(self.sentiment_agent.analyze, market_state)
         )
-        contrarian_task = asyncio.create_task(
-            asyncio.to_thread(self.contrarian_agent.analyze, market_state)
-        )
         
-        # Wait for all three to complete
-        research_findings, sentiment_findings, contrarian_findings = await asyncio.gather(
-            research_task,
-            sentiment_task,
-            contrarian_task
-        )
+        if self.contrarian_agent:
+            contrarian_task = asyncio.create_task(
+                asyncio.to_thread(self.contrarian_agent.analyze, market_state)
+            )
+            research_findings, sentiment_findings, contrarian_findings = await asyncio.gather(
+                research_task,
+                sentiment_task,
+                contrarian_task
+            )
+        else:
+            # Clear any stale contrarian data in shared context
+            self.shared_context.set("contrarian_analysis", None, "contrarian_signals")
+            research_findings, sentiment_findings = await asyncio.gather(
+                research_task,
+                sentiment_task
+            )
+            contrarian_findings = {
+                "status": "disabled",
+                "message": "Contrarian agent disabled via settings",
+                "timestamp": datetime.now().isoformat()
+            }
         
         # Phase 2: Analyst Agent (synthesizes research + sentiment)
         analyst_task = asyncio.create_task(

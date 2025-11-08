@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
-import { Play, Square, Loader, CheckCircle, AlertCircle, Cpu, RefreshCw } from 'lucide-react'
+import { Play, Square, Loader, CheckCircle, AlertCircle, Cpu, RefreshCw, Star } from 'lucide-react'
 import { getDefaultModel, sortModelsWithDefaultFirst, isDefaultModel } from '../utils/modelUtils'
 
 // Animated number component that highlights when value changes
@@ -98,6 +98,7 @@ const AnimatedMetric = ({ value, format = (v) => v, className = '' }) => {
 }
 
 const TrainingPanel = ({ models = [], onModelsChange }) => {
+  const DEFAULT_CONFIG_PATH = 'configs/train_config_full.yaml'
   const [training, setTraining] = useState(false)
   const [trainingStatus, setTrainingStatus] = useState(null)
   const [trainingMetrics, setTrainingMetrics] = useState(null)
@@ -134,7 +135,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [gpuInfo, setGpuInfo] = useState(null)
   const [totalTimesteps, setTotalTimesteps] = useState(1000000)
   const [reasoningModel, setReasoningModel] = useState('')
-  const [configPath, setConfigPath] = useState('configs/train_config.yaml')
+  const [configPath, setConfigPathState] = useState('')
   const [availableConfigs, setAvailableConfigs] = useState([])
   const [checkpoints, setCheckpoints] = useState([])
   const [selectedCheckpoint, setSelectedCheckpoint] = useState('latest') // 'latest', 'none', or checkpoint path
@@ -144,6 +145,38 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [trainingMode, setTrainingMode] = useState('quiet') // 'quiet', 'performance', or 'turbo'
   const [turboModeEnabled, setTurboModeEnabled] = useState(false)
   const [manualTriggerLoading, setManualTriggerLoading] = useState(false)
+  const [promoteLoading, setPromoteLoading] = useState(false)
+  const [transferStrategy, setTransferStrategy] = useState('copy_and_extend') // Transfer learning strategy
+  const [checkpointInfo, setCheckpointInfo] = useState(null) // Architecture info for selected checkpoint
+  const [configArchitecture, setConfigArchitecture] = useState(null) // Architecture from config
+  const [architectureMismatch, setArchitectureMismatch] = useState(false) // Whether architectures differ
+  const normalizePath = (path) => (path ? path.replace(/\\/g, '/') : '')
+  const setConfigPath = (path) => {
+    const normalized = normalizePath(path)
+    setConfigPathState(normalized)
+    try {
+      if (normalized) {
+        localStorage.setItem('trainingConfigPath', normalized)
+      } else {
+        localStorage.removeItem('trainingConfigPath')
+      }
+    } catch (error) {
+      // Ignore storage errors (e.g., privacy mode)
+    }
+  }
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem('trainingConfigPath')
+      if (stored) {
+        setConfigPathState(normalizePath(stored))
+        return
+      }
+    } catch (error) {
+      // Ignore storage errors (e.g., privacy mode)
+    }
+    setConfigPath(DEFAULT_CONFIG_PATH)
+  }, [])
   
   // Default reasoning model using universal default setting
   useEffect(() => {
@@ -351,16 +384,28 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     const loadConfigs = async () => {
       try {
         const response = await axios.get('/api/config/list')
-        const configs = response.data.configs || []
-        setAvailableConfigs(configs)
+        const rawConfigs = response.data.configs || []
+        const normalizedConfigs = rawConfigs.map(cfg => ({
+          ...cfg,
+          path: normalizePath(cfg.path),
+          relative: normalizePath(cfg.relative)
+        }))
+        setAvailableConfigs(normalizedConfigs)
         
-        // Auto-select GPU-optimized config if available
-        const optimizedConfig = configs.find(c => c.name.includes('gpu_optimized') || c.name.includes('optimized'))
-        if (optimizedConfig) {
-          setConfigPath(optimizedConfig.relative)
-        } else if (configs.length > 0) {
-          // Fall back to first available config
-          setConfigPath(configs[0].relative)
+        if (normalizedConfigs.length > 0) {
+          const currentNormalized = normalizePath(configPath)
+          const hasCurrent = currentNormalized && normalizedConfigs.some(c => c.relative === currentNormalized)
+          if (!hasCurrent) {
+            const lowerName = (name) => name.toLowerCase()
+            const fullConfig = normalizedConfigs.find(c => lowerName(c.name).includes('full'))
+            const gpuConfig = normalizedConfigs.find(c => lowerName(c.name).includes('gpu'))
+            const optimizedConfig = normalizedConfigs.find(c => {
+              const name = lowerName(c.name)
+              return name.includes('gpu_optimized') || name.includes('optimized')
+            })
+            const fallback = fullConfig || gpuConfig || optimizedConfig || normalizedConfigs[0]
+            setConfigPath(fallback.relative)
+          }
         }
       } catch (error) {
         console.error('Failed to load configs:', error)
@@ -393,6 +438,87 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     const interval = setInterval(loadCheckpoints, 10000)
     return () => clearInterval(interval)
   }, []) // Only run on mount, not when selectedCheckpoint changes
+
+  // Load config architecture when config changes
+  useEffect(() => {
+    const loadConfigArchitecture = async () => {
+      try {
+        const targetPath = normalizePath(configPath)
+        if (!targetPath) {
+          return
+        }
+        const response = await axios.get(`/api/config/read?path=${encodeURIComponent(targetPath)}`)
+        const config = response.data.config || {}
+        const hiddenDims = config.model?.hidden_dims || [256, 256, 128]
+        const configuredStateDim = config.environment?.state_features
+        const timeframes = config.environment?.timeframes
+        const lookbackBars = config.environment?.lookback_bars
+        const derivedStateDim = Array.isArray(timeframes) && timeframes.length > 0 && lookbackBars
+          ? timeframes.length * 15 * lookbackBars
+          : undefined
+        const stateDim = configuredStateDim ?? derivedStateDim ?? 200
+        
+        setConfigArchitecture({
+          hidden_dims: hiddenDims,
+          state_dim: stateDim
+        })
+      } catch (error) {
+        console.error('Failed to load config architecture:', error)
+      }
+    }
+    
+    if (configPath) {
+      loadConfigArchitecture()
+    }
+  }, [configPath])
+
+  // Load checkpoint info when checkpoint selection changes
+  useEffect(() => {
+    const loadCheckpointInfo = async () => {
+      if (selectedCheckpoint === 'none' || !selectedCheckpoint) {
+        setCheckpointInfo(null)
+        setArchitectureMismatch(false)
+        return
+      }
+      
+      try {
+        let checkpointPath = selectedCheckpoint
+        if (selectedCheckpoint === 'latest' && latestCheckpoint) {
+          checkpointPath = latestCheckpoint.path
+        }
+        
+        if (checkpointPath && checkpointPath !== 'latest' && checkpointPath !== 'none') {
+          const response = await axios.get(`/api/models/checkpoint/info?checkpoint_path=${encodeURIComponent(checkpointPath)}`)
+          if (response.data.error) {
+            setCheckpointInfo(null)
+            setArchitectureMismatch(false)
+            return
+          }
+          
+          setCheckpointInfo(response.data)
+          
+          // Check for architecture mismatch
+          if (response.data.architecture && configArchitecture) {
+            const checkpointArch = response.data.architecture
+            const configArch = configArchitecture
+            
+            const hiddenDimsMatch = JSON.stringify(checkpointArch.hidden_dims) === JSON.stringify(configArch.hidden_dims)
+            const stateDimMatch = checkpointArch.state_dim === configArch.state_dim
+            
+            setArchitectureMismatch(!hiddenDimsMatch || !stateDimMatch)
+          } else {
+            setArchitectureMismatch(false)
+          }
+        }
+      } catch (error) {
+        console.error('Failed to load checkpoint info:', error)
+        setCheckpointInfo(null)
+        setArchitectureMismatch(false)
+      }
+    }
+    
+    loadCheckpointInfo()
+  }, [selectedCheckpoint, latestCheckpoint, configArchitecture])
 
   // Check CUDA availability on mount and auto-select if available
   useEffect(() => {
@@ -737,6 +863,12 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
         console.log('📂 No checkpoint selected - starting fresh training')
       }
       
+      // Include transfer_strategy if architecture mismatch detected or explicitly set
+      if (architectureMismatch || selectedCheckpoint !== 'none') {
+        requestData.transfer_strategy = transferStrategy
+        console.log('🔄 Using transfer learning strategy:', transferStrategy)
+      }
+      
       console.log('📤 Training request data:', JSON.stringify(requestData, null, 2))
       console.log('📡 Sending POST request to /api/training/start...')
       
@@ -806,6 +938,72 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     }
   }
 
+  const handlePromoteCheckpoint = async () => {
+    if (!selectedCheckpoint || selectedCheckpoint === 'none') {
+      return
+    }
+
+    let checkpointPath = selectedCheckpoint
+    if (selectedCheckpoint === 'latest') {
+      if (!latestCheckpoint?.path) {
+        setMessages(prev => [...prev, {
+          status: 'error',
+          message: '❌ No latest checkpoint available to promote.'
+        }])
+        return
+      }
+      checkpointPath = latestCheckpoint.path
+    }
+
+    checkpointPath = normalizePath(checkpointPath)
+    if (!checkpointPath) {
+      setMessages(prev => [...prev, {
+        status: 'error',
+        message: '❌ Invalid checkpoint path. Unable to promote.'
+      }])
+      return
+    }
+
+    setPromoteLoading(true)
+    try {
+      const payload = {
+        source_path: checkpointPath,
+        target_name: 'best_model.pt',
+        overwrite: true
+      }
+      const response = await axios.post('/api/models/promote', payload)
+      const successMessage = response.data?.message || `⭐ Promoted ${checkpointPath} to best_model.pt`
+      setMessages(prev => [...prev, {
+        status: 'success',
+        message: successMessage
+      }])
+
+      if (typeof onModelsChangeRef.current === 'function') {
+        onModelsChangeRef.current()
+      }
+    } catch (error) {
+      const errorMessage = error.response?.data?.detail || error.message || 'Failed to promote checkpoint'
+      setMessages(prev => [...prev, {
+        status: 'error',
+        message: `❌ Failed to promote checkpoint: ${errorMessage}`
+      }])
+    } finally {
+      setPromoteLoading(false)
+    }
+  }
+
+  const resolvedCheckpointPath = (() => {
+    if (!selectedCheckpoint || selectedCheckpoint === 'none') {
+      return null
+    }
+    if (selectedCheckpoint === 'latest') {
+      return latestCheckpoint?.path ? normalizePath(latestCheckpoint.path) : null
+    }
+    return normalizePath(selectedCheckpoint)
+  })()
+
+  const canPromoteCheckpoint = Boolean(resolvedCheckpointPath)
+
   return (
     <div className="space-y-6">
       <div className="bg-white rounded-lg shadow p-6">
@@ -818,8 +1016,8 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
               Configuration File
             </label>
             <select
-              value={configPath}
-              onChange={(e) => setConfigPath(e.target.value)}
+              value={configPath || ''}
+              onChange={(e) => setConfigPath(normalizePath(e.target.value))}
               disabled={training}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
             >
@@ -827,7 +1025,11 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 availableConfigs.map((config, idx) => (
                   <option key={idx} value={config.relative}>
                     {config.name}
-                    {config.name.includes('gpu_optimized') || config.name.includes('optimized') ? ' ⚡ (Optimized for GPU)' : ''}
+                    {config.name.toLowerCase().includes('gpu') || config.name.toLowerCase().includes('optimized')
+                      ? ' ⚡ (Optimized for GPU)'
+                      : config.name.toLowerCase().includes('full')
+                        ? ' (Full Capacity)'
+                        : ''}
                   </option>
                 ))
               ) : (
@@ -964,10 +1166,86 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 </optgroup>
               )}
             </select>
+            
+            {/* Checkpoint Architecture Info */}
+            {checkpointInfo && checkpointInfo.has_architecture && (
+              <div className="mt-2 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                <div className="text-sm font-semibold text-blue-800 mb-1">Checkpoint Architecture:</div>
+                <div className="text-sm text-blue-700">
+                  Hidden Layers: [{checkpointInfo.architecture.hidden_dims?.join(', ') || 'N/A'}]
+                  {checkpointInfo.architecture.state_dim && (
+                    <> | State Dim: {checkpointInfo.architecture.state_dim}</>
+                  )}
+                  {checkpointInfo.training.timestep > 0 && (
+                    <> | Timestep: {checkpointInfo.training.timestep.toLocaleString()}</>
+                  )}
+                </div>
+              </div>
+            )}
+            
+            {/* Config Architecture Info */}
+            {configArchitecture && (
+              <div className="mt-2 p-3 bg-gray-50 rounded-lg border border-gray-200">
+                <div className="text-sm font-semibold text-gray-700 mb-1">Config Architecture:</div>
+                <div className="text-sm text-gray-600">
+                  Hidden Layers: [{configArchitecture.hidden_dims?.join(', ') || 'N/A'}]
+                  {configArchitecture.state_dim && (
+                    <> | State Dim: {configArchitecture.state_dim}</>
+                  )}
+                </div>
+              </div>
+            )}
+            
+            {canPromoteCheckpoint && (
+              <div className="mt-3">
+                <button
+                  type="button"
+                  onClick={handlePromoteCheckpoint}
+                  disabled={promoteLoading || !canPromoteCheckpoint}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {promoteLoading ? (
+                    <>
+                      <Loader className="w-4 h-4 animate-spin" />
+                      Promoting...
+                    </>
+                  ) : (
+                    <>
+                      <Star className="w-4 h-4" />
+                      Promote to Best Model
+                    </>
+                  )}
+                </button>
+                <p className="text-xs text-gray-500 mt-2">
+                  Copies the selected checkpoint to <code>models/best_model.pt</code> for backtests and deployment.
+                </p>
+              </div>
+            )}
+            
+            {/* Architecture Mismatch Warning */}
+            {architectureMismatch && (
+              <div className="mt-2 p-3 bg-yellow-50 rounded-lg border border-yellow-300">
+                <div className="flex items-start gap-2">
+                  <span className="text-yellow-600 font-bold text-lg">⚠️</span>
+                  <div className="flex-1">
+                    <div className="text-sm font-semibold text-yellow-800 mb-1">Architecture Mismatch Detected</div>
+                    <div className="text-sm text-yellow-700 mb-2">
+                      The checkpoint architecture differs from the config. Transfer learning will be used to preserve learned knowledge.
+                    </div>
+                    <div className="text-xs text-yellow-600">
+                      <div>Checkpoint: [{checkpointInfo.architecture.hidden_dims?.join(', ') || 'N/A'}]</div>
+                      <div>Config: [{configArchitecture.hidden_dims?.join(', ') || 'N/A'}]</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            
             <p className="text-sm text-gray-500 mt-1">
               {selectedCheckpoint === 'latest' && latestCheckpoint ? (
                 <span className="text-blue-600 font-medium">
                   ✓ Will resume from latest checkpoint ({latestCheckpoint.timestep ? `${(latestCheckpoint.timestep / 1000).toFixed(0)}k timesteps` : 'Unknown timesteps'})
+                  {architectureMismatch && ' with transfer learning'}
                 </span>
               ) : selectedCheckpoint === 'none' ? (
                 <span className="text-orange-600 font-medium">
@@ -978,6 +1256,46 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
               )}
             </p>
           </div>
+
+          {/* Transfer Learning Strategy (shown when checkpoint selected) */}
+          {selectedCheckpoint !== 'none' && (
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-2">
+                Transfer Learning Strategy
+                {architectureMismatch && <span className="text-yellow-600 ml-2">(Required for architecture mismatch)</span>}
+              </label>
+              <select
+                value={transferStrategy}
+                onChange={(e) => setTransferStrategy(e.target.value)}
+                disabled={training}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+              >
+                <option value="copy_and_extend">
+                  Copy and Extend (Recommended) - Preserves learned weights, initializes new dimensions with small random values
+                </option>
+                <option value="interpolate">
+                  Interpolate - Averages existing neurons to fill new dimensions
+                </option>
+                <option value="zero_pad">
+                  Zero Pad - Copies weights, initializes new dimensions with zeros
+                </option>
+              </select>
+              <p className="text-sm text-gray-500 mt-1">
+                {transferStrategy === 'copy_and_extend' && (
+                  <>✅ <strong>Recommended:</strong> Best balance between preserving knowledge and allowing new capacity to learn.</>
+                )}
+                {transferStrategy === 'interpolate' && (
+                  <>🔄 Uses average of existing neurons - good for similar architectures.</>
+                )}
+                {transferStrategy === 'zero_pad' && (
+                  <>⚡ Fastest but may require more training for new dimensions to learn effectively.</>
+                )}
+                {!architectureMismatch && (
+                  <> This strategy will be used if architecture changes are detected during checkpoint loading.</>
+                )}
+              </p>
+            </div>
+          )}
 
           {/* Status */}
           {trainingStatus && (

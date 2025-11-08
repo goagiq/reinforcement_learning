@@ -21,7 +21,7 @@ model:
 environment:
   instrument: "ES"                     # ES or MES
   timeframes: [1, 5, 15]             # Timeframes in minutes
-  state_features: 200                 # State dimension (NOTE: Increasing this would break existing checkpoints - only change if starting fresh)
+  state_features: 900                 # State dimension (15 features * 3 timeframes * 20 lookback = 900; must match environment)
   action_space: "continuous"          # continuous or discrete
   action_range: [-1.0, 1.0]          # Position size range
   max_episode_steps: 10000            # Maximum steps per episode (episodes will terminate at this limit)
@@ -42,6 +42,10 @@ training:
   eval_freq: 5000                     # Evaluation frequency
   device: "cuda"                      # cuda or cpu
   num_envs: 1                         # Number of parallel environments
+  transfer_strategy: "copy_and_extend"  # Transfer learning strategy when architecture changes:
+                                        # - "copy_and_extend": Copy weights, init new dims with small random values (recommended)
+                                        # - "interpolate": Interpolate from existing neurons
+                                        # - "zero_pad": Initialize new dimensions with zeros
   
   # Data
   train_split: 0.8                    # Train/test split
@@ -72,6 +76,11 @@ reasoning:
   pre_trade_validation: true         # Validate before trading
   confidence_threshold: 0.7           # Minimum confidence to trade
   timeout: 2.0                        # Reasoning timeout (seconds)
+  
+  # Kong Gateway Integration (optional)
+  use_kong: false                     # Route requests through Kong Gateway
+  kong_base_url: "http://localhost:8300"  # Kong Gateway proxy URL
+  kong_api_key: null                  # Kong consumer API key (set via KONG_API_KEY or provider-specific env var)
 
 # Agentic Swarm Configuration
 agentic_swarm:
@@ -84,6 +93,12 @@ agentic_swarm:
   node_timeout: 5.0                   # Per-agent timeout (seconds)
   cache_ttl: 300                      # Cache TTL (seconds) - 5 minutes
   
+  # Contrarian Agent Configuration (Warren Buffett-style overrides)
+  contrarian:
+    enabled: true                     # Enable contrarian agent by default
+    greed_threshold_percentile: 90    # Top 10% sentiment/volatility = greed
+    fear_threshold_percentile: 10     # Bottom 10% sentiment/volatility = fear
+
   # Market Research Agent Configuration
   market_research:
     instruments: ["ES", "NQ", "RTY", "YM"]  # Instruments to analyze

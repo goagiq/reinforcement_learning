@@ -540,6 +540,72 @@ class PPOAgent:
         
         print(f"Agent loaded from: {filepath} (timestep={timestep}, episode={episode})")
         return timestep, episode, episode_rewards, episode_lengths
+    
+    def load_with_transfer(self, filepath: str, transfer_strategy: str = "copy_and_extend"):
+        """
+        Load agent state with transfer learning from different architecture.
+        
+        This method transfers weights from a checkpoint with different architecture
+        (e.g., [128, 128, 64] -> [256, 256, 128]) while preserving learned knowledge.
+        
+        Args:
+            filepath: Path to checkpoint with different architecture
+            transfer_strategy: Strategy for weight transfer:
+                - "copy_and_extend": Copy old weights, initialize new dimensions with small random values
+                - "interpolate": Interpolate old weights to fill new dimensions
+                - "zero_pad": Copy old weights, pad new dimensions with zeros
+        
+        Returns:
+            Tuple of (timestep, episode, episode_rewards, episode_lengths)
+        """
+        from src.weight_transfer import transfer_checkpoint_weights
+        
+        print(f"\n🔄 Loading checkpoint with transfer learning: {filepath}")
+        
+        # Transfer weights
+        new_actor_state, new_critic_state = transfer_checkpoint_weights(
+            filepath,
+            self.actor,
+            self.critic,
+            transfer_strategy
+        )
+        
+        # Load transferred weights
+        self.actor.load_state_dict(new_actor_state)
+        self.critic.load_state_dict(new_critic_state)
+        
+        # Load checkpoint for training state and optimizer states
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        
+        # Try to load optimizer states (may fail if architecture changed significantly)
+        try:
+            # Create new optimizers with current network parameters
+            # This ensures optimizer states match new architecture
+            self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.actor_optimizer.param_groups[0]['lr'])
+            self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.critic_optimizer.param_groups[0]['lr'])
+            print("  ✅ Optimizers reinitialized for new architecture")
+        except Exception as e:
+            print(f"  ⚠️  Could not transfer optimizer states: {e}")
+            print("  ✅ Optimizers will be reinitialized")
+        
+        # Extract training state
+        timestep = checkpoint.get("timestep", 0)
+        episode = checkpoint.get("episode", 0)
+        episode_rewards = checkpoint.get("episode_rewards", [])
+        episode_lengths = checkpoint.get("episode_lengths", [])
+        
+        # If training state not in checkpoint, try to extract from filename
+        if timestep == 0:
+            import re
+            from pathlib import Path
+            filename = Path(filepath).name
+            match = re.search(r'checkpoint_(\d+)\.pt', filename)
+            if match:
+                timestep = int(match.group(1))
+                print(f"  📊 Extracted timestep from filename: {timestep}")
+        
+        print(f"✅ Transfer learning complete! (timestep={timestep}, episode={episode})")
+        return timestep, episode, episode_rewards, episode_lengths
 
 
 # Example usage

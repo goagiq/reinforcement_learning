@@ -52,12 +52,19 @@ class BaseSwarmAgent:
             import os
             api_key = provider_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
             
+            # Kong Gateway configuration
+            use_kong = provider_config.get("use_kong", False)
+            kong_api_key = provider_config.get("kong_api_key") or os.getenv("KONG_API_KEY")
+            
             self.reasoning_engine = ReasoningEngine(
                 provider_type=provider_config.get("provider", "ollama"),
                 model=provider_config.get("model", "deepseek-r1:8b"),
                 api_key=api_key,
                 base_url=provider_config.get("base_url"),
-                timeout=int(provider_config.get("timeout", 2.0) * 60)
+                timeout=int(provider_config.get("timeout", 2.0) * 60),
+                keep_alive=provider_config.get("keep_alive", "10m"),
+                use_kong=use_kong,
+                kong_api_key=kong_api_key
             )
         else:
             self.reasoning_engine = reasoning_engine

@@ -144,10 +144,15 @@ const SetupWizard = ({ setupStatus, onSetupComplete }) => {
                 ) : (
                   <XCircle className="w-5 h-5 text-red-500" />
                 )}
-                <span className="flex-1">Virtual Environment</span>
+                <span className="flex-1">
+                  Virtual Environment
+                  {setupStatus?.venv_type && (
+                    <span className="text-xs text-gray-500 ml-2">({setupStatus.venv_type})</span>
+                  )}
+                </span>
                 {!setupStatus?.venv_exists && (
                   <span className="text-sm text-gray-500">
-                    Run: python -m venv .venv
+                    Run: {setupStatus?.venv_message || "python -m venv .venv"}
                   </span>
                 )}
               </div>
