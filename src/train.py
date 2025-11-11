@@ -32,14 +32,16 @@ from src.data_extraction import DataExtractor
 from src.trading_env import TradingEnvironment
 from src.rl_agent import PPOAgent
 from torch.utils.tensorboard import SummaryWriter
+from src.trading_hours import TradingHoursManager
 
 
 class Trainer:
     """Handles the training loop"""
     
-    def __init__(self, config: dict, checkpoint_path: str = None):
+    def __init__(self, config: dict, checkpoint_path: str = None, config_path: str = None):
         self.config = config
         self.checkpoint_path = checkpoint_path
+        self.config_path = config_path  # Store config_path for adaptive trainer
         
         # Validate and adjust device selection
         requested_device = config["training"]["device"]
@@ -88,15 +90,45 @@ class Trainer:
         print("Loading data...")
         print(f"  Instrument: {config['environment']['instrument']}")
         print(f"  Timeframes: {config['environment']['timeframes']}")
+        print("  This may take a while if loading many files...")
+        sys.stdout.flush()  # Ensure output is visible immediately
+        
         try:
-            self._load_data()
-            data_load_elapsed = time.time() - data_load_start
-            print(f"✅ Data loaded successfully (took {data_load_elapsed:.1f}s)")
+            # Add periodic progress updates during data loading
+            import threading
+            progress_thread = None
+            progress_stop = threading.Event()
+            
+            def progress_reporter():
+                """Report progress every 10 seconds during data loading"""
+                elapsed = 0
+                while not progress_stop.is_set():
+                    time.sleep(10)
+                    if not progress_stop.is_set():
+                        elapsed = time.time() - data_load_start
+                        print(f"  [Progress] Still loading data... ({elapsed:.0f}s elapsed)")
+                        sys.stdout.flush()
+            
+            progress_thread = threading.Thread(target=progress_reporter, daemon=True)
+            progress_thread.start()
+            
+            try:
+                self._load_data()
+                progress_stop.set()
+                data_load_elapsed = time.time() - data_load_start
+                print(f"[OK] Data loaded successfully (took {data_load_elapsed:.1f}s)")
+                sys.stdout.flush()
+            finally:
+                progress_stop.set()
+                if progress_thread and progress_thread.is_alive():
+                    progress_thread.join(timeout=1)
         except Exception as e:
+            progress_stop.set() if 'progress_stop' in locals() else None
             data_load_elapsed = time.time() - data_load_start
-            print(f"❌ Error loading data after {data_load_elapsed:.1f}s: {e}")
+            print(f"[ERROR] Error loading data after {data_load_elapsed:.1f}s: {e}")
             import traceback
             traceback.print_exc()
+            sys.stdout.flush()
             raise
         
         # Create environment
@@ -111,7 +143,8 @@ class Trainer:
             initial_capital=config["risk_management"]["initial_capital"],
             transaction_cost=config["risk_management"]["commission"] / config["risk_management"]["initial_capital"],
             reward_config=config["environment"]["reward"],
-            max_episode_steps=max_episode_steps  # Limit episode length for reasonable training
+            max_episode_steps=max_episode_steps,  # Limit episode length for reasonable training
+            action_threshold=config["environment"].get("action_threshold", 0.05)  # Configurable action threshold (default 5%)
         )
         
         # Create agent
@@ -231,6 +264,69 @@ class Trainer:
         self.current_episode_reward = 0.0
         self.current_episode_length = 0
         
+        # Trading metrics tracking
+        self.episode_trades = []  # List of trade counts per episode
+        self.episode_pnls = []  # List of PnL per episode
+        self.episode_equities = []  # List of final equity per episode
+        self.episode_win_rates = []  # List of win rates per episode
+        self.episode_max_drawdowns = []  # List of max drawdowns per episode
+        self.total_trades = 0  # Cumulative total trades across all episodes
+        self.total_winning_trades = 0  # Cumulative winning trades
+        self.total_losing_trades = 0  # Cumulative losing trades
+        self.current_episode_trades = 0  # Current episode trade count
+        self.current_episode_pnl = 0.0  # Current episode PnL
+        self.current_episode_equity = 0.0  # Current episode equity
+        self.current_episode_win_rate = 0.0  # Current episode win rate
+        self.current_episode_max_drawdown = 0.0  # Current episode max drawdown
+        
+        # Track average win/loss and risk/reward ratio for profitability monitoring
+        self.current_avg_win = 0.0  # Current average winning trade PnL
+        self.current_avg_loss = 0.0  # Current average losing trade PnL
+        self.current_risk_reward_ratio = 0.0  # Current risk/reward ratio
+        
+        # DecisionGate integration for training (ensures consistency with live trading)
+        self.decision_gate = None
+        self.decision_gate_enabled = config.get("training", {}).get("use_decision_gate", False)
+        if self.decision_gate_enabled:
+            from src.decision_gate import DecisionGate
+            decision_gate_config = config.get("decision_gate", {})
+            # For training, ALWAYS set min_confluence_required to 0 to allow RL-only trades
+            # During training, we don't use swarm, so confluence_count will always be 0
+            # Quality filters (confidence, quality score, expected value) will still be applied
+            training_decision_gate_config = decision_gate_config.copy()
+            training_decision_gate_config["min_confluence_required"] = 0  # Always allow RL-only trades during training
+            training_decision_gate_config["swarm_enabled"] = False  # Disable swarm during training (not used anyway)
+            
+            # Also relax min_combined_confidence for training (default 0.7 is too high)
+            # Further reduced to 0.3 to allow more trades during training
+            if training_decision_gate_config.get("min_combined_confidence", 0.7) >= 0.5:
+                training_decision_gate_config["min_combined_confidence"] = 0.3  # More permissive for training (reduced from 0.5)
+                print("   [DecisionGate] Reduced min_combined_confidence to 0.3 for training")
+            
+            print("   [DecisionGate] Training mode: min_confluence_required=0, swarm_enabled=false")
+            print("   [DecisionGate] Quality filters (confidence, quality score, EV) still applied")
+            
+            self.decision_gate = DecisionGate(training_decision_gate_config)
+            print("[OK] DecisionGate integrated into training loop")
+            print(f"   Will apply quality filters, expected value checks, and position sizing")
+            print(f"   Ensures consistency between training and live trading")
+        
+        # Adaptive training system
+        self.adaptive_trainer = None
+        if config.get("training", {}).get("adaptive_training", {}).get("enabled", False):
+            from src.adaptive_trainer import AdaptiveTrainer, AdaptiveConfig
+            adaptive_cfg = AdaptiveConfig(
+                eval_frequency=config["training"]["adaptive_training"].get("eval_frequency", 10000),
+                eval_episodes=config["training"]["adaptive_training"].get("eval_episodes", 3),
+                min_trades_per_episode=config["training"]["adaptive_training"].get("min_trades_per_episode", 0.5),
+                auto_save_on_improvement=config["training"]["adaptive_training"].get("auto_save_on_improvement", True),
+                improvement_threshold=config["training"]["adaptive_training"].get("improvement_threshold", 0.05)
+            )
+            self.adaptive_trainer = AdaptiveTrainer(str(self.config_path), adaptive_cfg)
+            print("✅ Adaptive training system enabled")
+            print(f"   Will evaluate every {adaptive_cfg.eval_frequency:,} timesteps")
+            print(f"   Auto-adjusts: entropy_coef, inaction_penalty, learning_rate")
+        
         # Load performance mode from settings (for dynamic adjustment during training)
         self.performance_mode = self._load_performance_mode()
         
@@ -244,11 +340,11 @@ class Trainer:
         self.max_batch_multiplier = 100.0  # Increased max multiplier (for very small models with lots of VRAM)
         
         if self.performance_mode == "turbo":
-            print(f"⚙️  Performance mode: {self.performance_mode} (ADAPTIVE GPU UTILIZATION)")
+            print(f"[PERF] Performance mode: {self.performance_mode} (ADAPTIVE GPU UTILIZATION)")
             print(f"   Adaptive Turbo: Targeting {self.gpu_target_util}% GPU, <{self.vram_limit_gb}GB VRAM")
             print(f"   Starting: {self.turbo_batch_multiplier}x batch, {self.turbo_epoch_multiplier}x epochs")
         else:
-            print(f"⚙️  Performance mode: {self.performance_mode}")
+            print(f"[PERF] Performance mode: {self.performance_mode}")
         
         # Load checkpoint if provided (resume training)
         checkpoint_timestep = 0
@@ -336,13 +432,13 @@ class Trainer:
                     
                     # Check for turbo mode first (overrides performance mode)
                     if turbo_enabled:
-                        print(f"✅ TURBO MODE DETECTED in settings.json (turbo_training_mode: {turbo_enabled})")
+                        print(f"[OK] TURBO MODE DETECTED in settings.json (turbo_training_mode: {turbo_enabled})")
                         return "turbo"
                     else:
-                        print(f"📊 Performance mode: {perf_mode} (turbo_training_mode: {turbo_enabled})")
+                        print(f"[PERF] Performance mode: {perf_mode} (turbo_training_mode: {turbo_enabled})")
                         return perf_mode
             except Exception as e:
-                print(f"⚠️  Error loading performance mode: {e}")
+                print(f"[WARN] Error loading performance mode: {e}")
                 pass
         print(f"⚠️  settings.json not found, defaulting to quiet mode")
         return "quiet"  # Default: resource-friendly mode
@@ -429,7 +525,7 @@ class Trainer:
             if gpu_util > self.gpu_target_util + 5:  # Too high (>70%)
                 # Reduce batch size (more impact on GPU)
                 self.turbo_batch_multiplier = max(2.0, self.turbo_batch_multiplier * (1 - 0.1))
-                print(f"   📉 GPU too high ({gpu_util:.1f}% > {self.gpu_target_util}%), reducing batch multiplier to {self.turbo_batch_multiplier:.2f}x")
+                print(f"   [DOWN] GPU too high ({gpu_util:.1f}% > {self.gpu_target_util}%), reducing batch multiplier to {self.turbo_batch_multiplier:.2f}x")
             elif gpu_util < self.gpu_target_util:  # Too low (<65%)
                 # Increase batch size - more aggressive when far from target
                 old_batch = self.turbo_batch_multiplier
@@ -459,7 +555,7 @@ class Trainer:
                 # Reduce both multipliers to save memory
                 self.turbo_batch_multiplier = max(2.0, self.turbo_batch_multiplier * (1 - 0.1))
                 self.turbo_epoch_multiplier = max(1.5, self.turbo_epoch_multiplier * (1 - 0.1))
-                print(f"   ⚠️  VRAM high ({vram_used:.2f}GB > {self.vram_limit_gb * 0.9:.1f}GB), reducing multipliers")
+                print(f"   [WARN] VRAM high ({vram_used:.2f}GB > {self.vram_limit_gb * 0.9:.1f}GB), reducing multipliers")
             elif vram_used < self.vram_limit_gb * 0.5:  # <50% of limit (<4GB)
                 # Can increase aggressively if GPU utilization allows
                 if gpu_util is None or gpu_util < self.gpu_target_util:
@@ -474,7 +570,7 @@ class Trainer:
                     
                     self.turbo_batch_multiplier = min(self.max_batch_multiplier, self.turbo_batch_multiplier * (1 + vram_adjustment))
                     if self.turbo_batch_multiplier != old_batch:
-                        print(f"   💾 VRAM low ({vram_used:.2f}GB, {vram_percent:.1f}%), increasing batch multiplier to {self.turbo_batch_multiplier:.2f}x (+{vram_adjustment*100:.0f}%)")
+                        print(f"   [MEM] VRAM low ({vram_used:.2f}GB, {vram_percent:.1f}%), increasing batch multiplier to {self.turbo_batch_multiplier:.2f}x (+{vram_adjustment*100:.0f}%)")
     
     def _load_data(self):
         """Load multi-timeframe data"""
@@ -494,11 +590,22 @@ class Trainer:
         extractor = DataExtractor(nt8_data_path=nt8_data_path)
         instrument = self.config["environment"]["instrument"]
         timeframes = self.config["environment"]["timeframes"]
+        trading_hours_cfg = self.config["environment"].get("trading_hours", {})
+        trading_hours_manager = None
+        if trading_hours_cfg.get("enabled"):
+            trading_hours_manager = TradingHoursManager.from_dict(trading_hours_cfg)
+            if trading_hours_manager.sessions:
+                session_names = ", ".join(session.name for session in trading_hours_manager.sessions)
+                print(f"  Trading hours enabled for sessions: {session_names}")
+            else:
+                print("  Trading hours enabled but no sessions defined (all times allowed).")
         
         # Try to load data
         try:
             self.multi_tf_data = extractor.load_multi_timeframe_data(
-                instrument, timeframes
+                instrument,
+                timeframes,
+                trading_hours=trading_hours_manager,
             )
             print(f"Loaded data for {instrument} with timeframes: {timeframes}")
             
@@ -540,17 +647,71 @@ class Trainer:
             # Select action
             action, value, log_prob = self.agent.select_action(state)
             
-            # Step environment
-            next_state, reward, terminated, truncated, step_info = self.env.step(action)
-            done = terminated or truncated
+            # Apply DecisionGate filtering if enabled (ensures consistency with live trading)
+            if self.decision_gate:
+                # Calculate RL confidence from action magnitude (proxy for confidence)
+                rl_confidence = abs(float(action[0]))
+                
+                # Make decision through DecisionGate (RL-only mode during training)
+                decision = self.decision_gate.make_decision(
+                    rl_action=float(action[0]),
+                    rl_confidence=rl_confidence,
+                    reasoning_analysis=None,  # No reasoning during training
+                    swarm_recommendation=None  # No swarm during training (unless enabled)
+                )
+                
+                # Check if trade should execute based on DecisionGate filters
+                if not self.decision_gate.should_execute(decision):
+                    # Trade rejected by DecisionGate - use hold action (0.0)
+                    action = np.array([0.0], dtype=np.float32)
+                else:
+                    # Trade approved - use DecisionGate's adjusted action (includes position sizing)
+                    action = np.array([decision.action], dtype=np.float32)
             
-            # Debug: Log environment state vs training episode length
-            if episode_length >= 9995:
-                import sys
-                env_step = getattr(self.env, 'current_step', 'unknown')
-                env_max = getattr(self.env, 'max_steps', 'unknown')
-                print(f"[DEBUG] Step comparison: episode_length={episode_length}, env.current_step={env_step}, env.max_steps={env_max}, terminated={terminated}", flush=True)
+            # Step environment
+            try:
+                next_state, reward, terminated, truncated, step_info = self.env.step(action)
+                done = terminated or truncated
+            except (IndexError, KeyError, Exception) as e:
+                # CRITICAL FIX: Catch exceptions during step and terminate episode gracefully
+                import traceback
+                print(f"[ERROR] Exception in env.step() at episode {self.episode}, step {episode_length}: {e}", flush=True)
+                traceback.print_exc()
                 sys.stdout.flush()
+                # Terminate episode on exception
+                done = True
+                terminated = True
+                truncated = False
+                reward = -1.0  # Negative reward for exception
+                next_state = np.zeros(self.env.state_dim, dtype=np.float32)
+                step_info = {"step": episode_length, "error": str(e)}
+            
+            # Update current episode trading metrics from step_info
+            if step_info:
+                # Use episode_trades if available (episode-specific), otherwise fall back to trades (cumulative)
+                self.current_episode_trades = step_info.get("episode_trades", step_info.get("trades", 0))
+                self.current_episode_pnl = float(step_info.get("pnl", 0.0))
+                self.current_episode_equity = float(step_info.get("equity", 0.0))
+                self.current_episode_win_rate = float(step_info.get("win_rate", 0.0))
+                self.current_episode_max_drawdown = float(step_info.get("max_drawdown", 0.0))
+                
+                # Track average win/loss and risk/reward ratio for profitability monitoring
+                self.current_avg_win = float(step_info.get("avg_win", 0.0))
+                self.current_avg_loss = float(step_info.get("avg_loss", 0.0))
+                self.current_risk_reward_ratio = float(step_info.get("risk_reward_ratio", 0.0))
+            
+            # Real-time adaptive check for trading activity (lightweight, no full evaluation)
+            if self.adaptive_trainer:
+                adjustments = self.adaptive_trainer.check_trading_activity(
+                    timestep=self.timestep,
+                    episode=self.episode,
+                    current_episode_trades=self.current_episode_trades,
+                    current_episode_length=episode_length,
+                    agent=self.agent
+                )
+                if adjustments:
+                    # Adjustments already applied to agent, just log
+                    print(f"[ADAPTIVE] Real-time adjustments applied at timestep {self.timestep:,}")
             
             # Store transition
             self.agent.store_transition(state, action, reward, value, log_prob, done)
@@ -561,18 +722,6 @@ class Trainer:
             self.current_episode_length = episode_length
             self.timestep += 1
             pbar.update(1)
-            
-            # Debug: Log reward accumulation at start of new episode
-            if episode_length <= 10 or episode_length % 1000 == 0:
-                import sys
-                print(f"[DEBUG] Episode {self.episode + 1}: step={episode_length}, cumulative_reward={episode_reward:.4f}, step_reward={reward:.4f}", flush=True)
-                sys.stdout.flush()
-            
-            # Debug: Log if episode is about to terminate
-            if done or episode_length >= 9995:
-                import sys
-                print(f"\n[DEBUG] Train: episode_length={episode_length}, done={done}, terminated={terminated}, truncated={truncated}, cumulative_reward={episode_reward:.2f}, step_reward={reward:.4f}", flush=True)
-                sys.stdout.flush()
             
             # Update agent if buffer is full or episode ended
             if done or len(self.agent.states) >= self.config["model"]["n_steps"]:
@@ -852,22 +1001,55 @@ class Trainer:
             
             # Handle episode end
             if done:
-                # Debug: Log episode completion
-                import sys
-                print(f"\n[DEBUG] Episode completing: length={episode_length}, reward={episode_reward:.2f}, terminated={terminated}, truncated={truncated}", flush=True)
-                sys.stdout.flush()
+                # IMPORTANT: Use current_episode_trades which is updated during the loop
+                # This is more reliable than step_info which might not have the latest value
+                episode_trades = self.current_episode_trades
+                
+                # Fallback to step_info or environment if current_episode_trades is 0 (shouldn't happen)
+                if episode_trades == 0:
+                    episode_trades_from_env = getattr(self.env, 'episode_trades', 0)
+                    episode_trades = step_info.get("episode_trades", episode_trades_from_env) if step_info else episode_trades_from_env
+                    if episode_trades == 0:
+                        # Final fallback to cumulative trades (shouldn't happen, but just in case)
+                        episode_trades = step_info.get("trades", 0) if step_info else 0
+                
+                episode_pnl = float(step_info.get("pnl", 0.0)) if step_info else 0.0
+                episode_equity = float(step_info.get("equity", 0.0)) if step_info else 0.0
+                episode_win_rate = float(step_info.get("win_rate", 0.0)) if step_info else 0.0
+                episode_max_drawdown = float(step_info.get("max_drawdown", 0.0)) if step_info else 0.0
                 
                 self.episode += 1
                 self.episode_rewards.append(episode_reward)
                 self.episode_lengths.append(episode_length)
                 
+                # Store trading metrics for this episode
+                self.episode_trades.append(episode_trades)
+                self.episode_pnls.append(episode_pnl)
+                self.episode_equities.append(episode_equity)
+                self.episode_win_rates.append(episode_win_rate)
+                self.episode_max_drawdowns.append(episode_max_drawdown)
+                
+                # Update cumulative totals (estimate wins/losses from win rate)
+                old_total_trades = self.total_trades
+                self.total_trades += episode_trades
+                if episode_trades > 0:
+                    estimated_wins = int(episode_trades * episode_win_rate)
+                    estimated_losses = episode_trades - estimated_wins
+                    self.total_winning_trades += estimated_wins
+                    self.total_losing_trades += estimated_losses
+                else:
+                    print(f"[WARN] Episode {self.episode} had 0 trades! current_episode_trades={self.current_episode_trades}", flush=True)
+                sys.stdout.flush()
+                
                 # Log episode metrics
                 if self.writer:
                     self.writer.add_scalar("episode/reward", episode_reward, self.episode)
                     self.writer.add_scalar("episode/length", episode_length, self.episode)
-                    self.writer.add_scalar("episode/trades", step_info.get("trades", 0), self.episode)
-                    self.writer.add_scalar("episode/pnl", step_info.get("pnl", 0), self.episode)
-                    self.writer.add_scalar("episode/equity", step_info.get("equity", 0), self.episode)
+                    self.writer.add_scalar("episode/trades", episode_trades, self.episode)
+                    self.writer.add_scalar("episode/pnl", episode_pnl, self.episode)
+                    self.writer.add_scalar("episode/equity", episode_equity, self.episode)
+                    self.writer.add_scalar("episode/win_rate", episode_win_rate, self.episode)
+                    self.writer.add_scalar("episode/max_drawdown", episode_max_drawdown, self.episode)
                 
                 # Print episode summary
                 if self.episode % 10 == 0:
@@ -891,6 +1073,14 @@ class Trainer:
                 episode_length = 0
                 self.current_episode_reward = 0.0
                 self.current_episode_length = 0
+                self.current_episode_trades = 0
+                self.current_episode_pnl = 0.0
+                self.current_episode_equity = 0.0
+                self.current_episode_win_rate = 0.0
+                self.current_episode_max_drawdown = 0.0
+                self.current_avg_win = 0.0
+                self.current_avg_loss = 0.0
+                self.current_risk_reward_ratio = 0.0
             else:
                 state = next_state
             
@@ -918,9 +1108,54 @@ class Trainer:
                             self.episode_lengths
                         )
             
-            # Evaluation
+            # Evaluation and adaptive adjustment
             if self.timestep % self.eval_freq == 0 and self.timestep > 0:
-                self._evaluate()
+                if self.adaptive_trainer and self.adaptive_trainer.should_evaluate(self.timestep):
+                    # Use adaptive trainer for intelligent evaluation and adjustment
+                    checkpoint_path = self.model_dir / f"checkpoint_{self.timestep}.pt"
+                    if not checkpoint_path.exists():
+                        # Create temporary checkpoint for evaluation
+                        self.agent.save_with_training_state(
+                            str(checkpoint_path),
+                            self.timestep,
+                            self.episode,
+                            self.episode_rewards,
+                            self.episode_lengths
+                        )
+                    
+                    mean_reward = np.mean(self.episode_rewards[-10:]) if len(self.episode_rewards) >= 10 else (np.mean(self.episode_rewards) if self.episode_rewards else 0)
+                    result = self.adaptive_trainer.evaluate_and_adapt(
+                        model_path=str(checkpoint_path),
+                        timestep=self.timestep,
+                        episode=self.episode,
+                        mean_reward=mean_reward,
+                        agent=self.agent
+                    )
+                    
+                    # Apply adjustments
+                    if result.get("adjustments"):
+                        adjustments = result["adjustments"]
+                        if "entropy_coef" in adjustments:
+                            print(f"✅ Applied entropy_coef adjustment: {adjustments['entropy_coef']['new']:.4f}")
+                        if "inaction_penalty" in adjustments:
+                            print(f"✅ Applied inaction_penalty adjustment: {adjustments['inaction_penalty']['new']:.6f}")
+                        if "learning_rate" in adjustments:
+                            print(f"✅ Applied learning_rate adjustment: {adjustments['learning_rate']['new']:.6f}")
+                    
+                    # Auto-save on improvement
+                    if result.get("should_save") and result.get("improvement"):
+                        best_path = self.model_dir / "best_model.pt"
+                        self.agent.save_with_training_state(
+                            str(best_path),
+                            self.timestep,
+                            self.episode,
+                            self.episode_rewards,
+                            self.episode_lengths
+                        )
+                        print(f"💾 Auto-saved best model (improvement: {result['improvement']*100:.1f}%)")
+                else:
+                    # Standard evaluation
+                    self._evaluate()
         
         pbar.close()
         
@@ -957,6 +1192,7 @@ class Trainer:
             initial_capital=self.config["risk_management"]["initial_capital"],
             transaction_cost=self.config["risk_management"]["commission"] / self.config["risk_management"]["initial_capital"],
             reward_config=self.config["environment"]["reward"],
+            action_threshold=self.config["environment"].get("action_threshold", 0.05),  # Configurable action threshold
             max_episode_steps=max_episode_steps
         )
         

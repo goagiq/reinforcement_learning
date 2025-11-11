@@ -19,6 +19,7 @@ from datetime import datetime
 from src.data_extraction import DataExtractor
 from src.trading_env import TradingEnvironment
 from src.rl_agent import PPOAgent
+from src.trading_hours import TradingHoursManager
 
 
 class Backtester:
@@ -59,9 +60,15 @@ class Backtester:
         extractor = DataExtractor()
         instrument = self.config["environment"]["instrument"]
         timeframes = self.config["environment"]["timeframes"]
+        trading_hours_cfg = self.config["environment"].get("trading_hours", {})
+        trading_hours_manager = None
+        if trading_hours_cfg.get("enabled"):
+            trading_hours_manager = TradingHoursManager.from_dict(trading_hours_cfg)
         
         self.multi_tf_data = extractor.load_multi_timeframe_data(
-            instrument, timeframes
+            instrument,
+            timeframes,
+            trading_hours=trading_hours_manager
         )
     
     def run_backtest(self, n_episodes: int = 10) -> dict:
@@ -88,16 +95,25 @@ class Backtester:
             done = False
             episode_reward = 0
             episode_trades = []
+            episode_step = 0
             
             while not done:
                 # Select action (deterministic for backtesting)
                 action, _, _ = self.agent.select_action(state, deterministic=True)
+                raw_action = (
+                    float(action[0])
+                    if isinstance(action, (list, tuple, np.ndarray))
+                    else float(action)
+                )
                 
                 # Step environment
                 state, reward, terminated, truncated, step_info = self.env.step(action)
+                if isinstance(step_info, dict):
+                    step_info["raw_action"] = raw_action
                 done = terminated or truncated
                 episode_reward += reward
-                
+                episode_step += 1
+            
                 # Track trades
                 if step_info.get("trades", 0) > len(episode_trades):
                     episode_trades.append(step_info)
