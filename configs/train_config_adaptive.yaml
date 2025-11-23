@@ -1,0 +1,250 @@
+model:
+  algorithm: PPO
+  learning_rate: 0.0001
+  batch_size: 128
+  n_steps: 4096
+  n_epochs: 30
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.15  # INCREASED from 0.05 to 0.15 (3x) to prevent action saturation - encourages exploration
+  max_grad_norm: 0.5
+  hidden_dims:
+  - 256
+  - 256
+  - 128
+environment:
+  instrument: ES
+  timeframes:
+  - 1
+  - 5
+  - 15
+  state_features: 900
+  action_space: continuous
+  action_range:
+  - -1.0
+  - 1.0
+  action_threshold: 0.015  # Increased from 0.01 to 0.015 to reduce over-trading (was causing 2.2 trades/episode)
+  max_episode_steps: 10000
+  lookback_bars: 20
+  trading_hours:
+    enabled: true
+    source_timezone: America/New_York
+    exclude_weekends: true
+    use_nt8_calendar: true
+    sessions:
+    - name: Tokyo
+      timezone: Asia/Tokyo
+      start: 09:00
+      end: '15:00'
+    - name: London
+      timezone: Europe/London
+      start: 08:00
+      end: '16:30'
+    - name: New York
+      timezone: America/New_York
+      start: 09:30
+      end: '16:00'
+  reward:
+    pnl_weight: 1.0
+    transaction_cost: 0.0003
+    risk_penalty: 0.05
+    drawdown_penalty: 0.07  # Slightly higher penalty for drawdowns to discourage sequences of losses
+    exploration_bonus_enabled: true
+    exploration_bonus_scale: 5.0e-05  # Increased from 1e-5 to encourage more exploration (prevent saturation)
+    action_diversity_bonus: 0.01  # NEW: Reward diverse actions to prevent saturation (penalize always same action)
+    constant_action_penalty: 0.05  # NEW: Penalize models that always output same action value
+    loss_mitigation: 0.11  # Slightly stronger penalty for losses to push toward profitability
+    overtrading_penalty_enabled: true
+    optimal_trades_per_episode: 1  # Reduced from 50 to 1 to discourage over-trading (current: 2.2 trades/episode is too high)
+    profit_factor_required: 1.0
+    inaction_penalty: 5.0e-05
+    max_consecutive_losses: 10  # Increased from 5 to 10 for training (investigation showed 3 caused 96% pause rate)
+    resume_confluence_required: 3
+    stop_loss_pct: 0.02
+    min_risk_reward_ratio: 2.5  # Increased from 2.0 to 2.5 - with 36.7% win rate, need 2.5+ R:R for profitability
+    quality_filters:
+      enabled: true
+      min_action_confidence: 0.20  # Increased from 0.15 - stricter initial filters to learn from better trades
+      min_quality_score: 0.50  # Increased from 0.40 - stricter initial filters to learn from better trades
+      require_positive_expected_value: false
+training:
+  total_timesteps: 1000000
+  save_freq: 10000
+  use_decision_gate: true
+  eval_freq: 10000
+  device: cuda
+  num_envs: 1
+  transfer_learning: false  # DISABLED: Retraining from scratch to fix saturation issue
+  transfer_checkpoint: null  # No checkpoint - starting fresh
+  transfer_strategy: copy_and_extend
+  adaptive_training:
+    enabled: true
+    eval_frequency: 5000  # More frequent evaluation (was 10000)
+    eval_episodes: 10  # More episodes for better statistics (was 3)
+    min_trades_per_episode: 0.3
+    min_win_rate: 0.40  # Increased from 0.35 - more strict
+    target_sharpe: 0.5
+    auto_save_on_improvement: true
+    improvement_threshold: 0.05
+    # NEW: More aggressive adjustment rates
+    quality_adjustment_rate: 0.05  # Increased from 0.01 (5x more aggressive)
+    rr_adjustment_rate: 0.2  # Increased from 0.1 (2x more aggressive)
+    # NEW: Pause/resume settings
+    pause_on_critical_failure: true
+    critical_win_rate_threshold: 0.30
+    critical_failure_count: 3
+    # NEW: Reward good performance
+    reward_good_performance: true
+    good_win_rate_threshold: 0.50
+    good_performance_count: 2
+  train_split: 0.8
+  validation_split: 0.1
+  # Early stopping to prevent overfitting
+  early_stopping:
+    enabled: false  # DISABLED: With new PnL-aligned reward function, rewards may be negative initially - need time to learn
+    patience: 50000  # Stop if no improvement for 50k steps (5 evaluations at eval_freq=10000)
+    min_delta: 0.005  # Minimum improvement threshold (0.5% for reward, 0.5% for win rate)
+risk_management:
+  max_position_size: 1.0
+  max_drawdown: 0.2
+  stop_loss_atr_multiplier: 2.0
+  initial_capital: 100000.0
+  commission: 2.0
+  max_position_fraction_of_balance: 0.02
+  position_value_per_unit: 5000.0
+  break_even:
+    enabled: true
+    activation_pct: 0.006
+    trail_pct: 0.0015
+    scale_out_fraction: 0.5
+    scale_out_min_confluence: 2
+    free_trade_fraction: 0.5
+drift_detection:
+  enabled: true
+  baseline_metrics:
+    win_rate: 0.55
+    sharpe_ratio: 1.0
+    profit_factor: 1.5
+    max_drawdown: 0.15
+  thresholds:
+    win_rate_drop: 0.1
+    sharpe_drop: 0.3
+    profit_factor_drop: 0.3
+    max_drawdown_increase: 0.05
+    consecutive_losses: 5
+  window_size: 50
+  min_trades: 20
+reasoning:
+  enabled: true
+  provider: ollama
+  model: deepseek-r1:8b
+  api_key: null
+  base_url: null
+  keep_alive: 10m
+  pre_trade_validation: true
+  confidence_threshold: 0.7
+  timeout: 2.0
+  use_kong: false
+  kong_base_url: http://localhost:8300
+  kong_api_key: null
+agentic_swarm:
+  enabled: true
+  provider: ollama
+  keep_alive: 10m
+  max_handoffs: 10
+  max_iterations: 15
+  execution_timeout: 20.0
+  node_timeout: 5.0
+  cache_ttl: 300
+  contrarian:
+    enabled: true
+    greed_threshold_percentile: 90
+    fear_threshold_percentile: 10
+  market_research:
+    instruments:
+    - ES
+    - NQ
+    - RTY
+    - YM
+    correlation_window: 20
+    divergence_threshold: 0.1
+  sentiment:
+    sources:
+    - newsapi
+    newsapi_key: null
+    sentiment_window: 3600
+  elliott_wave:
+    enabled: true
+    lookback_bars: 400
+    swing_threshold: 0.003
+    min_confidence: 0.55
+    position_multiplier: 0.6
+    max_position_size: 0.8
+    min_bars: 120
+  analyst:
+    deep_reasoning: true
+    conflict_detection: true
+  recommendation:
+    risk_integration: true
+    position_sizing: true
+decision_gate:
+  rl_weight: 0.6
+  swarm_weight: 0.4
+  min_combined_confidence: 0.7
+  conflict_reduction_factor: 0.5
+  min_confluence_required: 2
+  swarm_enabled: true
+  swarm_timeout: 20.0
+  fallback_to_rl_only: true
+  quality_scorer:
+    enabled: true
+    min_quality_score: 0.6
+    min_risk_reward_ratio: 1.5
+    min_profit_margin: 1.5
+    min_volatility: 0.01
+    min_volume_ratio: 1.2
+    confidence_weight: 0.3
+    confluence_weight: 0.2
+    expected_profit_weight: 0.2
+    risk_reward_weight: 0.15
+    market_conditions_weight: 0.15
+  position_sizing:
+    enabled: true
+    scale_multipliers:
+      '1': 1.0
+      '2': 1.15
+      '3': 1.3
+    max_scale: 1.3
+    min_scale: 0.3
+    hold_scale: 0.3
+    rl_only_scale: 0.5
+    swarm_only_scale: 0.65
+    disagreement_scale: 0.35
+    contrarian_threshold: 0.6
+    elliott_threshold: 0.6
+manual_approval:
+  enabled: false
+  auto_approve_timeout: 30.0
+  require_approval_for:
+  - high_risk_trades
+  - conflicting_signals
+  - large_position_sizes
+logging:
+  log_dir: logs
+  tensorboard: true
+  verbose: 1
+live_trading:
+  enabled: false
+  paper_trading: true
+bridge:
+  host: localhost
+  port: 8888
+continuous_learning:
+  retrain_frequency: 1000
+  min_experiences: 500
+  evaluation_episodes: 10
+  min_annotated_for_finetune: 100
+  experience_buffer_size: 10000
+  experience_storage: data/experience_buffer

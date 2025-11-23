@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 from src.data_extraction import DataExtractor, MarketBar
 from src.data_sources.cache import DataCache
+from src.trading_hours import TradingHoursManager
 
 
 class MarketDataProvider:
@@ -41,6 +42,11 @@ class MarketDataProvider:
         self.instruments = config.get("instruments", ["ES", "NQ", "RTY", "YM"])
         self.timeframes = config.get("timeframes", [1, 5, 15])
         
+        trading_hours_cfg = config.get("trading_hours", {})
+        self.trading_hours_manager = None
+        if trading_hours_cfg.get("enabled"):
+            self.trading_hours_manager = TradingHoursManager.from_dict(trading_hours_cfg)
+
         # Data storage
         self._historical_data: Dict[str, Dict[int, pd.DataFrame]] = {}
         self._live_data: Dict[str, List[MarketBar]] = {}
@@ -70,7 +76,8 @@ class MarketDataProvider:
                         # DataExtractor.load_historical_data returns a DataFrame
                         df = self.data_extractor.load_historical_data(
                             instrument=instrument,
-                            timeframe=timeframe
+                            timeframe=timeframe,
+                            trading_hours=self.trading_hours_manager,
                         )
                         
                         if df is not None and len(df) > 0:

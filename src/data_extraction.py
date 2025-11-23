@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 
+from src.trading_hours import TradingHoursManager
 
 @dataclass
 class MarketBar:
@@ -50,6 +51,9 @@ class DataExtractor:
         
         # NT8 data folder mapping (supports UNC paths and local paths)
         self.nt8_data_path = None
+        
+        # Track files used for archiving after training
+        self.used_data_files = []  # List of (source_path, local_path) tuples
         
         # Load from settings.json if not provided directly
         if not nt8_data_path:
@@ -91,7 +95,8 @@ class DataExtractor:
         instrument: str,
         timeframe: int,
         start_date: Optional[str] = None,
-        end_date: Optional[str] = None
+        end_date: Optional[str] = None,
+        trading_hours: Optional[TradingHoursManager] = None,
     ) -> pd.DataFrame:
         """
         Load historical data from CSV/TXT file exported from NT8.
@@ -220,23 +225,34 @@ class DataExtractor:
                     matching_files.sort(key=lambda x: x[1], reverse=True)
                     best_match = matching_files[0][0]
                     if total_files > 10:
-                        print(f"  ✅ Found {instrument} {timeframe}min data: {best_match.name} (from {total_files} files)")
+                        print(f"  [OK] Found {instrument} {timeframe}min data: {best_match.name} (from {total_files} files)")
                     return best_match
                 elif total_files > 10:
-                    print(f"  ⚠️  No matching file found for {instrument} {timeframe}min in {total_files} files")
+                    print(f"  [WARN] No matching file found for {instrument} {timeframe}min in {total_files} files")
             
             return None
         
         # Priority 1: Local data/raw folder (check both .csv and .txt)
         local_file = find_and_load_file([filename_csv, filename_txt], [self.raw_dir])
         if local_file:
-            return self._load_data_file(local_file, start_date, end_date, timeframe)
+            # Track this file for archiving
+            self.used_data_files.append(("local_file", str(local_file)))
+            return self._load_data_file(
+                local_file,
+                start_date,
+                end_date,
+                timeframe,
+                trading_hours=trading_hours,
+            )
         
         # Priority 2: Mapped NT8 data folder
         if self.nt8_data_path:
             nt8_file = find_and_load_file([filename_txt, filename_csv], [self.nt8_data_path])
             if nt8_file:
                 print(f"Found data in NT8 folder: {nt8_file}")
+                # Track this file for archiving
+                self.used_data_files.append(("nt8_source", str(nt8_file)))
+                
                 # Copy to local folder for faster access next time
                 try:
                     import shutil
@@ -245,13 +261,29 @@ class DataExtractor:
                     local_copy = self.raw_dir / filename_csv
                     shutil.copy2(nt8_file, local_copy)
                     print(f"Copied to local folder: {local_copy}")
-                    return self._load_data_file(local_copy, start_date, end_date, timeframe)
+                    # Track local copy too
+                    self.used_data_files.append(("local_copy", str(local_copy)))
+                    return self._load_data_file(
+                        local_copy,
+                        start_date,
+                        end_date,
+                        timeframe,
+                        trading_hours=trading_hours,
+                    )
                 except Exception as e:
                     print(f"Warning: Could not copy file, using directly: {e}")
-                    return self._load_data_file(nt8_file, start_date, end_date, timeframe)
+                    return self._load_data_file(
+                        nt8_file,
+                        start_date,
+                        end_date,
+                        timeframe,
+                        trading_hours=trading_hours,
+                    )
         
         # Priority 3: Try common NT8 export locations
         common_paths = [
+            Path("C:/Users/schuo/Documents/NinjaTrader 8/export"),  # Current user path
+            Path("C:/Users/sovan/Documents/NinjaTrader 8/export"),  # Previous user path
             Path.home() / "Documents" / "NinjaTrader 8" / "export",  # lowercase
             Path.home() / "Documents" / "NinjaTrader 8" / "Export",  # capitalized
             Path.home() / "Documents" / "NinjaTrader 8" / "db",
@@ -263,6 +295,9 @@ class DataExtractor:
                 nt8_file = find_and_load_file([filename_txt, filename_csv], [common_path])
                 if nt8_file:
                     print(f"Found data in NT8 export folder: {nt8_file}")
+                    # Track this file for archiving
+                    self.used_data_files.append(("nt8_source", str(nt8_file)))
+                    
                     # Copy to local folder
                     try:
                         import shutil
@@ -270,10 +305,24 @@ class DataExtractor:
                         local_copy = self.raw_dir / filename_csv
                         shutil.copy2(nt8_file, local_copy)
                         print(f"Copied to local folder: {local_copy}")
-                        return self._load_data_file(local_copy, start_date, end_date, timeframe)
+                        # Track local copy too
+                        self.used_data_files.append(("local_copy", str(local_copy)))
+                        return self._load_data_file(
+                            local_copy,
+                            start_date,
+                            end_date,
+                            timeframe,
+                            trading_hours=trading_hours,
+                        )
                     except Exception as e:
                         print(f"Warning: Could not copy file, using directly: {e}")
-                        return self._load_data_file(nt8_file, start_date, end_date, timeframe)
+                        return self._load_data_file(
+                            nt8_file,
+                            start_date,
+                            end_date,
+                            timeframe,
+                            trading_hours=trading_hours,
+                        )
         
         # Not found anywhere - provide detailed error with file listing
         checked_locations = []
@@ -311,7 +360,14 @@ class DataExtractor:
         error_msg += f"  - Or manually copy/rename files to: {self.raw_dir / filename_txt}"
         raise FileNotFoundError(error_msg)
     
-    def _load_data_file(self, filepath: Path, start_date: Optional[str] = None, end_date: Optional[str] = None, timeframe: int = 1) -> pd.DataFrame:
+    def _load_data_file(
+        self,
+        filepath: Path,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        timeframe: int = 1,
+        trading_hours: Optional[TradingHoursManager] = None,
+    ) -> pd.DataFrame:
         """Load and process data file (CSV or TXT from NT8)"""
         
         # Determine file format - check if it's .txt or has .txt in the name
@@ -402,7 +458,7 @@ class DataExtractor:
                                 continue
                 
                 if is_large_file:
-                    print(f"    ✅ Finished processing {filepath.name}: {line_num:,} total lines, {matching_rows:,} rows extracted")
+                    print(f"    [OK] Finished processing {filepath.name}: {line_num:,} total lines, {matching_rows:,} rows extracted")
                 
                 if data_rows:
                     df = pd.DataFrame(data_rows)
@@ -505,6 +561,23 @@ class DataExtractor:
         
         # Validate data
         df = self._validate_data(df)
+
+        if trading_hours:
+            df = trading_hours.filter_dataframe(df)
+        
+        # Safety: Track this file if not already tracked (backup mechanism)
+        # This ensures we catch files loaded from any path, even if tracking was missed earlier
+        filepath_str = str(filepath.resolve())
+        already_tracked = any(
+            str(Path(tracked_path).resolve()) == filepath_str 
+            for _, tracked_path in self.used_data_files
+        )
+        if not already_tracked:
+            # Determine file type based on path
+            if "NinjaTrader" in str(filepath) or "export" in str(filepath).lower():
+                self.used_data_files.append(("nt8_source", filepath_str))
+            else:
+                self.used_data_files.append(("local_file", filepath_str))
         
         return df
     
@@ -532,7 +605,8 @@ class DataExtractor:
         instrument: str,
         timeframes: List[int],
         start_date: Optional[str] = None,
-        end_date: Optional[str] = None
+        end_date: Optional[str] = None,
+        trading_hours: Optional[TradingHoursManager] = None,
     ) -> Dict[int, pd.DataFrame]:
         """
         Load data for multiple timeframes.
@@ -547,8 +621,25 @@ class DataExtractor:
             Dictionary mapping timeframe to DataFrame
         """
         data = {}
-        for tf in timeframes:
-            data[tf] = self.load_historical_data(instrument, tf, start_date, end_date)
+        total_tfs = len(timeframes)
+        for idx, tf in enumerate(timeframes, 1):
+            print(f"  Loading {tf}min data ({idx}/{total_tfs})...")
+            import sys
+            sys.stdout.flush()
+            try:
+                data[tf] = self.load_historical_data(
+                    instrument,
+                    tf,
+                    start_date,
+                    end_date,
+                    trading_hours=trading_hours,
+                )
+                print(f"  [OK] {tf}min data loaded: {len(data[tf])} bars")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"  [ERROR] Failed to load {tf}min data: {e}")
+                sys.stdout.flush()
+                raise
         
         return data
     

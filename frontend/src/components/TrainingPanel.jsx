@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import { Play, Square, Loader, CheckCircle, AlertCircle, Cpu, RefreshCw, Star } from 'lucide-react'
 import { getDefaultModel, sortModelsWithDefaultFirst, isDefaultModel } from '../utils/modelUtils'
+import CapabilityExplainer from './CapabilityExplainer'
 
 // Animated number component that highlights when value changes
 const AnimatedNumber = ({ value, format = (v) => v, className = '', colorClass = '' }) => {
@@ -98,7 +99,7 @@ const AnimatedMetric = ({ value, format = (v) => v, className = '' }) => {
 }
 
 const TrainingPanel = ({ models = [], onModelsChange }) => {
-  const DEFAULT_CONFIG_PATH = 'configs/train_config_full.yaml'
+  const DEFAULT_CONFIG_PATH = 'configs/train_config_adaptive.yaml'
   const [training, setTraining] = useState(false)
   const [trainingStatus, setTrainingStatus] = useState(null)
   const [trainingMetrics, setTrainingMetrics] = useState(null)
@@ -138,6 +139,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [configPath, setConfigPathState] = useState('')
   const [availableConfigs, setAvailableConfigs] = useState([])
   const [checkpoints, setCheckpoints] = useState([])
+  const [bestModel, setBestModel] = useState(null)
   const [selectedCheckpoint, setSelectedCheckpoint] = useState('latest') // 'latest', 'none', or checkpoint path
   const [latestCheckpoint, setLatestCheckpoint] = useState(null)
   const [messages, setMessages] = useState([])
@@ -354,25 +356,36 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   }
   
   useEffect(() => {
-    loadTrainingMode()
+    let mounted = true
+    
+    const loadOnce = async () => {
+      if (mounted) {
+        await loadTrainingMode()
+      }
+    }
+    
+    loadOnce()
     
     // Reload when settings might have changed (listen to storage events)
     const handleSettingsChange = () => {
-      loadTrainingMode()
+      if (mounted) {
+        loadTrainingMode()
+      }
     }
     
     window.addEventListener('storage', handleSettingsChange)
     window.addEventListener('defaultModelChanged', handleSettingsChange)
     
-    // Also poll settings periodically during training (every 5 seconds)
+    // Also poll settings periodically during training (every 10 seconds, not 5)
     // This ensures the indicator updates when turbo mode is toggled
     const settingsPollInterval = setInterval(() => {
-      if (training) {
+      if (mounted && training) {
         loadTrainingMode()
       }
-    }, 5000)
+    }, 10000) // Increased from 5000 to reduce spam
     
     return () => {
+      mounted = false
       window.removeEventListener('storage', handleSettingsChange)
       window.removeEventListener('defaultModelChanged', handleSettingsChange)
       clearInterval(settingsPollInterval)
@@ -397,13 +410,14 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           const hasCurrent = currentNormalized && normalizedConfigs.some(c => c.relative === currentNormalized)
           if (!hasCurrent) {
             const lowerName = (name) => name.toLowerCase()
+            const adaptiveConfig = normalizedConfigs.find(c => lowerName(c.name).includes('adaptive'))
             const fullConfig = normalizedConfigs.find(c => lowerName(c.name).includes('full'))
             const gpuConfig = normalizedConfigs.find(c => lowerName(c.name).includes('gpu'))
             const optimizedConfig = normalizedConfigs.find(c => {
               const name = lowerName(c.name)
               return name.includes('gpu_optimized') || name.includes('optimized')
             })
-            const fallback = fullConfig || gpuConfig || optimizedConfig || normalizedConfigs[0]
+            const fallback = adaptiveConfig || fullConfig || gpuConfig || optimizedConfig || normalizedConfigs[0]
             setConfigPath(fallback.relative)
           }
         }
@@ -422,9 +436,20 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
         const response = await axios.get('/api/models/list')
         const checkpointsList = response.data.checkpoints || []
         const latest = response.data.latest_checkpoint
+        const allModels = response.data.models || []
+        const foundBestModel = allModels.find((model) => (model.name || '').toLowerCase() === 'best_model.pt')
         
         setCheckpoints(checkpointsList)
         setLatestCheckpoint(latest)
+        if (foundBestModel) {
+          const normalizedPath = normalizePath(foundBestModel.path || 'models/best_model.pt')
+          setBestModel({
+            ...foundBestModel,
+            path: normalizedPath,
+          })
+        } else {
+          setBestModel(null)
+        }
         
         // Auto-select latest checkpoint only on first load if none is selected yet
         // Don't change user's explicit selection
@@ -438,6 +463,16 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     const interval = setInterval(loadCheckpoints, 10000)
     return () => clearInterval(interval)
   }, []) // Only run on mount, not when selectedCheckpoint changes
+
+  useEffect(() => {
+    if (
+      (!latestCheckpoint || !latestCheckpoint.path) &&
+      bestModel &&
+      selectedCheckpoint === 'latest'
+    ) {
+      setSelectedCheckpoint(bestModel.path)
+    }
+  }, [bestModel, latestCheckpoint, selectedCheckpoint])
 
   // Load config architecture when config changes
   useEffect(() => {
@@ -524,43 +559,67 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   useEffect(() => {
     const checkCudaAvailability = async () => {
       try {
+        console.log('🔍 Checking CUDA availability...')
         const response = await axios.get('/api/system/cuda-status')
-        const { cuda_available, device: recommendedDevice, gpu_name, cuda_version } = response.data
         
-        console.log('CUDA Status Check:', {
+        console.log('📦 Full API Response:', response)
+        console.log('📦 Response Data:', response.data)
+        
+        const data = response.data || {}
+        const cuda_available = Boolean(data.cuda_available) // Ensure boolean
+        const recommendedDevice = data.device || 'cpu'
+        const gpu_name = data.gpu_name
+        const cuda_version = data.cuda_version
+        const error = data.error
+        
+        console.log('🔍 Parsed CUDA Status:', {
           cuda_available,
+          type: typeof cuda_available,
           recommendedDevice,
           gpu_name,
           cuda_version,
+          error,
           currentDevice: device
         })
         
         setCudaAvailable(cuda_available)
+        
         if (cuda_available && gpu_name) {
           setGpuInfo({
             name: gpu_name,
-            version: cuda_version
+            version: cuda_version || 'Unknown'
           })
+          console.log(`✅ GPU Info Set: ${gpu_name} (CUDA ${cuda_version})`)
+        } else if (error) {
+          console.warn('⚠️ CUDA Check Warning:', error)
         }
         
-        // Auto-select CUDA if available
-        if (cuda_available === true) {
+        // Auto-select CUDA if available (check both boolean true and string "true")
+        if (cuda_available === true || cuda_available === 'true') {
           console.log('✅ CUDA is available - auto-selecting GPU')
           setDevice('cuda')
-          // Force a state update by logging
-          console.log(`Device will be set to: cuda (was: ${device})`)
+          console.log(`✅ Device set to: cuda (was: ${device})`)
         } else {
           console.log('❌ CUDA not available - keeping device as cpu')
-          console.log('Response data:', response.data)
+          if (error) {
+            console.log('   Error details:', error)
+          }
         }
       } catch (error) {
-        console.error('Failed to check CUDA status:', error)
+        console.error('❌ Failed to check CUDA status:', error)
+        console.error('   Error details:', error.response?.data || error.message)
         // Default to CPU if check fails
+        setCudaAvailable(false)
         setDevice('cpu')
       }
     }
     
-    checkCudaAvailability()
+    // Add a small delay to ensure backend is ready
+    const timeoutId = setTimeout(() => {
+      checkCudaAvailability()
+    }, 1000)
+    
+    return () => clearTimeout(timeoutId)
   }, []) // Only run once on mount
   
         useEffect(() => {
@@ -649,6 +708,11 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           
           // Update training metrics if available
           // Only update if metrics actually contain data (not empty object during initialization)
+          // Debug: Log metrics received
+          if (pollCount % 10 === 0 || pollCount <= 3) {
+            console.log(`[TrainingPanel] Status check #${pollCount}: status=${status}, metrics keys=${response.data.metrics ? Object.keys(response.data.metrics).length : 0}`, response.data.metrics)
+          }
+          
           if (response.data.metrics && Object.keys(response.data.metrics).length > 0) {
             // Deep clone to ensure new reference - use JSON parse/stringify for complete deep copy
             const newMetrics = JSON.parse(JSON.stringify(response.data.metrics))
@@ -1002,7 +1066,10 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     return normalizePath(selectedCheckpoint)
   })()
 
-  const canPromoteCheckpoint = Boolean(resolvedCheckpointPath)
+  const isBestModelSelected =
+    resolvedCheckpointPath && bestModel && normalizePath(bestModel.path) === resolvedCheckpointPath
+
+  const canPromoteCheckpoint = Boolean(resolvedCheckpointPath) && !isBestModelSelected
 
   return (
     <div className="space-y-6">
@@ -1025,11 +1092,13 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 availableConfigs.map((config, idx) => (
                   <option key={idx} value={config.relative}>
                     {config.name}
-                    {config.name.toLowerCase().includes('gpu') || config.name.toLowerCase().includes('optimized')
-                      ? ' ⚡ (Optimized for GPU)'
-                      : config.name.toLowerCase().includes('full')
-                        ? ' (Full Capacity)'
-                        : ''}
+                    {config.name.toLowerCase().includes('adaptive')
+                      ? ' 🔄 (Adaptive Training - Recommended)'
+                      : config.name.toLowerCase().includes('gpu') || config.name.toLowerCase().includes('optimized')
+                        ? ' ⚡ (Optimized for GPU)'
+                        : config.name.toLowerCase().includes('full')
+                          ? ' (Full Capacity)'
+                          : ''}
                   </option>
                 ))
               ) : (
@@ -1043,9 +1112,20 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
 
           {/* Device Selection */}
           <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-2">
-              Device
-            </label>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-sm font-semibold text-gray-700">
+                Device
+              </label>
+              <CapabilityExplainer
+                capabilityId="training.device"
+                context={{
+                  cudaAvailable,
+                  selectedDevice: device,
+                  gpuName: gpuInfo?.name || null,
+                  cudaVersion: gpuInfo?.version || null,
+                }}
+              />
+            </div>
             <div className="flex gap-4">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input
@@ -1141,9 +1221,23 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
 
           {/* Checkpoint Selection */}
           <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-2">
-              Resume from Checkpoint
-            </label>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-sm font-semibold text-gray-700">
+                Resume from Checkpoint
+              </label>
+              <CapabilityExplainer
+                capabilityId="training.checkpoints"
+                context={{
+                  checkpoints: checkpoints.map(c => ({
+                    timestep: c.timestep,
+                    path: c.path,
+                  })),
+                  latestCheckpoint: latestCheckpoint,
+                  architectureMismatch,
+                  transferStrategy,
+                }}
+              />
+            </div>
             <select
               value={selectedCheckpoint}
               onChange={(e) => setSelectedCheckpoint(e.target.value)}
@@ -1156,6 +1250,11 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                   : 'Latest (No checkpoints found)'}
               </option>
               <option value="none">Start Fresh Training</option>
+              {bestModel && (
+                <option value={bestModel.path}>
+                  best_model.pt (Current Best Model)
+                </option>
+              )}
               {checkpoints.length > 0 && (
                 <optgroup label="Select Specific Checkpoint:">
                   {checkpoints.map((checkpoint, idx) => (
@@ -1422,7 +1521,17 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
       {training && trainingMetrics && (
         <div key={`training-metrics-${renderKey}`} className="bg-white rounded-lg shadow p-6">
           <div className="flex justify-between items-center mb-4">
-            <h3 className="text-lg font-semibold text-gray-800">Training Progress</h3>
+            <div className="flex items-center gap-3">
+              <h3 className="text-lg font-semibold text-gray-800">Training Progress</h3>
+              <CapabilityExplainer
+                capabilityId="training.progress"
+                context={{
+                  metrics: trainingMetrics,
+                  performanceMode: trainingMode,
+                  turboModeEnabled,
+                }}
+              />
+            </div>
             <button
               onClick={async (e) => {
                 e.preventDefault()
@@ -1591,6 +1700,171 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
               )}
             </div>
           </div>
+          
+          {/* Trading Metrics */}
+          {(trainingMetrics.total_trades !== undefined || trainingMetrics.current_episode_trades !== undefined) && (
+            <div className="border-t pt-4 mb-6">
+              <h4 className="text-md font-semibold text-gray-700 mb-3">Trading Metrics</h4>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                {/* Total Trades */}
+                <div className="bg-blue-50 rounded-lg p-4">
+                  <div className="text-xs text-gray-600 mb-1">Total Trades</div>
+                  {trainingMetrics.total_trades !== undefined ? (
+                    <div
+                      key={`total-trades-${renderKey}`}
+                      className="text-2xl font-bold text-blue-700"
+                    >
+                      {trainingMetrics.total_trades.toLocaleString()}
+                    </div>
+                  ) : (
+                    <div className="text-2xl font-bold text-gray-500">0</div>
+                  )}
+                </div>
+                
+                {/* Winning Trades */}
+                <div className="bg-green-50 rounded-lg p-4">
+                  <div className="text-xs text-gray-600 mb-1">Winning Trades</div>
+                  {trainingMetrics.total_winning_trades !== undefined ? (
+                    <div
+                      key={`winning-trades-${renderKey}`}
+                      className="text-2xl font-bold text-green-700"
+                    >
+                      {trainingMetrics.total_winning_trades.toLocaleString()}
+                    </div>
+                  ) : (
+                    <div className="text-2xl font-bold text-gray-500">0</div>
+                  )}
+                </div>
+                
+                {/* Losing Trades */}
+                <div className="bg-red-50 rounded-lg p-4">
+                  <div className="text-xs text-gray-600 mb-1">Losing Trades</div>
+                  {trainingMetrics.total_losing_trades !== undefined ? (
+                    <div
+                      key={`losing-trades-${renderKey}`}
+                      className="text-2xl font-bold text-red-700"
+                    >
+                      {trainingMetrics.total_losing_trades.toLocaleString()}
+                    </div>
+                  ) : (
+                    <div className="text-2xl font-bold text-gray-500">0</div>
+                  )}
+                </div>
+                
+                {/* Overall Win Rate */}
+                <div className="bg-purple-50 rounded-lg p-4">
+                  <div className="text-xs text-gray-600 mb-1">Overall Win Rate</div>
+                  {trainingMetrics.overall_win_rate !== undefined ? (
+                    <div
+                      key={`win-rate-${renderKey}`}
+                      className="text-2xl font-bold text-purple-700"
+                    >
+                      {trainingMetrics.overall_win_rate.toFixed(1)}%
+                    </div>
+                  ) : (
+                    <div className="text-2xl font-bold text-gray-500">0%</div>
+                  )}
+                </div>
+              </div>
+              
+              {/* Current Episode Trading Metrics */}
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                <div className="bg-gray-50 rounded-lg p-3">
+                  <div className="text-xs text-gray-600 mb-1">Current Episode Trades</div>
+                  {trainingMetrics.current_episode_trades !== undefined ? (
+                    <div className="text-lg font-semibold text-gray-800">
+                      {trainingMetrics.current_episode_trades}
+                    </div>
+                  ) : (
+                    <div className="text-lg font-semibold text-gray-500">0</div>
+                  )}
+                </div>
+                
+                <div className="bg-gray-50 rounded-lg p-3">
+                  <div className="text-xs text-gray-600 mb-1">Current PnL</div>
+                  {trainingMetrics.current_episode_pnl !== undefined ? (
+                    <div className={`text-lg font-semibold ${trainingMetrics.current_episode_pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      ${trainingMetrics.current_episode_pnl.toFixed(2)}
+                    </div>
+                  ) : (
+                    <div className="text-lg font-semibold text-gray-500">$0.00</div>
+                  )}
+                </div>
+                
+                <div className="bg-gray-50 rounded-lg p-3">
+                  <div className="text-xs text-gray-600 mb-1">Current Equity</div>
+                  {trainingMetrics.current_episode_equity !== undefined ? (
+                    <div className="text-lg font-semibold text-gray-800">
+                      ${trainingMetrics.current_episode_equity.toFixed(2)}
+                    </div>
+                  ) : (
+                    <div className="text-lg font-semibold text-gray-500">$0.00</div>
+                  )}
+                </div>
+                
+                <div className="bg-gray-50 rounded-lg p-3">
+                  <div className="text-xs text-gray-600 mb-1">Current Win Rate</div>
+                  {trainingMetrics.current_episode_win_rate !== undefined ? (
+                    <div className="text-lg font-semibold text-gray-800">
+                      {trainingMetrics.current_episode_win_rate.toFixed(1)}%
+                    </div>
+                  ) : (
+                    <div className="text-lg font-semibold text-gray-500">0%</div>
+                  )}
+                </div>
+                
+                <div className="bg-gray-50 rounded-lg p-3">
+                  <div className="text-xs text-gray-600 mb-1">Max Drawdown</div>
+                  {trainingMetrics.current_episode_max_drawdown !== undefined ? (
+                    <div className="text-lg font-semibold text-red-600">
+                      {trainingMetrics.current_episode_max_drawdown.toFixed(1)}%
+                    </div>
+                  ) : (
+                    <div className="text-lg font-semibold text-gray-500">0%</div>
+                  )}
+                </div>
+              </div>
+              
+              {/* Mean Metrics (Last 10 Episodes) */}
+              {(trainingMetrics.mean_pnl_10 !== undefined || trainingMetrics.mean_win_rate_10 !== undefined) && (
+                <div className="mt-4 pt-4 border-t">
+                  <div className="text-xs text-gray-500 mb-2">Mean (Last 10 Episodes)</div>
+                  <div className="grid grid-cols-3 gap-4">
+                    <div>
+                      <div className="text-xs text-gray-600 mb-1">Mean PnL</div>
+                      {trainingMetrics.mean_pnl_10 !== undefined ? (
+                        <div className={`text-sm font-semibold ${trainingMetrics.mean_pnl_10 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                          ${trainingMetrics.mean_pnl_10.toFixed(2)}
+                        </div>
+                      ) : (
+                        <div className="text-sm font-semibold text-gray-500">$0.00</div>
+                      )}
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-600 mb-1">Mean Equity</div>
+                      {trainingMetrics.mean_equity_10 !== undefined ? (
+                        <div className="text-sm font-semibold text-gray-800">
+                          ${trainingMetrics.mean_equity_10.toFixed(2)}
+                        </div>
+                      ) : (
+                        <div className="text-sm font-semibold text-gray-500">$0.00</div>
+                      )}
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-600 mb-1">Mean Win Rate</div>
+                      {trainingMetrics.mean_win_rate_10 !== undefined ? (
+                        <div className="text-sm font-semibold text-gray-800">
+                          {trainingMetrics.mean_win_rate_10.toFixed(1)}%
+                        </div>
+                      ) : (
+                        <div className="text-sm font-semibold text-gray-500">0%</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           
           {/* Training Metrics */}
           {trainingMetrics.training_metrics && (

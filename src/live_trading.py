@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import csv
 import yaml
 import numpy as np
 import torch
@@ -16,7 +17,9 @@ from datetime import datetime
 import time
 import json
 import threading
-from typing import Dict, Optional
+import math
+from collections import deque
+from typing import Dict, Optional, List, Any
 
 from src.data_extraction import DataExtractor, MarketBar
 from src.trading_env import TradingEnvironment
@@ -25,9 +28,75 @@ from src.nt8_bridge_server import NT8BridgeServer
 from src.reasoning_engine import ReasoningEngine, MarketState, RLRecommendation, TradeAction
 from src.risk_manager import RiskManager
 from src.drift_monitor import DriftMonitor, TradeMetrics
-from src.decision_gate import DecisionGate
+from src.decision_gate import DecisionGate, DecisionResult
 from src.agentic_swarm import SwarmOrchestrator
+from src.trading_hours import TradingHoursManager
 import asyncio
+
+
+class MultiTimeframeResampler:
+    """
+    Resample a base timeframe stream (e.g., 1-minute bars) into higher timeframes
+    for live trading inference.
+    """
+
+    def __init__(self, base_timeframe: int, target_timeframes: List[int]):
+        self.base_timeframe = base_timeframe
+        self.target_timeframes = sorted(
+            tf for tf in target_timeframes if tf > base_timeframe
+        )
+        self.window_sizes = {
+            tf: max(1, math.ceil(tf / base_timeframe)) for tf in self.target_timeframes
+        }
+        self.buffers = {
+            tf: deque(maxlen=self.window_sizes[tf]) for tf in self.target_timeframes
+        }
+        self.latest_complete: Dict[int, Optional[MarketBar]] = {
+            tf: None for tf in self.target_timeframes
+        }
+        self.last_timestamp: Optional[datetime] = None
+
+    def update(self, bar: MarketBar) -> Dict[int, Optional[MarketBar]]:
+        """Update resampler with the latest base timeframe bar."""
+        if self.last_timestamp:
+            minutes_diff = (bar.timestamp - self.last_timestamp).total_seconds() / 60.0
+            # Reset buffers if we detect a gap larger than expected (session break, etc.)
+            if minutes_diff > self.base_timeframe * 1.5:
+                for buffer in self.buffers.values():
+                    buffer.clear()
+        self.last_timestamp = bar.timestamp
+
+        result: Dict[int, Optional[MarketBar]] = {self.base_timeframe: bar}
+
+        for tf in self.target_timeframes:
+            window_size = self.window_sizes[tf]
+            buffer = self.buffers[tf]
+            buffer.append(bar)
+
+            if len(buffer) == window_size and self._is_boundary(bar.timestamp, tf):
+                aggregated = self._aggregate(list(buffer))
+                self.latest_complete[tf] = aggregated
+
+        for tf in self.target_timeframes:
+            result[tf] = self.latest_complete[tf]
+
+        return result
+
+    @staticmethod
+    def _is_boundary(timestamp: datetime, timeframe: int) -> bool:
+        total_minutes = timestamp.hour * 60 + timestamp.minute
+        return (total_minutes % timeframe) == 0
+
+    @staticmethod
+    def _aggregate(bars: List[MarketBar]) -> MarketBar:
+        return MarketBar(
+            timestamp=bars[-1].timestamp,
+            open=bars[0].open,
+            high=max(bar.high for bar in bars),
+            low=min(bar.low for bar in bars),
+            close=bars[-1].close,
+            volume=sum(bar.volume for bar in bars)
+        )
 
 
 class LiveTradingSystem:
@@ -131,6 +200,64 @@ class LiveTradingSystem:
         self.equity_history = []
         self.trade_history = []
         
+        # Performance tracking for adaptive learning
+        self.performance_start_time = datetime.now()
+        self.winning_trades = []
+        self.losing_trades = []
+        self.max_equity = config.get("environment", {}).get("initial_capital", 100000.0)
+        self.max_drawdown = 0.0
+        env_config = config.get("environment", {})
+        self.instrument = env_config.get("instrument", "default")
+        logging_config = config.get("logging", {})
+        log_dir = Path(logging_config.get("log_dir", "logs"))
+        log_dir.mkdir(exist_ok=True)
+        self.decision_log_path = log_dir / "decision_gate_debug.csv"
+        if not self.decision_log_path.exists():
+            try:
+                with open(self.decision_log_path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "timestamp",
+                        "rl_action",
+                        "rl_confidence",
+                        "decision_action",
+                        "decision_confidence",
+                        "scale_factor",
+                        "confluence_count",
+                        "confluence_score",
+                        "agreement",
+                        "final_action",
+                        "current_position",
+                        "break_even_active",
+                        "avg_entry",
+                        "protected_size",
+                        "trail_price",
+                        "confluence_signals",
+                        "risk_state"
+                    ])
+            except Exception as e:
+                print(f"⚠️  Could not initialize decision log: {e}")
+        trading_hours_cfg = env_config.get("trading_hours", {})
+        self.trading_hours: Optional[TradingHoursManager] = None
+        if trading_hours_cfg.get("enabled"):
+            self.trading_hours = TradingHoursManager.from_dict(trading_hours_cfg)
+        self.timeframes = sorted(env_config.get("timeframes", [1]))
+        self.primary_timeframe = self.timeframes[0]
+        higher_timeframes = [tf for tf in self.timeframes if tf > self.primary_timeframe]
+        if higher_timeframes:
+            if self.primary_timeframe != 1:
+                print(
+                    f"⚠️  Resampler assumes 1-minute base data but primary timeframe is {self.primary_timeframe}."
+                    " Ensure NT8 stream matches the smallest timeframe."
+                )
+            self.multi_timeframe_resampler = MultiTimeframeResampler(
+                base_timeframe=self.primary_timeframe,
+                target_timeframes=self.timeframes
+            )
+        else:
+            self.multi_timeframe_resampler = None
+        self.latest_multi_tf_bars: Optional[Dict[int, MarketBar]] = None
+        
         # Statistics
         self.stats = {
             "trades_executed": 0,
@@ -200,6 +327,11 @@ class LiveTradingSystem:
     def stop(self):
         """Stop the live trading system"""
         self.running = False
+        
+        # Stop adaptive learning agent if enabled
+        if self.swarm_orchestrator and self.swarm_enabled:
+            self.swarm_orchestrator.stop_adaptive_learning()
+        
         if self.bridge_server:
             self.bridge_server.stop()
         
@@ -216,14 +348,30 @@ class LiveTradingSystem:
         try:
             # Parse market data
             bar = self._parse_market_data(data)
-            
+
+            if self.trading_hours and not self.trading_hours.is_in_session(bar.timestamp):
+                return
+
+            if self.multi_timeframe_resampler:
+                bars_by_tf = self.multi_timeframe_resampler.update(bar)
+                # Wait until all higher timeframes have at least one completed bar
+                missing = [
+                    tf for tf in self.timeframes
+                    if bars_by_tf.get(tf) is None
+                ]
+                if missing:
+                    return
+            else:
+                bars_by_tf = {self.primary_timeframe: bar}
+
+            self.latest_multi_tf_bars = bars_by_tf
             # Update state (would need to maintain state buffer)
             # For now, we'll request a trade decision
-            self._process_market_update(bar)
-            
+            self._process_market_update(bars_by_tf)
+
         except Exception as e:
             print(f"Error handling market data: {e}")
-    
+
     def _parse_market_data(self, data: Dict) -> MarketBar:
         """Parse market data from NT8"""
         return MarketBar(
@@ -235,7 +383,7 @@ class LiveTradingSystem:
             volume=float(data["volume"])
         )
     
-    def _process_market_update(self, bar: MarketBar):
+    def _process_market_update(self, bars_by_timeframe: Dict[int, MarketBar]):
         """
         Process market update and make trading decision.
         
@@ -250,6 +398,10 @@ class LiveTradingSystem:
         # TODO: Implement full state update logic
         # For now, this is a placeholder that shows the structure
         
+        primary_bar = bars_by_timeframe.get(self.primary_timeframe)
+        if primary_bar is None:
+            return
+
         if self.current_state is None:
             # Initialize state (would need historical data)
             return
@@ -272,7 +424,7 @@ class LiveTradingSystem:
         # Run swarm analysis (async, with timeout)
         swarm_recommendation = None
         if self.swarm_enabled and self.swarm_orchestrator:
-            swarm_recommendation = self._run_swarm_analysis(bar, rl_rec)
+            swarm_recommendation = self._run_swarm_analysis(primary_bar, rl_rec)
         
         # Use DecisionGate to combine RL + Swarm
         decision = self.decision_gate.make_decision(
@@ -283,15 +435,24 @@ class LiveTradingSystem:
         
         # Apply risk management (DecisionGate already handles basic risk, but apply final validation)
         # Note: validate_action now returns (position, monte_carlo_result)
+        decision_context = {
+            "confluence_count": decision.confluence_count,
+            "confluence_score": decision.confluence_score,
+            "scale_factor": decision.scale_factor,
+            "agreement": decision.agreement
+        }
         result = self.risk_manager.validate_action(
             decision.action,
             current_position=self.current_position,
             market_data={
-                "price": bar.close,
-                "high": bar.high,
-                "low": bar.low,
-                "volume": bar.volume
-            }
+                "price": primary_bar.close,
+                "high": primary_bar.high,
+                "low": primary_bar.low,
+                "volume": primary_bar.volume
+            },
+            current_price=primary_bar.close,
+            decision_context=decision_context,
+            instrument=self.instrument
         )
         
         # Handle tuple return (position, monte_carlo_result)
@@ -312,14 +473,23 @@ class LiveTradingSystem:
         
         # Manual approval workflow (if enabled)
         if self.manual_approval_enabled:
-            if not self._request_manual_approval(decision, bar):
+            if not self._request_manual_approval(decision, primary_bar):
                 print("⚠️  Trade rejected by manual approval")
                 self.stats["trades_rejected"] += 1
                 return
         
         # Execute trade
         if abs(final_action - self.current_position) > 0.01:
-            self._execute_trade(final_action, bar)
+            self._execute_trade(final_action, primary_bar)
+        
+        # Log decision diagnostics for post-trade analysis
+        self._log_decision(
+            timestamp=primary_bar.timestamp,
+            rl_action=rl_action_value,
+            rl_confidence=rl_confidence,
+            decision=decision,
+            final_action=final_action
+        )
     
     def _run_swarm_analysis(
         self,
@@ -457,6 +627,44 @@ class LiveTradingSystem:
         else:
             print("⚠️  Bridge server not connected")
     
+    def _log_decision(
+        self,
+        timestamp: datetime,
+        rl_action: float,
+        rl_confidence: float,
+        decision: DecisionResult,
+        final_action: float
+    ):
+        """Append decision diagnostics to a CSV log for offline analysis."""
+        if not getattr(self, "decision_log_path", None):
+            return
+        try:
+            risk_state = self.risk_manager.get_position_state_info(self.instrument)
+            row = [
+                timestamp.isoformat(),
+                rl_action,
+                rl_confidence,
+                decision.action,
+                decision.confidence,
+                getattr(decision, "scale_factor", None),
+                getattr(decision, "confluence_count", None),
+                getattr(decision, "confluence_score", None),
+                decision.agreement,
+                final_action,
+                self.current_position,
+                risk_state.get("break_even_active"),
+                risk_state.get("avg_entry"),
+                risk_state.get("protected_size"),
+                risk_state.get("trail_price"),
+                json.dumps(decision.confluence_signals or {}),
+                json.dumps(risk_state),
+            ]
+            with open(self.decision_log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+        except Exception as e:
+            print(f"⚠️  Failed to log decision: {e}")
+    
     def log_completed_trade(
         self,
         entry_price: float,
@@ -501,11 +709,27 @@ class LiveTradingSystem:
             "timestamp": trade_metrics.timestamp,
             "pnl": pnl,
             "entry": entry_price,
-            "exit": exit_price
+            "exit": exit_price,
+            "position_size": position_size
         })
         
         # Update statistics
         self.stats["total_pnl"] += pnl
+        
+        # Track winning/losing trades for adaptive learning
+        if pnl > 0:
+            self.winning_trades.append(pnl)
+        else:
+            self.losing_trades.append(abs(pnl))
+        
+        # Update max equity and drawdown
+        current_equity = self.max_equity + self.stats["total_pnl"]
+        if current_equity > self.max_equity:
+            self.max_equity = current_equity
+        else:
+            drawdown = (self.max_equity - current_equity) / self.max_equity if self.max_equity > 0 else 0.0
+            if drawdown > self.max_drawdown:
+                self.max_drawdown = drawdown
     
     def get_drift_status(self):
         """
@@ -517,6 +741,50 @@ class LiveTradingSystem:
         if self.drift_monitor:
             return self.drift_monitor.get_drift_status()
         return None
+    
+    def get_performance_data(self) -> Dict[str, Any]:
+        """
+        Get performance data for adaptive learning agent.
+        
+        Returns:
+            Dict with performance metrics
+        """
+        total_trades = len(self.trade_history)
+        winning_trades_count = len(self.winning_trades)
+        losing_trades_count = len(self.losing_trades)
+        
+        # Calculate averages
+        avg_win = sum(self.winning_trades) / max(1, winning_trades_count) if self.winning_trades else 0.0
+        avg_loss = sum(self.losing_trades) / max(1, losing_trades_count) if self.losing_trades else 0.0
+        
+        # Calculate time window
+        time_window_seconds = (datetime.now() - self.performance_start_time).total_seconds()
+        trades_per_hour = (total_trades / max(1, time_window_seconds)) * 3600 if time_window_seconds > 0 else 0.0
+        
+        return {
+            "total_trades": total_trades,
+            "winning_trades": winning_trades_count,
+            "losing_trades": losing_trades_count,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "max_drawdown": self.max_drawdown,
+            "trades_per_hour": trades_per_hour,
+            "time_window_seconds": time_window_seconds,
+            "total_pnl": self.stats.get("total_pnl", 0.0),
+            "current_equity": self.max_equity + self.stats.get("total_pnl", 0.0)
+        }
+    
+    def get_adaptive_learning_recommendations(self) -> Optional[Dict[str, Any]]:
+        """Get latest adaptive learning recommendations"""
+        if self.swarm_orchestrator and self.swarm_enabled:
+            return self.swarm_orchestrator.get_adaptive_learning_recommendations()
+        return None
+    
+    def apply_adaptive_learning_recommendation(self, recommendation: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply an approved adaptive learning recommendation"""
+        if self.swarm_orchestrator and self.swarm_enabled:
+            return self.swarm_orchestrator.apply_adaptive_learning_recommendation(recommendation)
+        return {"status": "error", "message": "Swarm orchestrator not available"}
     
     def _handle_trade_request(self, data: Dict) -> Dict:
         """

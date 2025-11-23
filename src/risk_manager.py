@@ -72,9 +72,21 @@ class RiskManager:
             stop_loss_atr_multiplier=risk_config.get("stop_loss_atr_multiplier", 2.0),
             max_leverage=risk_config.get("max_leverage", 1.0)
         )
+        self.initial_capital = risk_config.get("initial_capital", 100000.0)
+
+        self.dynamic_position_fraction = risk_config.get("max_position_fraction_of_balance", 0.02)
+        self.position_value_per_unit = risk_config.get("position_value_per_unit", self.initial_capital)
+        break_even_cfg = risk_config.get("break_even", {})
+        self.break_even_cfg = {
+            "enabled": break_even_cfg.get("enabled", True),
+            "activation_pct": break_even_cfg.get("activation_pct", 0.003),
+            "trail_pct": break_even_cfg.get("trail_pct", 0.0015),
+            "scale_out_fraction": break_even_cfg.get("scale_out_fraction", 0.5),
+            "scale_out_min_confluence": break_even_cfg.get("scale_out_min_confluence", 1),
+            "free_trade_fraction": break_even_cfg.get("free_trade_fraction", 0.5),
+        }
         
         # State tracking
-        self.initial_capital = risk_config.get("initial_capital", 100000.0)
         self.current_capital = self.initial_capital
         self.max_capital = self.initial_capital
         self.current_drawdown = 0.0
@@ -87,6 +99,7 @@ class RiskManager:
         # Position tracking
         self.current_positions = {}  # instrument -> position_size
         self.total_exposure = 0.0
+        self.position_states: Dict[str, Dict[str, float]] = {}
         
         # Monte Carlo risk analyzer (optional)
         self.monte_carlo_enabled = risk_config.get("monte_carlo_enabled", True)
@@ -145,7 +158,9 @@ class RiskManager:
         market_data: Optional[Dict] = None,
         price_data: Optional[pd.DataFrame] = None,
         current_price: Optional[float] = None,
-        use_monte_carlo: bool = True
+        use_monte_carlo: bool = True,
+        decision_context: Optional[Dict] = None,
+        instrument: str = "default"
     ) -> Tuple[float, Optional[MonteCarloResult]]:
         """
         Validate and adjust trading action based on risk limits.
@@ -158,12 +173,19 @@ class RiskManager:
             price_data: Historical price data (for Monte Carlo)
             current_price: Current market price (for Monte Carlo)
             use_monte_carlo: Whether to use Monte Carlo risk assessment
+            decision_context: Additional decision metadata (confluences, scaling, etc.)
+            instrument: Instrument identifier for multi-instrument tracking
         
         Returns:
             Tuple of (adjusted_position_size, monte_carlo_result)
         """
         # Reset daily limits if needed
         self.reset_daily()
+        instrument = instrument or "default"
+        decision_context = decision_context or {}
+        market_price = current_price
+        if market_price is None and market_data:
+            market_price = market_data.get("price") or market_data.get("close")
         
         # Check drawdown limit
         if self.current_drawdown >= self.limits.max_drawdown:
@@ -181,6 +203,18 @@ class RiskManager:
             -self.limits.max_position_size,
             self.limits.max_position_size
         )
+
+        # Apply dynamic position cap relative to balance
+        target_position = self._enforce_dynamic_position_cap(target_position)
+
+        # Break-even / free trade management
+        target_position = self._apply_break_even_logic(
+            instrument=instrument,
+            target_position=target_position,
+            current_position=current_position,
+            market_price=market_price,
+            decision_context=decision_context
+        )
         
         # Check leverage
         position_value = abs(target_position) * self.current_capital
@@ -195,6 +229,12 @@ class RiskManager:
         
         # Check if change is significant
         if abs(position_change) < 0.01:
+            self._update_position_state(
+                instrument=instrument,
+                new_position=current_position,
+                prior_position=current_position,
+                execution_price=market_price
+            )
             return current_position, None  # No change needed
         
         # Trend detection and asymmetric risk management for downtrends
@@ -264,8 +304,151 @@ class RiskManager:
                 print(f"⚠️  Monte Carlo risk assessment failed: {e}")
                 # Continue with basic validation if Monte Carlo fails
         
+        self._update_position_state(
+            instrument=instrument,
+            new_position=target_position,
+            prior_position=current_position,
+            execution_price=market_price
+        )
         return target_position, monte_carlo_result
     
+    def _empty_state(self) -> Dict[str, float]:
+        return {
+            "position": 0.0,
+            "avg_entry": None,
+            "break_even_active": False,
+            "max_favorable": None,
+            "trail_price": None,
+            "protected_size": 0.0,
+        }
+
+    def _get_position_state(self, instrument: str) -> Dict[str, float]:
+        if instrument not in self.position_states:
+            self.position_states[instrument] = self._empty_state()
+        return self.position_states[instrument]
+
+    def get_position_state_info(self, instrument: str) -> Dict[str, float]:
+        """Public accessor for current position state (for logging/debugging)."""
+        state = self.position_states.get(instrument)
+        if state is None:
+            state = self._empty_state()
+        # Return a shallow copy to avoid external mutation
+        return dict(state)
+
+    def _enforce_dynamic_position_cap(self, target_position: float) -> float:
+        if self.position_value_per_unit <= 0 or self.dynamic_position_fraction <= 0:
+            return target_position
+        dynamic_cap = (self.current_capital * self.dynamic_position_fraction) / self.position_value_per_unit
+        dynamic_cap = max(self.limits.max_position_size, dynamic_cap)
+        return float(np.clip(target_position, -dynamic_cap, dynamic_cap))
+
+    def _apply_break_even_logic(
+        self,
+        instrument: str,
+        target_position: float,
+        current_position: float,
+        market_price: Optional[float],
+        decision_context: Dict
+    ) -> float:
+        if not self.break_even_cfg.get("enabled", True):
+            return target_position
+        if market_price is None:
+            return target_position
+
+        state = self._get_position_state(instrument)
+        existing_position = state.get("position", 0.0)
+        if abs(existing_position) < 1e-6:
+            # No active position to manage yet
+            return target_position
+
+        direction = np.sign(existing_position)
+        avg_entry = state.get("avg_entry")
+        if not avg_entry or direction == 0:
+            return target_position
+
+        move_pct = direction * (market_price - avg_entry) / avg_entry if avg_entry else 0.0
+        activation_pct = self.break_even_cfg.get("activation_pct", 0.003)
+        if not state.get("break_even_active") and move_pct >= activation_pct:
+            state["break_even_active"] = True
+            state["protected_size"] = max(state.get("protected_size", 0.0), abs(existing_position))
+            state["max_favorable"] = market_price
+            state["trail_price"] = market_price
+
+        if state.get("break_even_active"):
+            # Update trailing reference
+            if direction > 0:
+                state["max_favorable"] = max(state.get("max_favorable") or market_price, market_price)
+                trail_pct = self.break_even_cfg.get("trail_pct", 0.0015)
+                state["trail_price"] = state["max_favorable"] * (1 - trail_pct)
+                if market_price <= state.get("trail_price", market_price):
+                    return 0.0
+            else:
+                state["max_favorable"] = min(state.get("max_favorable") or market_price, market_price)
+                trail_pct = self.break_even_cfg.get("trail_pct", 0.0015)
+                state["trail_price"] = state["max_favorable"] * (1 + trail_pct)
+                if market_price >= state.get("trail_price", market_price):
+                    return 0.0
+
+            min_confluence = self.break_even_cfg.get("scale_out_min_confluence", 1)
+            confluence_count = int(decision_context.get("confluence_count", 0))
+            if confluence_count <= min_confluence:
+                free_fraction = self.break_even_cfg.get("free_trade_fraction", 0.5)
+                protected_size = state.get("protected_size", abs(existing_position))
+                target_size = protected_size * free_fraction
+                target_position = direction * min(abs(target_position), target_size)
+
+        return target_position
+
+    def _update_position_state(
+        self,
+        instrument: str,
+        new_position: float,
+        prior_position: float,
+        execution_price: Optional[float]
+    ):
+        state = self._get_position_state(instrument)
+        direction = np.sign(new_position) if abs(new_position) > 1e-6 else 0.0
+
+        if direction == 0.0:
+            self.position_states[instrument] = self._empty_state()
+            self.current_positions[instrument] = 0.0
+            return
+
+        price = execution_price or state.get("avg_entry")
+        if price is None:
+            price = 0.0
+
+        prev_direction = np.sign(prior_position) if abs(prior_position) > 1e-6 else 0.0
+        new_size = abs(new_position)
+        prev_size = abs(prior_position)
+
+        if prev_direction == 0.0 or prev_direction != direction:
+            # Fresh position or reversal
+            state.update({
+                "position": new_position,
+                "avg_entry": price,
+                "break_even_active": False,
+                "max_favorable": price,
+                "trail_price": price,
+                "protected_size": new_size,
+            })
+        else:
+            state["position"] = new_position
+            if new_size > prev_size and price:
+                avg_entry = state.get("avg_entry") or price
+                state["avg_entry"] = (
+                    (avg_entry * prev_size) + (price * (new_size - prev_size))
+                ) / max(new_size, 1e-6)
+            if state.get("break_even_active"):
+                state["protected_size"] = max(state.get("protected_size", 0.0), new_size)
+            if price:
+                if direction > 0:
+                    state["max_favorable"] = max(state.get("max_favorable") or price, price)
+                else:
+                    state["max_favorable"] = min(state.get("max_favorable") or price, price)
+
+        self.current_positions[instrument] = new_position
+
     def _detect_trend_and_adjust(
         self,
         target_position: float,

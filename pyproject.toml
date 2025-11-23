@@ -1,67 +1,83 @@
+# NT8 RL Trading Strategy - Project Configuration
+#
+# CUDA PyTorch Setup:
+# This project REQUIRES CUDA-enabled PyTorch builds - CPU-only versions are NOT supported.
+# The [tool.uv] section below configures the PyTorch CUDA index (cu121) and
+# uses unsafe-best-match strategy to prefer CUDA builds over CPU-only builds.
+#
+# IMPORTANT: Before running `uv sync`, verify CUDA configuration:
+#   1. Run: python prevent_cpu_pytorch.py (verifies configuration)
+#   2. If CPU-only PyTorch is detected, run: python ensure_cuda_pytorch.py --auto
+#   3. Or use: .\setup_cuda_pytorch.ps1 (Windows)
+#
+# See docs/PYTORCH_CUDA_SETUP.md for detailed information.
+
 [project]
 name = "nt8-rl"
 version = "0.1.0"
 description = "NT8 RL Trading Strategy - Reinforcement Learning Trading System"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.15"  # Note: Python 3.14 has limited package support (e.g., numba/pandas-ta)
 dependencies = [
     # Core ML/RL Framework
-    "torch>=2.6.0",  # PyTorch (CUDA version available: install with --index-url for GPU support)
-    "torchvision>=0.21.0",
-    "torchaudio>=2.6.0",
+    # IMPORTANT: CUDA builds are required - DO NOT use CPU-only versions
+    # These versions are pinned to CUDA builds from PyTorch index
+    # If CPU-only versions are installed, run: python ensure_cuda_pytorch.py
+    "torch>=2.5.1,<2.6.0", # CUDA builds only - use cu121 index
+    "torchvision>=0.20.1,<0.21.0", # CUDA builds only - use cu121 index
+    "torchaudio>=2.5.1,<2.6.0", # CUDA builds only - use cu121 index
     "gymnasium>=0.29.0",
     "stable-baselines3>=2.0.0",
     "sb3-contrib>=2.0.0",
-    
     # Data Processing
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "scikit-learn>=1.3.0",
-    
     # Technical Analysis
     "ta>=0.10.2",
-    "pandas-ta>=0.3.14b",
-    
+    # "pandas-ta>=0.3.14b",  # Disabled: requires numba which doesn't support Python 3.14
     # Communication
     "requests>=2.31.0",
     "httpx>=0.24.0",
     "websockets>=12.0",
-    
     # Monitoring & Logging
     "tensorboard>=2.13.0",
     "wandb>=0.15.0",
     "matplotlib>=3.7.0",
     "seaborn>=0.12.0",
-    
     # Utilities
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
     "tqdm>=4.65.0",
     "watchdog>=3.0.0",
-    
     # Web Framework (for Production UI)
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.6",
     "psutil>=5.9.0",
-    
     # Agentic Swarm (Multi-Agent System)
     "strands-agents",
     "strands-agents-tools",
-    "anthropic>=0.40.0",  # Anthropic Claude API client
-    "ollama>=0.3.0",      # Ollama Python client
-    
+    "anthropic>=0.40.0", # Anthropic Claude API client
+    "ollama>=0.3.0", # Ollama Python client
     # Testing (optional, but included for development)
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.1.0",
-    
     # Code Quality (optional, but included for development)
     "black>=23.7.0",
     "flake8>=6.1.0",
     "mypy>=1.5.0",
 ]
+
+[tool.uv]
+# PyTorch CUDA index - CUDA 12.1 builds
+# This index provides CUDA-enabled PyTorch packages
+extra-index-url = ["https://download.pytorch.org/whl/cu121"]
+# Use unsafe-best-match to prefer CUDA builds from PyTorch index over CPU builds from PyPI
+# This ensures CUDA versions (e.g., torch==2.5.1+cu121) are preferred over CPU versions (e.g., torch==2.9.0+cpu)
+index-strategy = "unsafe-best-match"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

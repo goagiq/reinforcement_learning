@@ -98,7 +98,7 @@ class ReasoningEngine:
         Initialize reasoning engine with specified provider.
         
         Args:
-            provider_type: "ollama", "deepseek_cloud", or "grok"
+            provider_type: "ollama", "deepseek_cloud", "grok", or "anthropic"
             model: Model name (provider-specific)
             api_key: API key (required for cloud providers, unless using Kong)
             base_url: Base URL (optional, uses provider defaults if not provided, ignored if use_kong=True)
@@ -126,6 +126,12 @@ class ReasoningEngine:
                 raise ValueError(f"api_key is required for {self.provider_type} provider (unless using Kong)")
             provider_kwargs["api_key"] = api_key
             if base_url and not use_kong:
+                provider_kwargs["base_url"] = base_url
+        elif self.provider_type == "anthropic":
+            if not api_key:
+                raise ValueError("ANTHROPIC_API_KEY not found for reasoning provider. Set ANTHROPIC_API_KEY environment variable or provide in config.")
+            provider_kwargs["api_key"] = api_key
+            if base_url:
                 provider_kwargs["base_url"] = base_url
         
         self.provider = get_provider(self.provider_type, **provider_kwargs)

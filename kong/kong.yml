@@ -90,7 +90,9 @@ services:
       - name: fastapi-route
         paths:
           - /api
+          - /api/
         strip_path: false
+        preserve_host: false
         methods:
           - GET
           - POST

@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import axios from 'axios'
 import { Play, Loader, CheckCircle, AlertCircle, BarChart3 } from 'lucide-react'
 import { getDefaultModel, sortModelsWithDefaultFirst, isDefaultModel } from '../utils/modelUtils'
+import CapabilityExplainer from './CapabilityExplainer'
 
 const BacktestPanel = ({ models }) => {
   const [selectedModel, setSelectedModel] = useState('')
@@ -268,10 +269,16 @@ const BacktestPanel = ({ models }) => {
       {/* Results */}
       {results && (
         <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
-            <BarChart3 className="w-5 h-5" />
-            Backtest Results
-          </h3>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <BarChart3 className="w-5 h-5" />
+              <h3 className="text-lg font-semibold text-gray-800">Backtest Results</h3>
+            </div>
+            <CapabilityExplainer
+              capabilityId="backtest.results"
+              context={{ results, selectedModel }}
+            />
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {Object.entries(results).map(([key, value]) => (
               <div key={key} className="p-4 bg-gray-50 rounded-lg">

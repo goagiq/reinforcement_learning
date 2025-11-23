@@ -74,8 +74,19 @@ class Trainer:
         # Setup paths
         self.log_dir = Path(config["logging"]["log_dir"])
         self.model_dir = Path("models")
+        self.archive_dir = Path("models/Archive")
         self.log_dir.mkdir(exist_ok=True)
         self.model_dir.mkdir(exist_ok=True)
+        self.archive_dir.mkdir(exist_ok=True)
+        
+        # Archive existing models if starting fresh training (no checkpoint provided)
+        # This prevents accidentally reusing old models
+        should_archive = (
+            not checkpoint_path and  # No checkpoint provided (starting fresh)
+            not config["training"].get("transfer_learning", False)  # Not using transfer learning
+        )
+        if should_archive:
+            self._archive_existing_models()
         
         # TensorBoard writer
         if config["logging"]["tensorboard"]:
@@ -252,6 +263,21 @@ class Trainer:
         self.total_timesteps = config["training"]["total_timesteps"]
         self.save_freq = config["training"]["save_freq"]
         self.eval_freq = config["training"]["eval_freq"]
+        
+        # Early stopping configuration
+        early_stopping_config = config["training"].get("early_stopping", {})
+        self.early_stopping_enabled = early_stopping_config.get("enabled", False)
+        self.early_stopping_patience = early_stopping_config.get("patience", 50000)  # Steps without improvement
+        self.early_stopping_min_delta = early_stopping_config.get("min_delta", 0.005)  # Minimum improvement threshold
+        self.early_stopping_best_metric = float('-inf')  # Track best performance metric
+        self.early_stopping_last_improvement = 0  # Timestep of last improvement
+        self.early_stopping_metric_name = "mean_reward"  # Metric to track (can be "mean_reward" or "win_rate")
+        
+        if self.early_stopping_enabled:
+            print(f"✅ Early stopping enabled:")
+            print(f"   Patience: {self.early_stopping_patience:,} timesteps")
+            print(f"   Min delta: {self.early_stopping_min_delta:.4f}")
+            print(f"   Metric: {self.early_stopping_metric_name}")
         
         # Metrics
         self.timestep = 0
@@ -572,6 +598,184 @@ class Trainer:
                     if self.turbo_batch_multiplier != old_batch:
                         print(f"   [MEM] VRAM low ({vram_used:.2f}GB, {vram_percent:.1f}%), increasing batch multiplier to {self.turbo_batch_multiplier:.2f}x (+{vram_adjustment*100:.0f}%)")
     
+    def _archive_existing_models(self):
+        """
+        Archive existing model files to Archive folder before starting fresh training.
+        This prevents accidentally reusing old (potentially bad) models.
+        """
+        import shutil
+        from datetime import datetime
+        
+        # Find all model files (checkpoints, best_model, final_model)
+        model_files = list(self.model_dir.glob("*.pt"))
+        
+        # Filter out files already in Archive
+        model_files = [f for f in model_files if "Archive" not in str(f)]
+        
+        if not model_files:
+            print("No existing models to archive (models directory is empty or already archived).")
+            return
+        
+        # Create timestamped archive folder
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_subdir = self.archive_dir / f"archive_{timestamp}"
+        archive_subdir.mkdir(exist_ok=True)
+        
+        print(f"\n{'='*70}")
+        print(f"ARCHIVING EXISTING MODELS")
+        print(f"{'='*70}")
+        print(f"Archive folder: {archive_subdir}")
+        print(f"Found {len(model_files)} model file(s) to archive:")
+        
+        archived_count = 0
+        for model_file in model_files:
+            try:
+                # Skip if already in Archive folder
+                if "Archive" in str(model_file):
+                    continue
+                
+                dest_path = archive_subdir / model_file.name
+                shutil.move(str(model_file), str(dest_path))
+                print(f"  [OK] Archived: {model_file.name}")
+                archived_count += 1
+            except Exception as e:
+                print(f"  [WARN] Failed to archive {model_file.name}: {e}")
+        
+        print(f"\nArchived {archived_count} model file(s) to: {archive_subdir}")
+        print(f"{'='*70}\n")
+    
+    def _archive_used_data_files(self):
+        """
+        Archive data files used during training to prevent reuse.
+        Archives from both NT8 export folder and local data/raw folder.
+        """
+        import shutil
+        from datetime import datetime
+        
+        if not hasattr(self, 'data_extractor') or not self.data_extractor:
+            print("No data extractor found - skipping data file archiving.")
+            return
+        
+        used_files = getattr(self.data_extractor, 'used_data_files', [])
+        if not used_files:
+            print("No data files tracked - skipping data file archiving.")
+            return
+        
+        # Create timestamped archive folder (same timestamp as model archive if available)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Archive NT8 export files
+        nt8_archive_dir = None
+        nt8_data_path = self.config.get("data", {}).get("nt8_data_path")
+        if not nt8_data_path:
+            # Try to get from settings
+            try:
+                settings_file = Path("settings.json")
+                if settings_file.exists():
+                    with open(settings_file, 'r') as f:
+                        settings = json.load(f)
+                        nt8_data_path = settings.get("nt8_data_path")
+            except:
+                pass
+        
+        # Also try common NT8 paths
+        common_nt8_paths = [
+            Path("C:/Users/schuo/Documents/NinjaTrader 8/export"),  # Current user path
+            Path("C:/Users/sovan/Documents/NinjaTrader 8/export"),  # Previous user path
+            Path.home() / "Documents" / "NinjaTrader 8" / "export",
+            Path.home() / "Documents" / "NinjaTrader 8" / "Export",
+        ]
+        
+        if nt8_data_path:
+            common_nt8_paths.insert(0, Path(nt8_data_path))
+        
+        print(f"\n{'='*70}")
+        print(f"ARCHIVING USED DATA FILES")
+        print(f"{'='*70}")
+        
+        archived_count = 0
+        
+        # Deduplicate files by path (same file might be tracked multiple times)
+        seen_files = set()
+        unique_files = []
+        for file_type, file_path in used_files:
+            file_path_normalized = str(Path(file_path).resolve())
+            if file_path_normalized not in seen_files:
+                seen_files.add(file_path_normalized)
+                unique_files.append((file_type, file_path))
+        
+        # Archive NT8 source files
+        for file_type, file_path in unique_files:
+            if file_type == "nt8_source":
+                source_file = Path(file_path)
+                if not source_file.exists():
+                    continue
+                
+                # Find which NT8 path this file is in
+                nt8_base_path = None
+                source_file_resolved = source_file.resolve()
+                source_file_str = str(source_file_resolved)
+                for nt8_path in common_nt8_paths:
+                    if not nt8_path.exists():
+                        continue
+                    try:
+                        nt8_path_resolved = nt8_path.resolve()
+                        nt8_path_str = str(nt8_path_resolved)
+                        # Check if file is in this NT8 directory (using resolved paths)
+                        if source_file_str.startswith(nt8_path_str) or str(source_file).startswith(str(nt8_path)):
+                            nt8_base_path = nt8_path_resolved
+                            break
+                    except Exception:
+                        # If resolve fails, try string comparison
+                        if str(source_file).startswith(str(nt8_path)):
+                            nt8_base_path = nt8_path
+                            break
+                
+                if nt8_base_path:
+                    # Create archive folder in NT8 export directory
+                    nt8_archive_dir = nt8_base_path / "Archive" / f"archive_{timestamp}"
+                    nt8_archive_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    try:
+                        dest_path = nt8_archive_dir / source_file.name
+                        shutil.move(str(source_file), str(dest_path))
+                        print(f"  [OK] Archived NT8 file: {source_file.name}")
+                        archived_count += 1
+                    except Exception as e:
+                        print(f"  [WARN] Failed to archive NT8 file {source_file.name}: {e}")
+        
+        # Archive local data files
+        local_archive_dir = Path("data/raw/Archive") / f"archive_{timestamp}"
+        local_archive_dir.mkdir(parents=True, exist_ok=True)
+        
+        for file_type, file_path in unique_files:
+            if file_type in ["local_file", "local_copy"]:
+                local_file = Path(file_path)
+                if not local_file.exists():
+                    continue
+                
+                # Skip if already in Archive
+                if "Archive" in str(local_file):
+                    continue
+                
+                try:
+                    dest_path = local_archive_dir / local_file.name
+                    shutil.move(str(local_file), str(dest_path))
+                    print(f"  [OK] Archived local file: {local_file.name}")
+                    archived_count += 1
+                except Exception as e:
+                    print(f"  [WARN] Failed to archive local file {local_file.name}: {e}")
+        
+        if archived_count > 0:
+            print(f"\nArchived {archived_count} data file(s)")
+            if nt8_archive_dir:
+                print(f"  NT8 Archive: {nt8_archive_dir}")
+            print(f"  Local Archive: {local_archive_dir}")
+        else:
+            print("No data files were archived.")
+        
+        print(f"{'='*70}\n")
+    
     def _load_data(self):
         """Load multi-timeframe data"""
         # Get NT8 data path from config or settings
@@ -588,6 +792,7 @@ class Trainer:
                     pass
         
         extractor = DataExtractor(nt8_data_path=nt8_data_path)
+        self.data_extractor = extractor  # Store for archiving later
         instrument = self.config["environment"]["instrument"]
         timeframes = self.config["environment"]["timeframes"]
         trading_hours_cfg = self.config["environment"].get("trading_hours", {})
@@ -1142,6 +1347,28 @@ class Trainer:
                         if "learning_rate" in adjustments:
                             print(f"✅ Applied learning_rate adjustment: {adjustments['learning_rate']['new']:.6f}")
                     
+                    # Check if training should be paused
+                    if self.adaptive_trainer.is_training_paused():
+                        print("\n" + "="*70)
+                        print("[PAUSED] Training paused by adaptive learning system")
+                        print("="*70)
+                        print(f"Reason: {self.adaptive_trainer.get_pause_reason()}")
+                        print("\nSaving final checkpoint...")
+                        # Save checkpoint
+                        checkpoint_path = self.model_dir / f"checkpoint_{self.timestep}.pt"
+                        self.agent.save_with_training_state(
+                            str(checkpoint_path),
+                            self.timestep,
+                            self.episode,
+                            self.episode_rewards,
+                            self.episode_lengths
+                        )
+                        print(f"✅ Checkpoint saved: {checkpoint_path}")
+                        print("\n[ACTION REQUIRED] Review performance and adjust parameters before resuming.")
+                        print("Training stopped.")
+                        print("="*70 + "\n")
+                        break  # Exit training loop
+                    
                     # Auto-save on improvement
                     if result.get("should_save") and result.get("improvement"):
                         best_path = self.model_dir / "best_model.pt"
@@ -1153,9 +1380,106 @@ class Trainer:
                             self.episode_lengths
                         )
                         print(f"💾 Auto-saved best model (improvement: {result['improvement']*100:.1f}%)")
+                    
+                    # Early stopping check (after adaptive evaluation)
+                    if self.early_stopping_enabled:
+                        # Get current metric from evaluation result or episode metrics
+                        current_metric = None
+                        if self.early_stopping_metric_name == "mean_reward":
+                            # Use mean reward from recent episodes
+                            current_metric = np.mean(self.episode_rewards[-50:]) if len(self.episode_rewards) >= 50 else (np.mean(self.episode_rewards) if self.episode_rewards else float('-inf'))
+                        elif self.early_stopping_metric_name == "win_rate":
+                            # Use win rate from recent episodes
+                            if len(self.episode_win_rates) >= 10:
+                                current_metric = np.mean(self.episode_win_rates[-10:])
+                            elif self.episode_win_rates:
+                                current_metric = np.mean(self.episode_win_rates)
+                            else:
+                                current_metric = 0.0
+                        
+                        if current_metric is not None:
+                            # Check if current metric is better than best (with min_delta threshold)
+                            improvement = current_metric - self.early_stopping_best_metric
+                            if improvement >= self.early_stopping_min_delta:
+                                # New best metric found
+                                self.early_stopping_best_metric = current_metric
+                                self.early_stopping_last_improvement = self.timestep
+                                print(f"📈 Early stopping: New best {self.early_stopping_metric_name} = {current_metric:.4f} (improvement: {improvement:.4f})")
+                            else:
+                                # No improvement
+                                steps_since_improvement = self.timestep - self.early_stopping_last_improvement
+                                if steps_since_improvement >= self.early_stopping_patience:
+                                    print("\n" + "="*70)
+                                    print("[EARLY STOPPING] Training stopped - no improvement detected")
+                                    print("="*70)
+                                    print(f"Best {self.early_stopping_metric_name}: {self.early_stopping_best_metric:.4f}")
+                                    print(f"Current {self.early_stopping_metric_name}: {current_metric:.4f}")
+                                    print(f"Steps since last improvement: {steps_since_improvement:,} / {self.early_stopping_patience:,}")
+                                    print(f"Min delta required: {self.early_stopping_min_delta:.4f}")
+                                    print("\nSaving final checkpoint...")
+                                    # Save checkpoint
+                                    checkpoint_path = self.model_dir / f"checkpoint_{self.timestep}.pt"
+                                    self.agent.save_with_training_state(
+                                        str(checkpoint_path),
+                                        self.timestep,
+                                        self.episode,
+                                        self.episode_rewards,
+                                        self.episode_lengths
+                                    )
+                                    print(f"✅ Checkpoint saved: {checkpoint_path}")
+                                    print("\nTraining stopped to prevent overfitting.")
+                                    print("="*70 + "\n")
+                                    break  # Exit training loop
+                                else:
+                                    remaining = self.early_stopping_patience - steps_since_improvement
+                                    if steps_since_improvement % 10000 == 0:  # Print every 10k steps
+                                        print(f"⏳ Early stopping: No improvement for {steps_since_improvement:,} steps ({remaining:,} remaining)")
                 else:
                     # Standard evaluation
-                    self._evaluate()
+                    eval_metrics = self._evaluate()
+                    
+                    # Early stopping check (after standard evaluation)
+                    if self.early_stopping_enabled and eval_metrics:
+                        # Get current metric from evaluation
+                        current_metric = None
+                        if self.early_stopping_metric_name == "mean_reward":
+                            current_metric = eval_metrics.get("mean_reward", np.mean(self.episode_rewards[-50:]) if len(self.episode_rewards) >= 50 else (np.mean(self.episode_rewards) if self.episode_rewards else float('-inf')))
+                        elif self.early_stopping_metric_name == "win_rate":
+                            current_metric = eval_metrics.get("win_rate", np.mean(self.episode_win_rates[-10:]) if len(self.episode_win_rates) >= 10 else (np.mean(self.episode_win_rates) if self.episode_win_rates else 0.0))
+                        
+                        if current_metric is not None:
+                            # Check if current metric is better than best (with min_delta threshold)
+                            improvement = current_metric - self.early_stopping_best_metric
+                            if improvement >= self.early_stopping_min_delta:
+                                # New best metric found
+                                self.early_stopping_best_metric = current_metric
+                                self.early_stopping_last_improvement = self.timestep
+                                print(f"📈 Early stopping: New best {self.early_stopping_metric_name} = {current_metric:.4f} (improvement: {improvement:.4f})")
+                            else:
+                                # No improvement
+                                steps_since_improvement = self.timestep - self.early_stopping_last_improvement
+                                if steps_since_improvement >= self.early_stopping_patience:
+                                    print("\n" + "="*70)
+                                    print("[EARLY STOPPING] Training stopped - no improvement detected")
+                                    print("="*70)
+                                    print(f"Best {self.early_stopping_metric_name}: {self.early_stopping_best_metric:.4f}")
+                                    print(f"Current {self.early_stopping_metric_name}: {current_metric:.4f}")
+                                    print(f"Steps since last improvement: {steps_since_improvement:,} / {self.early_stopping_patience:,}")
+                                    print(f"Min delta required: {self.early_stopping_min_delta:.4f}")
+                                    print("\nSaving final checkpoint...")
+                                    # Save checkpoint
+                                    checkpoint_path = self.model_dir / f"checkpoint_{self.timestep}.pt"
+                                    self.agent.save_with_training_state(
+                                        str(checkpoint_path),
+                                        self.timestep,
+                                        self.episode,
+                                        self.episode_rewards,
+                                        self.episode_lengths
+                                    )
+                                    print(f"✅ Checkpoint saved: {checkpoint_path}")
+                                    print("\nTraining stopped to prevent overfitting.")
+                                    print("="*70 + "\n")
+                                    break  # Exit training loop
         
         pbar.close()
         
@@ -1171,6 +1495,9 @@ class Trainer:
         
         # Save training summary
         self._save_training_summary()
+        
+        # Archive data files used during training
+        self._archive_used_data_files()
         
         print("\n" + "="*60)
         print("Training Complete!")
@@ -1222,6 +1549,12 @@ class Trainer:
         
         print(f"\n📊 Evaluation @ step {self.timestep}: "
               f"Mean reward: {mean_reward:.2f}, Mean PnL: ${mean_pnl:.2f}")
+        
+        # Return metrics for early stopping
+        return {
+            "mean_reward": mean_reward,
+            "mean_pnl": mean_pnl
+        }
     
     def _save_training_summary(self):
         """Save training summary to JSON"""

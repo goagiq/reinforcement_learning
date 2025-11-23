@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
+from copy import deepcopy
 from src.agentic_swarm.base_agent import BaseSwarmAgent
 from src.agentic_swarm.shared_context import SharedContext
 from src.data_sources.market_data import MarketDataProvider
@@ -45,7 +46,9 @@ class ContrarianAgent(BaseSwarmAgent):
             reasoning_engine: Optional reasoning engine
             config: Optional configuration
         """
-        config = config or {}
+        config = deepcopy(config) if config else {}
+        reasoning_config = config.setdefault("reasoning", {})
+        reasoning_config.setdefault("model", "claude-sonnet-4-20250514")
         system_prompt = """You are a contrarian market analyst following Warren Buffett's philosophy:
 "Be fearful when others are greedy, and greedy when others are fearful."
 

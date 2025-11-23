@@ -1,0 +1,32 @@
+# Example Swarm Configuration with Adaptive Learning Agent
+
+agentic_swarm:
+  enabled: true
+  
+  # Adaptive Learning Agent Configuration
+  adaptive_learning:
+    enabled: true  # Enable adaptive learning agent
+    use_llm_reasoning: true  # Use LLM for reasoning (configurable)
+    analysis_frequency: 300  # Every 5 minutes (seconds)
+    min_trades_for_analysis: 20  # Minimum trades needed
+    min_analysis_window: 3600  # 1 hour minimum (seconds)
+    
+    # Performance thresholds
+    min_win_rate: 0.35  # 35% minimum
+    min_rr_ratio: 1.3  # 1.3:1 minimum
+    max_drawdown_threshold: 0.10  # 10% max drawdown
+    
+    # Initial parameters
+    initial_rr_threshold: 1.5
+    initial_min_confidence: 0.15
+    initial_min_quality: 0.4
+  
+  # Other swarm agents...
+  market_research:
+    enabled: true
+    # ... other config
+  
+  sentiment:
+    enabled: true
+    # ... other config
+

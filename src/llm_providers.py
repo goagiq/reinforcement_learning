@@ -10,6 +10,7 @@ import requests
 from typing import Dict, List, Optional
 from enum import Enum
 from abc import ABC, abstractmethod
+from anthropic import Anthropic, APIError
 
 
 class LLMProvider(Enum):
@@ -17,6 +18,7 @@ class LLMProvider(Enum):
     OLLAMA = "ollama"
     DEEPSEEK_CLOUD = "deepseek_cloud"
     GROK = "grok"
+    ANTHROPIC = "anthropic"
 
 
 class BaseLLMProvider(ABC):
@@ -318,6 +320,74 @@ class GrokProvider(BaseLLMProvider):
             return ""
 
 
+class AnthropicProvider(BaseLLMProvider):
+    """Anthropic Claude API provider"""
+    
+    def __init__(self, api_key: str, base_url: Optional[str] = None, max_output_tokens: int = 4096):
+        if not api_key:
+            raise ValueError("Anthropic API key is required")
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = Anthropic(**client_kwargs)
+        self.max_output_tokens = max_output_tokens
+    
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float = 0.3,
+        top_p: float = 0.9,
+        stream: bool = False,
+        timeout: Optional[int] = None,
+        max_tokens: Optional[int] = None
+    ) -> str:
+        """Call Anthropic Claude API."""
+        system_prompt: Optional[str] = None
+        formatted_messages: List[Dict[str, object]] = []
+        
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "system":
+                system_prompt = content
+                continue
+            anthropic_role = "user" if role == "user" else "assistant"
+            formatted_messages.append({
+                "role": anthropic_role,
+                "content": [{"type": "text", "text": content}],
+            })
+        
+        output_tokens = max_tokens or self.max_output_tokens
+        
+        try:
+            if stream:
+                # Streaming not yet implemented; fall back to non-streaming call
+                stream = False
+            
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=output_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                system=system_prompt,
+                messages=formatted_messages,
+                timeout=timeout
+            )
+            
+            contents = []
+            for block in getattr(response, "content", []):
+                if getattr(block, "type", None) == "text":
+                    contents.append(block.text)
+            return "".join(contents)
+        except APIError as e:
+            print(f"Error calling Anthropic: {e}")
+            return ""
+        except Exception as e:
+            print(f"Unexpected error calling Anthropic: {e}")
+            return ""
+
+
 def get_provider(provider_type: str, **kwargs) -> BaseLLMProvider:
     """
     Factory function to get the appropriate provider
@@ -354,6 +424,14 @@ def get_provider(provider_type: str, **kwargs) -> BaseLLMProvider:
         base_url = kwargs.get("base_url", "https://api.x.ai")
         return GrokProvider(api_key=api_key or "", base_url=base_url, use_kong=use_kong, kong_api_key=kong_api_key)
     
+    elif provider_type == LLMProvider.ANTHROPIC.value:
+        api_key = kwargs.get("api_key")
+        if not api_key:
+            raise ValueError("Anthropic API key is required")
+        base_url = kwargs.get("base_url")
+        max_output_tokens = kwargs.get("max_output_tokens", 4096)
+        return AnthropicProvider(api_key=api_key, base_url=base_url, max_output_tokens=max_output_tokens)
+    
     else:
-        raise ValueError(f"Unknown provider type: {provider_type}. Supported: ollama, deepseek_cloud, grok")
+        raise ValueError(f"Unknown provider type: {provider_type}. Supported: ollama, deepseek_cloud, grok, anthropic")
 

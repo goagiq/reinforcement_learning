@@ -6,8 +6,10 @@ import TradingPanel from './TradingPanel'
 import MonitoringPanel from './MonitoringPanel'
 import SettingsPanel from './SettingsPanel'
 import ScenarioSimulationPanel from './ScenarioSimulationPanel'
-import { Activity, Brain, TrendingUp, Play, Settings, BarChart3, TestTube } from 'lucide-react'
+import MarkovAnalysisPanel from './MarkovAnalysisPanel'
+import { Activity, Brain, TrendingUp, Play, Settings, BarChart3, TestTube, PieChart } from 'lucide-react'
 import { getDefaultModel, isDefaultModel } from '../utils/modelUtils'
+import CapabilityExplainer from './CapabilityExplainer'
 
 const Dashboard = ({ onSetupChange }) => {
   const [activeTab, setActiveTab] = useState('overview')
@@ -213,6 +215,7 @@ const Dashboard = ({ onSetupChange }) => {
     { id: 'training', label: 'Training', icon: Brain },
     { id: 'backtest', label: 'Backtest', icon: BarChart3 },
     { id: 'scenarios', label: 'Scenarios', icon: TestTube },
+    { id: 'analytics', label: 'Analytics', icon: PieChart },
     { id: 'trading', label: 'Trading', icon: Play },
     { id: 'monitoring', label: 'Monitoring', icon: TrendingUp },
   ]
@@ -311,7 +314,18 @@ const Dashboard = ({ onSetupChange }) => {
             </div>
 
             <div className="bg-white rounded-lg shadow p-6">
-              <h2 className="text-xl font-bold text-gray-800 mb-4">Quick Start</h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-bold text-gray-800">Quick Start</h2>
+                <CapabilityExplainer
+                  capabilityId="overview.quick_start"
+                  context={{
+                    trainedModelCount: models.filter(m => m.type === 'trained' || !m.type).length,
+                    hasMonitoring: Boolean(performance),
+                    activeNotifications: notifications.length,
+                  }}
+                  variant="badge"
+                />
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="p-4 border rounded-lg hover:border-primary-500 transition-colors">
                   <div className="font-semibold text-gray-800 mb-2">1. Train Model</div>
@@ -545,6 +559,10 @@ const Dashboard = ({ onSetupChange }) => {
 
         {activeTab === 'scenarios' && (
           <ScenarioSimulationPanel />
+        )}
+
+        {activeTab === 'analytics' && (
+          <MarkovAnalysisPanel />
         )}
 
         {activeTab === 'trading' && (

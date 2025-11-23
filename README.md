@@ -42,15 +42,41 @@ pip install -r requirements.txt
 
 ### 2. Install PyTorch with CUDA (GPU Users)
 
-If you have an NVIDIA GPU, install the CUDA version of PyTorch:
+**Using uv (Recommended):**
+
+The `pyproject.toml` is configured to automatically prefer CUDA builds. Simply run:
 
 ```bash
-# For CUDA 11.8
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# For CUDA 12.1
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Sync dependencies - will automatically install CUDA versions
+uv sync
 ```
+
+If CPU-only PyTorch is installed, run the setup script:
+
+```powershell
+# Windows
+.\setup_cuda_pytorch.ps1
+```
+
+**Using pip:**
+
+If you're using pip instead of uv:
+
+```bash
+# For CUDA 12.1 (recommended)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# For CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+**Verify CUDA Installation:**
+
+```bash
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('PyTorch:', torch.__version__)"
+```
+
+Should show `CUDA available: True` and PyTorch version with `+cu121` (not `+cpu`).
 
 ### 3. Setup Ollama and DeepSeek
 

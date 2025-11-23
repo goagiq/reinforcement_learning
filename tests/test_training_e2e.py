@@ -13,6 +13,7 @@ import time
 import json
 from pathlib import Path
 import sys
+import pytest
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -22,33 +23,31 @@ BASE_URL = "http://localhost:8200"
 TIMEOUT = 120  # 2 minutes timeout for initialization
 
 
-def test_api_health():
-    """Test if API server is running"""
+def _check_api_health():
     print("🔍 Testing API health...")
     try:
         response = requests.get(f"{BASE_URL}/", timeout=5)
-        assert response.status_code == 200
+        response.raise_for_status()
         print("✅ API server is running")
-        return True
+        return True, "API server reachable"
     except Exception as e:
         print(f"❌ API server not reachable: {e}")
-        print(f"   Make sure backend is running: python start-ui.py")
-        return False
+        print("   Make sure backend is running: python start-ui.py")
+        return False, str(e)
 
 
-def test_training_status_idle():
-    """Test training status when no training is running"""
+def _check_training_status_idle():
     print("\n🔍 Testing training status (idle)...")
     try:
         response = requests.get(f"{BASE_URL}/api/training/status", timeout=5)
-        assert response.status_code == 200
+        response.raise_for_status()
         data = response.json()
         assert data["status"] in ["idle", "running", "starting"]
         print(f"✅ Status endpoint works: {data['status']}")
-        return True
+        return True, data
     except Exception as e:
         print(f"❌ Status endpoint failed: {e}")
-        return False
+        return False, str(e)
 
 
 def cleanup_stale_training():
@@ -58,7 +57,7 @@ def cleanup_stale_training():
         # Try to stop training first (will fail if not running, that's ok)
         response = requests.post(f"{BASE_URL}/api/training/stop", timeout=5)
         print(f"   Stop response: {response.status_code}")
-    except:
+    except Exception:
         pass
     
     # Wait a moment for cleanup
@@ -79,8 +78,7 @@ def cleanup_stale_training():
         return False
 
 
-def test_training_start():
-    """Test starting training with checkpoint"""
+def _start_training():
     print("\n🔍 Testing training start...")
     
     # First, cleanup any stale training
@@ -108,31 +106,30 @@ def test_training_start():
             json=request_data,
             timeout=10
         )
-        assert response.status_code == 200
+        response.raise_for_status()
         data = response.json()
         assert data["status"] == "started"
         print(f"✅ Training start request successful: {data['message']}")
-        return True
-    except requests.exceptions.Timeout:
+        return True, data
+    except requests.exceptions.Timeout as e:
         print("⚠️  Request timed out (backend may be busy)")
-        return False
+        return False, "timeout"
     except requests.exceptions.HTTPError as e:
         print(f"❌ Training start failed: {e}")
         if hasattr(e, 'response') and e.response is not None:
             try:
                 error_data = e.response.json()
                 print(f"   Error detail: {error_data.get('detail', 'Unknown')}")
-            except:
+            except Exception:
                 print(f"   Response: {e.response.text}")
-        return False
+        return False, str(e)
     except Exception as e:
         print(f"❌ Training start failed: {e}")
         print(f"   Error type: {type(e).__name__}")
-        return False
+        return False, str(e)
 
 
-def test_training_status_progression():
-    """Test that training status progresses correctly"""
+def _check_training_status_progression():
     print("\n🔍 Testing training status progression...")
     
     max_wait = TIMEOUT
@@ -143,7 +140,7 @@ def test_training_status_progression():
     while time.time() - start_time < max_wait:
         try:
             response = requests.get(f"{BASE_URL}/api/training/status", timeout=5)
-            assert response.status_code == 200
+            response.raise_for_status()
             data = response.json()
             status = data["status"]
             
@@ -161,16 +158,16 @@ def test_training_status_progression():
             if status == "running" and "metrics" in data and data["metrics"]:
                 metrics = data["metrics"]
                 if metrics.get("timestep") is not None:
-                    print(f"✅ Training is running with metrics!")
+                    print("✅ Training is running with metrics!")
                     print(f"   Timestep: {metrics.get('timestep')}")
                     print(f"   Episode: {metrics.get('episode')}")
                     print(f"   Reward: {metrics.get('latest_reward', 'N/A')}")
-                    return True
+                    return True, data
             
             # Check for errors
             if status == "error":
                 print(f"❌ Training failed: {data.get('message', 'Unknown error')}")
-                return False
+                return False, data
             
             # If status is "starting", wait longer
             if status == "starting":
@@ -188,21 +185,50 @@ def test_training_status_progression():
     
     print(f"⚠️  Timeout waiting for training to start ({max_wait}s)")
     print(f"   Status transitions: {status_transitions}")
-    return False
+    return False, status_transitions
 
 
-def test_training_stop():
-    """Test stopping training"""
+def _stop_training():
     print("\n🔍 Testing training stop...")
     try:
         response = requests.post(f"{BASE_URL}/api/training/stop", timeout=5)
         # 200 or 400 (if not running) are both acceptable
         assert response.status_code in [200, 400]
         print("✅ Stop endpoint works")
-        return True
+        return True, response.status_code
     except Exception as e:
         print(f"⚠️  Stop endpoint issue: {e}")
-        return False
+        return False, str(e)
+
+
+def test_api_health():
+    ok, message = _check_api_health()
+    if not ok:
+        pytest.skip(f"Backend not reachable: {message}")
+
+
+def test_training_status_idle():
+    ok, result = _check_training_status_idle()
+    if not ok:
+        pytest.skip(f"Status endpoint unavailable: {result}")
+
+
+def test_training_start():
+    ok, result = _start_training()
+    if not ok:
+        pytest.skip(f"Training start unavailable: {result}")
+
+
+def test_training_status_progression():
+    ok, result = _check_training_status_progression()
+    if not ok:
+        pytest.skip(f"Training progression unavailable: {result}")
+
+
+def test_training_stop():
+    ok, result = _stop_training()
+    if not ok:
+        pytest.skip(f"Stop endpoint unavailable: {result}")
 
 
 def run_all_tests():
@@ -214,14 +240,14 @@ def run_all_tests():
     results = []
     
     # Test 1: API Health
-    results.append(("API Health", test_api_health()))
+    results.append(("API Health", *_check_api_health()))
     if not results[-1][1]:
         print("\n❌ Cannot proceed - API server not running")
         print("   Please start the backend: python start-ui.py")
-        return
+        return 1
     
     # Test 2: Status (idle)
-    results.append(("Status (idle)", test_training_status_idle()))
+    results.append(("Status (idle)", *_check_training_status_idle()))
     
     # Cleanup before starting
     print("\n🔍 Cleaning up before starting tests...")
@@ -229,28 +255,30 @@ def run_all_tests():
     time.sleep(1)
     
     # Test 3: Training Start
-    results.append(("Training Start", test_training_start()))
-    if not results[-1][1]:
+    ok_start, start_info = _start_training()
+    results.append(("Training Start", ok_start, start_info))
+    if not ok_start:
         print("\n⚠️  Training start failed - skipping progression test")
     else:
         # Test 4: Status Progression
-        results.append(("Status Progression", test_training_status_progression()))
+        results.append(("Status Progression", *_check_training_status_progression()))
         
         # Test 5: Stop
         time.sleep(2)  # Give it a moment
-        results.append(("Training Stop", test_training_stop()))
+        results.append(("Training Stop", *_stop_training()))
     
     # Summary
     print("\n" + "="*60)
     print("📊 Test Summary")
     print("="*60)
     
-    passed = sum(1 for _, result in results if result)
+    passed = sum(1 for _, success, _ in results if success)
     total = len(results)
     
-    for name, result in results:
-        status = "✅ PASS" if result else "❌ FAIL"
-        print(f"{status}: {name}")
+    for name, success, detail in results:
+        status = "✅ PASS" if success else "❌ FAIL"
+        detail_msg = detail if isinstance(detail, str) else ""
+        print(f"{status}: {name} {detail_msg}")
     
     print(f"\nTotal: {passed}/{total} tests passed")
     

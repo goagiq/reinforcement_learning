@@ -49,8 +49,12 @@ class BaseSwarmAgent:
         if reasoning_engine is None:
             # Get provider config from shared context or config
             provider_config = self.config.get("reasoning", {})
-            import os
-            api_key = provider_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
+            api_key = (
+                provider_config.get("api_key")
+                or os.getenv("ANTHROPIC_API_KEY")
+                or os.getenv("DEEPSEEK_API_KEY")
+                or os.getenv("GROK_API_KEY")
+            )
             
             # Kong Gateway configuration
             use_kong = provider_config.get("use_kong", False)
@@ -71,12 +75,16 @@ class BaseSwarmAgent:
         
         # Get model configuration from config
         provider_config = self.config.get("reasoning", {})
-        provider_type = provider_config.get("provider", "anthropic").lower()
+        model_name = provider_config.get("model")
+        provider_type = provider_config.get("provider")
+        if not provider_type:
+            provider_type = self._infer_provider_from_model(model_name)
+        provider_type = provider_type.lower()
         
         # Create model based on provider type
         if provider_type == "ollama":
             # Ollama configuration
-            model_name = provider_config.get("model", "deepseek-r1:8b")
+            model_name = model_name or "deepseek-r1:8b"
             base_url = provider_config.get("base_url") or "http://localhost:11434"
             
             # Allow skipping connection check for tests
@@ -95,7 +103,7 @@ class BaseSwarmAgent:
             
         elif provider_type == "anthropic":
             # Anthropic configuration
-            model_name = provider_config.get("model", "claude-sonnet-4-20250514")
+            model_name = model_name or "claude-sonnet-4-20250514"
             
             # Get API key from environment or config
             api_key = provider_config.get("api_key") or os.getenv("ANTHROPIC_API_KEY")
@@ -192,4 +200,21 @@ class BaseSwarmAgent:
     def get_agent(self) -> Agent:
         """Get the underlying Strands Agent instance."""
         return self.agent
+    
+    @staticmethod
+    def _infer_provider_from_model(model_name: Optional[str]) -> str:
+        """
+        Infer provider type from model name when provider is not explicitly set.
+        
+        Args:
+            model_name: The model identifier from config.
+        
+        Returns:
+            Provider type string.
+        """
+        if isinstance(model_name, str):
+            lower_model = model_name.lower()
+            if "claude" in lower_model or "anthropic" in lower_model:
+                return "anthropic"
+        return "ollama"
 

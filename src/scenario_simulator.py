@@ -12,17 +12,18 @@ Veteran Futures Trader Approach:
 - Validate strategy robustness
 """
 
+import logging
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from enum import Enum
-import warnings
 import os
 import yaml
 from pathlib import Path
-warnings.filterwarnings('ignore')
+
+logger = logging.getLogger(__name__)
 
 
 class MarketRegime(Enum):
@@ -583,8 +584,7 @@ class ScenarioSimulator:
                 
             except Exception as e:
                 # If RL agent backtest fails, fall back to simple backtest
-                import warnings
-                warnings.warn(f"RL agent backtest failed: {e}. Falling back to simple backtest.")
+                logger.warning("RL agent backtest failed: %s. Falling back to simple backtest.", e)
                 
                 # Fallback to simple backtest
                 returns = price_data['close'].pct_change().fillna(0)

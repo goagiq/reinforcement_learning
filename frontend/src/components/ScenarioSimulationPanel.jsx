@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import axios from 'axios'
 import { TestTube, AlertTriangle, TrendingUp, BarChart3, Settings } from 'lucide-react'
+import CapabilityExplainer from './CapabilityExplainer'
 
 const ScenarioSimulationPanel = () => {
   const [loading, setLoading] = useState(false)
@@ -111,10 +112,25 @@ const ScenarioSimulationPanel = () => {
 
   return (
     <div className="bg-white rounded-lg shadow-md p-6">
-      <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
-        <TestTube className="w-5 h-5 text-orange-600" />
-        Scenario Simulation & Robustness Testing
-      </h3>
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-lg font-semibold flex items-center gap-2 text-gray-800">
+          <TestTube className="w-5 h-5 text-orange-600" />
+          Scenario Simulation & Robustness Testing
+        </h3>
+        <CapabilityExplainer
+          capabilityId="scenarios.guidance"
+          context={{
+            testType,
+            robustnessScenarios,
+            stressScenarios,
+            intensity,
+            stressIntensity,
+            paramName,
+            paramValues,
+            regime,
+          }}
+        />
+      </div>
 
       {/* Test Type Selection */}
       <div className="flex gap-2 mb-4 border-b pb-4">

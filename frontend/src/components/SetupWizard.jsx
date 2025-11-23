@@ -11,21 +11,51 @@ const SetupWizard = ({ setupStatus, onSetupComplete }) => {
 
   useEffect(() => {
     // Connect to WebSocket for real-time updates
-    const websocket = new WebSocket(`ws://${window.location.hostname}:8200/ws`)
+    // Use proxy if available (Vite dev server), otherwise direct connection
+    const wsUrl = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      ? `ws://${window.location.hostname}:8200/ws`
+      : `/ws`  // Use proxy in production
     
-    websocket.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      setMessages(prev => [...prev, data])
-    }
+    let websocket
+    try {
+      websocket = new WebSocket(wsUrl)
+      
+      websocket.onopen = () => {
+        console.log('WebSocket connected to backend')
+      }
+      
+      websocket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          setMessages(prev => [...prev, data])
+        } catch (error) {
+          console.error('Failed to parse WebSocket message:', error)
+        }
+      }
 
-    websocket.onerror = (error) => {
-      console.error('WebSocket error:', error)
-    }
+      websocket.onerror = (error) => {
+        console.error('WebSocket error:', error)
+        // Don't show error if backend is not running - it's expected during development
+        if (error.target?.readyState === WebSocket.CONNECTING) {
+          console.warn('WebSocket connection failed - backend may not be running on port 8200')
+        }
+      }
+      
+      websocket.onclose = (event) => {
+        if (event.code !== 1000) {  // 1000 = normal closure
+          console.warn('WebSocket closed unexpectedly:', event.code, event.reason)
+        }
+      }
 
-    setWs(websocket)
+      setWs(websocket)
+    } catch (error) {
+      console.error('Failed to create WebSocket:', error)
+    }
 
     return () => {
-      websocket.close()
+      if (websocket) {
+        websocket.close()
+      }
     }
   }, [])
 

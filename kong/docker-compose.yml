@@ -1,4 +1,5 @@
-version: '3.8'
+# Note: version field removed - obsolete in newer Docker Compose versions
+# Docker Compose v2+ automatically detects the compose file format
 
 services:
   postgres:
@@ -21,7 +22,7 @@ services:
       - kong-net
 
   kong-migrations:
-    image: kong:3.5
+    image: kong:3.7
     container_name: kong-migrations
     command: kong migrations bootstrap
     environment:
@@ -39,7 +40,7 @@ services:
     restart: on-failure
 
   kong:
-    image: kong:3.5
+    image: kong:3.7
     container_name: kong-gateway
     environment:
       KONG_DATABASE: postgres

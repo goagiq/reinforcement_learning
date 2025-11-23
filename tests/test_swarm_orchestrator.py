@@ -89,7 +89,11 @@ class TestSwarmOrchestrator:
         )
         
         assert orchestrator.is_enabled() is True
-        assert len(orchestrator.agents) == 4
+        expected_agents = 5
+        elliott_cfg = test_config.get("agentic_swarm", {}).get("elliott_wave")
+        if elliott_cfg is None or elliott_cfg.get("enabled", True):
+            expected_agents += 1
+        assert len(orchestrator.agents) == expected_agents
         assert orchestrator.shared_context is not None
     
     @patch('src.agentic_swarm.swarm_orchestrator.MarketDataProvider')
@@ -203,7 +207,11 @@ class TestSwarmOrchestrator:
         
         assert "enabled" in status
         assert "agents_initialized" in status
-        assert status["agent_count"] == 4
+        expected_agents = 5
+        elliott_cfg = test_config.get("agentic_swarm", {}).get("elliott_wave")
+        if elliott_cfg is None or elliott_cfg.get("enabled", True):
+            expected_agents += 1
+        assert status["agent_count"] == expected_agents
         assert status["execution_count"] == 0
 
 

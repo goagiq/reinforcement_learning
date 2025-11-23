@@ -10,6 +10,8 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
   const [contrarianEnabled, setContrarianEnabled] = useState(true)
   const [loading, setLoading] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [aiInsightsEnabled, setAiInsightsEnabled] = useState(false)
+  const [aiTooltipsEnabled, setAiTooltipsEnabled] = useState(false)
 
   useEffect(() => {
     if (isOpen) {
@@ -19,6 +21,10 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
       setDefaultModel(savedDefault)
       setNt8DataPath(savedNt8Path)
       setSaved(false)
+      const storedInsights = localStorage.getItem('aiInsightsEnabled')
+      const storedTooltips = localStorage.getItem('aiTooltipsEnabled')
+      setAiInsightsEnabled(storedInsights === 'true')
+      setAiTooltipsEnabled(storedTooltips === 'true')
       
       // Also try to load from backend settings.json
       fetch('/api/settings/get')
@@ -41,6 +47,12 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
           } else {
             setContrarianEnabled(true)
           }
+          if (data.ai_insights_enabled !== undefined) {
+            setAiInsightsEnabled(Boolean(data.ai_insights_enabled))
+          }
+          if (data.ai_tooltips_enabled !== undefined) {
+            setAiTooltipsEnabled(Boolean(data.ai_tooltips_enabled))
+          }
         })
         .catch(() => {
           // Ignore if endpoint doesn't exist yet
@@ -52,6 +64,8 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
     // Save to localStorage
     localStorage.setItem('defaultModel', defaultModel)
     localStorage.setItem('nt8DataPath', nt8DataPath)
+    localStorage.setItem('aiInsightsEnabled', aiInsightsEnabled ? 'true' : 'false')
+    localStorage.setItem('aiTooltipsEnabled', aiTooltipsEnabled ? 'true' : 'false')
     
     // Save settings to backend
     try {
@@ -59,8 +73,10 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
         nt8_data_path: nt8DataPath || null,
         performance_mode: performanceMode,
         turbo_training_mode: turboTrainingMode,
-      auto_retrain_enabled: autoRetrainEnabled,
-      contrarian_enabled: contrarianEnabled
+        auto_retrain_enabled: autoRetrainEnabled,
+        contrarian_enabled: contrarianEnabled,
+        ai_insights_enabled: aiInsightsEnabled,
+        ai_tooltips_enabled: aiTooltipsEnabled,
       }
       
       console.log('[SettingsPanel] Saving settings:', settingsPayload)
@@ -83,6 +99,7 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
     
     // Dispatch custom event to notify other components in the same window
     window.dispatchEvent(new Event('defaultModelChanged'))
+    window.dispatchEvent(new Event('aiSettingsUpdated'))
     setSaved(true)
     setTimeout(() => {
       setSaved(false)
@@ -229,6 +246,54 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
                 </p>
               </div>
             )}
+          </div>
+
+          {/* AI Assistance Toggles */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-2">
+                AI Detailed Insights
+              </label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="aiInsightsEnabled"
+                  checked={aiInsightsEnabled}
+                  onChange={(e) => setAiInsightsEnabled(e.target.checked)}
+                  className="w-5 h-5 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
+                />
+                <label htmlFor="aiInsightsEnabled" className="text-sm text-gray-700 cursor-pointer">
+                  Enable AI-generated comprehensive summaries (drawer view)
+                </label>
+              </div>
+              <p className="text-sm text-gray-500 mt-2">
+                {aiInsightsEnabled
+                  ? '✅ Summaries enabled: sections can request detailed AI analyses. Expect additional GPU/LLM usage.'
+                  : '❌ Summaries disabled: AI explainers will not run. Turn on after upgrading your system.'}
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-2">
+                AI Tooltips
+              </label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="aiTooltipsEnabled"
+                  checked={aiTooltipsEnabled}
+                  onChange={(e) => setAiTooltipsEnabled(e.target.checked)}
+                  className="w-5 h-5 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
+                />
+                <label htmlFor="aiTooltipsEnabled" className="text-sm text-gray-700 cursor-pointer">
+                  Enable hover tooltips powered by AI
+                </label>
+              </div>
+              <p className="text-sm text-gray-500 mt-2">
+                {aiTooltipsEnabled
+                  ? '✅ Tooltips enabled: short AI notes appear on hover.'
+                  : '❌ Tooltips disabled: only static UI hints will show.'}
+              </p>
+            </div>
           </div>
 
           {/* Auto-Retrain Toggle */}

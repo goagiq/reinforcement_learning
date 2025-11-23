@@ -44,6 +44,17 @@ class SwarmConfigLoader:
                 "newsapi_key": None,
                 "sentiment_window": 3600
             },
+            "elliott_wave": {
+                "enabled": True,
+                "instrument": "ES",
+                "timeframes": [1, 5, 15],
+                "lookback_bars": 400,
+                "min_bars": 120,
+                "min_confidence": 0.55,
+                "swing_threshold": 0.003,
+                "position_multiplier": 0.6,
+                "max_position_size": 0.8
+            },
             "analyst": {
                 "deep_reasoning": True,
                 "conflict_detection": True
@@ -59,7 +70,7 @@ class SwarmConfigLoader:
         merged.update(swarm_config)
         
         # Deep merge nested configs
-        for key in ["market_research", "sentiment", "analyst", "recommendation"]:
+        for key in ["market_research", "sentiment", "elliott_wave", "analyst", "recommendation"]:
             if key in swarm_config:
                 merged[key] = {**defaults.get(key, {}), **swarm_config[key]}
         

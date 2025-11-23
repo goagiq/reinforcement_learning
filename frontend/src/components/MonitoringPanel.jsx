@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import axios from 'axios'
 import { TrendingUp, TrendingDown, DollarSign, BarChart3, RefreshCw } from 'lucide-react'
+import CapabilityExplainer from './CapabilityExplainer'
 
 const MonitoringPanel = () => {
   const [performance, setPerformance] = useState(null)
@@ -52,7 +53,16 @@ const MonitoringPanel = () => {
     <div className="space-y-6">
       {/* Header */}
       <div className="bg-white rounded-lg shadow p-6 flex items-center justify-between">
-        <h2 className="text-2xl font-bold text-gray-800">Performance Monitoring</h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-2xl font-bold text-gray-800">Performance Monitoring</h2>
+          <CapabilityExplainer
+            capabilityId="monitoring.performance"
+            context={{
+              metrics: performance,
+              lastUpdated: lastUpdated?.toISOString(),
+            }}
+          />
+        </div>
         <div className="flex items-center gap-4">
           {lastUpdated && (
             <span className="text-sm text-gray-500">

@@ -13,12 +13,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+import importlib.util
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.scenario_simulator import ScenarioSimulator, MarketRegime
+
+HAS_GYMNASIUM = importlib.util.find_spec("gymnasium") is not None
 
 
 class TestRLAgentIntegration:
@@ -262,6 +265,7 @@ class TestDowntrendRiskManagement:
 class TestAPIIntegration:
     """Test API endpoint integration"""
     
+    @pytest.mark.skipif(not HAS_GYMNASIUM, reason="Gymnasium required for RL scenario API tests")
     def test_scenario_request_model(self):
         """Test ScenarioSimulationRequest model"""
         from src.api_server import ScenarioSimulationRequest

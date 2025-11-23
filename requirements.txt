@@ -1,8 +1,13 @@
 # NT8 RL Trading Strategy - Python Dependencies
 
 # Core ML/RL Framework
-torch>=2.0.0                    # PyTorch (install CUDA version if GPU available)
-torchvision>=0.15.0             # Additional PyTorch utilities
+# NOTE: CUDA-enabled PyTorch is configured in pyproject.toml
+# The pyproject.toml uses extra-index-url to prefer CUDA builds (cu121)
+# When using uv: `uv sync` will automatically install CUDA versions
+# When using pip: `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
+torch>=2.5.0                    # PyTorch (CUDA builds preferred via pyproject.toml config)
+torchvision>=0.20.0             # Additional PyTorch utilities (CUDA builds preferred)
+torchaudio>=2.5.0               # PyTorch audio (CUDA builds preferred)
 gymnasium>=0.29.0              # RL environment interface (successor to OpenAI Gym)
 stable-baselines3>=2.0.0       # Pre-built RL algorithms (PPO, DQN, SAC, etc.)
 sb3-contrib>=2.0.0             # Additional SB3 algorithms
@@ -15,7 +20,9 @@ scipy>=1.11.0                  # Scientific computing (required for Monte Carlo 
 
 # Technical Analysis
 ta>=0.10.2                     # Technical analysis indicators
-pandas-ta>=0.3.14b            # Additional technical analysis
+# pandas-ta>=0.3.14b            # Additional technical analysis
+# NOTE: pandas-ta requires numba, which doesn't support Python 3.14
+# Uncomment if using Python <3.14, or install manually: pip install pandas-ta
 
 # Communication
 requests>=2.31.0               # HTTP requests (Ollama API)

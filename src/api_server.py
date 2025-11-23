@@ -265,8 +265,14 @@ async def broadcast_message(message: Dict):
         except:
             disconnected.append(ws)
     
+    # Safely remove disconnected websockets
     for ws in disconnected:
-        websocket_connections.remove(ws)
+        try:
+            if ws in websocket_connections:
+                websocket_connections.remove(ws)
+        except (ValueError, RuntimeError):
+            # Already removed or list modified - ignore
+            pass
 
 
 # Routes
@@ -1810,7 +1816,7 @@ async def run_backtest(request: BacktestRequest, background_tasks: BackgroundTas
                 "message": "Backtest running..."
             })
             
-            results = backtester.run(episodes=request.episodes)
+            results = backtester.run_backtest(n_episodes=request.episodes)
             
             await broadcast_message({
                 "type": "backtest",

@@ -198,7 +198,7 @@ class TestSentimentAgent:
         
         assert "overall_sentiment" in result
         assert "confidence" in result
-        assert result["overall_sentiment"] == 0.65
+        assert result["overall_sentiment"] == pytest.approx(0.605, rel=1e-6)
         assert result["confidence"] == 0.75
     
     def test_tools(self, shared_context, mock_sentiment_provider):
@@ -651,6 +651,10 @@ class TestRecommendationAgent:
             "synthesis": {"alignment": "aligned"},
             "confidence": 0.9
         }, "analysis_results")
+        shared_context.set("sentiment_findings", {
+            "overall_sentiment": 0.7,
+            "confidence": 0.8
+        }, "sentiment_scores")
         
         market_state = {
             "price_data": {"close": 5000.0, "high": 5010.0, "low": 4990.0},

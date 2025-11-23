@@ -112,6 +112,7 @@ Format your recommendation with:
             research_findings = self.shared_context.get("market_research_findings", "research_findings")
             sentiment_findings = self.shared_context.get("sentiment_findings", "sentiment_scores")
             contrarian_analysis = self.shared_context.get("contrarian_analysis", "contrarian_signals")
+            elliott_analysis = self.shared_context.get("elliott_wave_analysis", "analysis_results")
             
             # Synthesize recommendation
             recommendation = self._synthesize_recommendation(
@@ -120,7 +121,8 @@ Format your recommendation with:
                 sentiment_findings,
                 rl_recommendation,
                 market_state,
-                contrarian_analysis
+                contrarian_analysis,
+                elliott_analysis
             )
             
             # Apply risk management
@@ -179,7 +181,8 @@ Format your recommendation with:
         sentiment_findings: Optional[Dict[str, Any]],
         rl_recommendation: Optional[Dict[str, Any]],
         market_state: Dict[str, Any],
-        contrarian_analysis: Optional[Dict[str, Any]] = None
+        contrarian_analysis: Optional[Dict[str, Any]] = None,
+        elliott_analysis: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Synthesize recommendation from all inputs."""
         # Default recommendation
@@ -219,10 +222,10 @@ Format your recommendation with:
             recommendation["action"] = "HOLD"
             recommendation["position_size"] = 0.0
             recommendation["reasoning"] = "Conflicting signals detected - holding position"
-        elif rl_confidence > 0.7 and rl_action != "HOLD":
+        elif rl_confidence > 0.5 and rl_action != "HOLD":
             # High RL confidence - follow RL but reduce size due to conflicts
             recommendation["action"] = rl_action
-            recommendation["position_size"] = rl_confidence * 0.6  # Reduced due to conflicts
+            recommendation["position_size"] = rl_confidence * 0.7  # Reduced due to conflicts
         else:
             # Default to HOLD
             recommendation["action"] = "HOLD"
@@ -241,6 +244,17 @@ Format your recommendation with:
                 contrarian_analysis
             )
         
+        if elliott_analysis:
+            recommendation = self._apply_elliott_influence(
+                recommendation,
+                elliott_analysis
+            )
+            recommendation["elliott_wave"] = elliott_analysis
+            recommendation["elliott_wave_action"] = elliott_analysis.get("action", "HOLD")
+            recommendation["elliott_wave_confidence"] = elliott_analysis.get("confidence", 0.0)
+            recommendation["elliott_wave_phase"] = elliott_analysis.get("phase")
+            recommendation["elliott_wave_bias"] = elliott_analysis.get("bias")
+        
         # Build reasoning
         reasoning_parts = []
         if alignment != "unknown":
@@ -254,8 +268,71 @@ Format your recommendation with:
             contrarian_conf = contrarian_analysis.get("contrarian_confidence", 0.0)
             market_condition = contrarian_analysis.get("market_condition", "NEUTRAL")
             reasoning_parts.append(f"Contrarian: {market_condition} -> {contrarian_signal} (confidence: {contrarian_conf:.2f})")
+        if elliott_analysis:
+            ew_action = elliott_analysis.get("action", "HOLD")
+            ew_conf = elliott_analysis.get("confidence", 0.0)
+            ew_phase = elliott_analysis.get("phase")
+            reasoning_parts.append(
+                f"Elliott Wave: {ew_action} (phase: {ew_phase}, confidence: {ew_conf:.2f})"
+            )
         
         recommendation["reasoning"] = "; ".join(reasoning_parts) if reasoning_parts else "Insufficient data"
+        
+        return recommendation
+    
+    def _apply_elliott_influence(
+        self,
+        recommendation: Dict[str, Any],
+        elliott_analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Blend Elliott Wave agent signal into the recommendation.
+
+        Prefers alignment with the existing action; when the base plan is HOLD,
+        the Elliott signal can promote a trade if confidence surpasses the
+        configured minimum.
+        """
+        elliott_action = elliott_analysis.get("action", "HOLD")
+        elliott_confidence = elliott_analysis.get("confidence", 0.0)
+        elliott_position = elliott_analysis.get("position_size", 0.0)
+        elliott_phase = elliott_analysis.get("phase")
+        min_conf = elliott_analysis.get("min_confidence", 0.55)
+        
+        if elliott_action not in {"BUY", "SELL"} or elliott_confidence < min_conf:
+            return recommendation
+
+        current_action = recommendation.get("action", "HOLD")
+        if current_action == "HOLD":
+            recommendation["action"] = elliott_action
+            recommendation["position_size"] = max(
+                recommendation.get("position_size", 0.0),
+                elliott_position
+            )
+            recommendation["confidence"] = max(
+                recommendation.get("confidence", 0.0),
+                elliott_confidence
+            )
+            recommendation["reasoning"] = (
+                f"Elliott Wave {elliott_phase} signal adopted (confidence {elliott_confidence:.2f})"
+            )
+        elif current_action == elliott_action:
+            recommendation["position_size"] = max(
+                recommendation.get("position_size", 0.0),
+                elliott_position
+            )
+            recommendation["confidence"] = max(
+                recommendation.get("confidence", 0.0),
+                elliott_confidence
+            )
+        else:
+            recommendation.setdefault("warnings", []).append(
+                f"Elliott Wave {elliott_phase} favors {elliott_action} "
+                f"with confidence {elliott_confidence:.2f}"
+            )
+            recommendation["confidence"] = max(
+                recommendation.get("confidence", 0.0),
+                elliott_confidence * 0.6
+            )
         
         return recommendation
     
@@ -332,7 +409,12 @@ Format your recommendation with:
             result = self.risk_manager.validate_action(
                 target_position=action_value,
                 current_position=current_position,
-                market_data=market_data_dict
+                market_data=market_data_dict,
+                current_price=market_state.get("price_data", {}).get("close"),
+                decision_context={
+                    "source": "swarm_recommendation"
+                },
+                instrument=market_state.get("instrument", "default")
             )
             
             # Handle tuple return (position, monte_carlo_result)

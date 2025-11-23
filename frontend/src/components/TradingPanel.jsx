@@ -4,6 +4,7 @@ import { Play, Square, Loader, CheckCircle, AlertCircle, Server } from 'lucide-r
 import { getDefaultModel, sortModelsWithDefaultFirst, isDefaultModel } from '../utils/modelUtils'
 import MonteCarloRiskPanel from './MonteCarloRiskPanel'
 import VolatilityPanel from './VolatilityPanel'
+import CapabilityExplainer from './CapabilityExplainer'
 
 const TradingPanel = ({ models }) => {
   const [selectedModel, setSelectedModel] = useState('')
@@ -303,7 +304,18 @@ const TradingPanel = ({ models }) => {
 
       {/* Trading Configuration */}
       <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-2xl font-bold text-gray-800 mb-6">Start Trading</h2>
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-2xl font-bold text-gray-800">Start Trading</h2>
+          <CapabilityExplainer
+            capabilityId="trading.live"
+            context={{
+              selectedModel,
+              paperTrading,
+              bridgeRunning,
+              tradingStatus,
+            }}
+          />
+        </div>
 
         <div className="space-y-6">
           {/* Model Selection */}

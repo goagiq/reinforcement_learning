@@ -146,6 +146,8 @@ class TradingEnvironment(gym.Env):
         self.total_commission_cost = 0.0
         self.last_position_change = 0.0
         self._steps_since_pause = 0  # Reset pause counter
+        self.action_history = []  # Track actions for diversity calculation
+        self.action_history_window = 50  # Use last N actions for diversity
         # Note: recent_trades_pnl persists across episodes for EV calculation
         
         # Stop loss configuration (fixed - not adaptive)
@@ -346,19 +348,46 @@ class TradingEnvironment(gym.Env):
     
     def _calculate_reward(self, prev_pnl: float, current_pnl: float, commission_cost: float = 0.0) -> float:
         """
-        Calculate reward based on NET PnL (after commission) and risk - optimized for profitability
+        Calculate reward based on NET PnL (after commission) - PnL-aligned reward function
         
-        Changes from previous version:
-        1. Uses net PnL (after commission) instead of gross PnL
-        2. Balanced exploration bonus (reduced, only if few trades)
-        3. Reduced loss mitigation (5% instead of 30%)
-        4. Penalizes overtrading
-        5. Checks profit factor requirement
+        CRITICAL FIX: Rewards must align with actual PnL. If PnL is negative, rewards should be negative.
+        Bonuses are minimal and only apply when PnL is already positive.
+        
+        Changes:
+        1. PnL is the PRIMARY signal (90%+ of reward)
+        2. Bonuses only apply when PnL is positive
+        3. Strong penalty when overall PnL is negative
+        4. R:R check - penalize if actual R:R < required R:R
         """
         # Net PnL change (already includes commission deduction)
         net_pnl_change = (current_pnl - prev_pnl) / self.initial_capital
+        total_pnl_normalized = current_pnl / self.initial_capital  # Overall PnL as % of capital
         
-        # Risk penalty (drawdown) - but only penalize significant drawdowns
+        # PRIMARY: PnL change is the main reward signal (90% weight)
+        reward = self.reward_config["pnl_weight"] * net_pnl_change
+        
+        # Calculate actual R:R from recent trades
+        actual_rr_ratio = 0.0
+        if self.state and self.state.trades_count > 10:  # Need enough trades for reliable R:R
+            avg_win = self.state.total_win_pnl / max(1, self.state.winning_trades) if self.state.winning_trades > 0 else 0.0
+            avg_loss = self.state.total_loss_pnl / max(1, self.state.losing_trades) if self.state.losing_trades > 0 else 0.0
+            if avg_loss > 0:
+                actual_rr_ratio = avg_win / avg_loss
+        
+        # CRITICAL: If overall PnL is negative, apply strong penalty
+        if total_pnl_normalized < -0.01:  # More than 1% down
+            # Strong penalty for negative PnL - this ensures rewards align with actual performance
+            pnl_penalty = abs(total_pnl_normalized) * 0.5  # 50% of negative PnL as penalty
+            reward -= pnl_penalty
+        
+        # CRITICAL: If actual R:R < required R:R, apply penalty
+        required_rr = self.min_risk_reward_ratio
+        if actual_rr_ratio > 0 and actual_rr_ratio < required_rr:
+            # Penalize poor R:R - this encourages the agent to achieve better R:R
+            rr_penalty = (required_rr - actual_rr_ratio) / required_rr * 0.1  # Up to 10% penalty
+            reward -= rr_penalty
+        
+        # Risk penalty (drawdown) - minimal, only for significant drawdowns
         current_equity = self.initial_capital + current_pnl
         if current_equity > self.max_equity:
             self.max_equity = current_equity
@@ -367,55 +396,69 @@ class TradingEnvironment(gym.Env):
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
         
-        # Risk penalties (reduced)
-        risk_penalty_coef = self.reward_config.get("risk_penalty", 0.5) * 0.05
-        drawdown_penalty_coef = self.reward_config.get("drawdown_penalty", 0.3) * 0.05
+        # Minimal risk penalties (only for significant drawdowns)
+        if drawdown > 0.10:  # Only penalize if drawdown > 10%
+            risk_penalty_coef = self.reward_config.get("risk_penalty", 0.5) * 0.02  # Very small
+            reward -= risk_penalty_coef * (drawdown - 0.10)  # Only penalize excess above 10%
         
-        # Base reward components - focus on NET PnL (after commission)
-        reward = (
-            self.reward_config["pnl_weight"] * net_pnl_change
-            - risk_penalty_coef * drawdown
-            - drawdown_penalty_coef * max(0, self.max_drawdown - 0.20)
-        )
+        # Action diversity bonus/penalty (MINIMAL - only to prevent saturation)
+        action_diversity_bonus = 0.0
+        if hasattr(self, 'action_value') and hasattr(self, 'action_history'):
+            self.action_history.append(self.action_value)
+            if len(self.action_history) > self.action_history_window:
+                self.action_history.pop(0)
+            
+            # Only apply diversity bonus if PnL is positive (don't mask losses)
+            if total_pnl_normalized > 0 and len(self.action_history) >= 10:
+                action_variance = np.var(self.action_history[-self.action_history_window:])
+                diversity_bonus_scale = self.reward_config.get("action_diversity_bonus", 0.0) * 0.1  # 10% of original
+                action_diversity_bonus = diversity_bonus_scale * action_variance
+                
+                # Constant action penalty (always apply to prevent saturation)
+                if len(self.action_history) >= 20:
+                    recent_actions = self.action_history[-20:]
+                    if len(set([round(a, 2) for a in recent_actions])) <= 2:
+                        constant_penalty_scale = self.reward_config.get("constant_action_penalty", 0.0)
+                        action_diversity_bonus -= constant_penalty_scale * 0.5  # 50% of original
         
-        # BALANCED exploration bonus (reduced, only if few trades)
+        reward += action_diversity_bonus
+        
+        # Exploration bonus (ONLY if PnL is positive and very few trades)
         if self.state and self.reward_config.get("exploration_bonus_enabled", True):
             position_size = abs(self.state.position)
             if position_size > self.action_threshold:
-                # Only apply exploration bonus if we haven't had many trades recently
-                # This balances between encouraging trading and preventing overtrading
-                if self.episode_trades < 5:  # Only if very few trades
-                    exploration_scale = self.reward_config.get("exploration_bonus_scale", 0.00001)
-                    exploration_bonus = exploration_scale * position_size  # 10x reduction from 0.0001
+                # Only apply if PnL is positive AND very few trades
+                if total_pnl_normalized > 0 and self.episode_trades < 3:
+                    exploration_scale = self.reward_config.get("exploration_bonus_scale", 0.00001) * 0.5  # 50% reduction
+                    exploration_bonus = exploration_scale * position_size
                     reward += exploration_bonus
                 
                 # Minimal holding cost
                 holding_cost = self.transaction_cost * 0.0005
                 reward -= holding_cost
             else:
-                # Adaptive inaction penalty (reduced)
-                inaction_penalty = self._get_adaptive_inaction_penalty() * 0.5  # 50% reduction
-                reward -= inaction_penalty
+                # Minimal inaction penalty (only if PnL is positive)
+                if total_pnl_normalized > 0:
+                    inaction_penalty = self._get_adaptive_inaction_penalty() * 0.3  # 30% of original
+                    reward -= inaction_penalty
         
-        # REDUCED loss mitigation (5% instead of 30%)
-        if net_pnl_change < 0:
-            loss_mitigation_coef = self.reward_config.get("loss_mitigation", 0.05)  # 5% mitigation
-            loss_mitigation = abs(net_pnl_change) * loss_mitigation_coef
-            reward += loss_mitigation  # Add back small portion of loss (reduces penalty)
+        # NO loss mitigation - losses should be penalized fully
+        # (Removed loss mitigation to ensure rewards align with PnL)
         
         # Penalize overtrading
         overtrading_penalty = self._calculate_overtrading_penalty()
         reward -= overtrading_penalty
         
-        # Profit factor requirement
-        profit_factor = self._calculate_profit_factor()
-        required_profit_factor = self.reward_config.get("profit_factor_required", 1.0)
-        if profit_factor < required_profit_factor:
-            # Reduce reward if profit factor is below requirement
-            reward *= 0.5  # 50% reduction if unprofitable
+        # Profit factor check - if unprofitable, reduce reward further
+        if self.state and self.state.trades_count > 10:
+            profit_factor = self._calculate_profit_factor()
+            required_profit_factor = self.reward_config.get("profit_factor_required", 1.0)
+            if profit_factor < required_profit_factor:
+                # Strong reduction if unprofitable
+                reward *= 0.3  # 70% reduction (was 50%)
         
-        # Reduced scaling (5x instead of 10x) for more granular learning
-        reward *= 5.0
+        # Moderate scaling (3x instead of 5x) to keep rewards aligned with PnL
+        reward *= 3.0
         
         return reward
     
@@ -661,7 +704,7 @@ class TradingEnvironment(gym.Env):
         
         # CRITICAL FIX: Check risk/reward ratio before allowing trade
         # Calculate estimated risk/reward ratio based on recent performance
-        if abs(position_change) > self.action_threshold and self.state.trades_count > 0:
+        if abs(position_change) > self.action_threshold and self.state.trades_count > 10:  # Need at least 10 trades
             # Calculate average win and loss from recent trades
             avg_win = self.state.total_win_pnl / max(1, self.state.winning_trades) if self.state.winning_trades > 0 else 0.0
             avg_loss = self.state.total_loss_pnl / max(1, self.state.losing_trades) if self.state.losing_trades > 0 else 0.0
@@ -670,9 +713,12 @@ class TradingEnvironment(gym.Env):
             if avg_loss > 0 and avg_win > 0:
                 risk_reward_ratio = avg_win / avg_loss
                 
-                # Reject trades with poor risk/reward ratio
-                if risk_reward_ratio < self.min_risk_reward_ratio:
+                # STRICT: Reject trades if actual R:R is below required R:R
+                # Add 10% buffer to ensure we're actually achieving the target
+                required_rr_with_buffer = self.min_risk_reward_ratio * 1.1
+                if risk_reward_ratio < required_rr_with_buffer:
                     # Risk/reward ratio too poor - reject trade
+                    # This forces the agent to improve its R:R before taking more trades
                     position_change = 0.0
                     new_position = self.state.position
         
@@ -696,8 +742,15 @@ class TradingEnvironment(gym.Env):
                 new_position = self.state.position
             elif self.require_positive_expected_value and expected_value is not None and expected_value <= 0:
                 # Reject: Expected value is negative or zero
-                position_change = 0.0
-                new_position = self.state.position
+                # BUT: Allow trade if we have no trade history (expected_value is None)
+                # This prevents blocking the first trades when there's no historical data
+                if expected_value is None:
+                    # No trade history yet - allow trade to proceed
+                    pass
+                else:
+                    # Expected value is negative or zero - reject
+                    position_change = 0.0
+                    new_position = self.state.position
         
         # Store position change for commission calculation
         self.last_position_change = position_change

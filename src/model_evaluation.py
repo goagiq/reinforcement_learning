@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict
 from src.rl_agent import PPOAgent
 from src.trading_env import TradingEnvironment
 from src.data_extraction import DataExtractor
+from src.trading_hours import TradingHoursManager
 
 
 @dataclass
@@ -65,9 +66,15 @@ class ModelEvaluator:
         extractor = DataExtractor()
         instrument = self.config["environment"]["instrument"]
         timeframes = self.config["environment"]["timeframes"]
+        trading_hours_cfg = self.config["environment"].get("trading_hours", {})
+        trading_hours_manager = None
+        if trading_hours_cfg.get("enabled"):
+            trading_hours_manager = TradingHoursManager.from_dict(trading_hours_cfg)
         
         self.test_data = extractor.load_multi_timeframe_data(
-            instrument, timeframes
+            instrument,
+            timeframes,
+            trading_hours=trading_hours_manager
         )
     
     def evaluate_model(
@@ -99,14 +106,19 @@ class ModelEvaluator:
         agent.actor.eval()
         agent.critic.eval()
         
-        # Create environment
+        # Create environment with ALL parameters from config (matching training)
+        action_threshold = self.config["environment"].get("action_threshold", 0.05)
+        max_episode_steps = self.config["environment"].get("max_episode_steps", 10000)
+        
         env = TradingEnvironment(
             data=self.test_data,
             timeframes=self.config["environment"]["timeframes"],
             initial_capital=self.config["risk_management"]["initial_capital"],
             transaction_cost=self.config["risk_management"]["commission"] / \
                            self.config["risk_management"]["initial_capital"],
-            reward_config=self.config["environment"]["reward"]
+            reward_config=self.config["environment"]["reward"],
+            action_threshold=action_threshold,
+            max_episode_steps=max_episode_steps
         )
         
         # Run evaluation episodes

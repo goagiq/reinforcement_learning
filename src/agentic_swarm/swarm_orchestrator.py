@@ -9,6 +9,8 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 from src.agentic_swarm.shared_context import SharedContext
 from src.agentic_swarm.config_loader import SwarmConfigLoader
@@ -16,6 +18,7 @@ from src.agentic_swarm.agents import (
     MarketResearchAgent,
     SentimentAgent,
     ContrarianAgent,
+    ElliottWaveAgent,
     AnalystAgent,
     RecommendationAgent
 )
@@ -112,6 +115,10 @@ class SwarmOrchestrator:
         self.last_execution_time: Optional[float] = None
         self.last_result: Optional[Dict[str, Any]] = None
         self.execution_count = 0
+        
+        # Adaptive Learning Agent periodic execution
+        self.adaptive_learning_task: Optional[asyncio.Task] = None
+        self.adaptive_learning_running = False
     
     def _init_data_providers(self):
         """Initialize data providers."""
@@ -170,6 +177,23 @@ class SwarmOrchestrator:
         else:
             self.contrarian_agent = None
         
+        # Elliott Wave Agent
+        elliott_config = dict(self.swarm_config.get("elliott_wave", {}))
+        elliott_config["environment_defaults"] = {
+            "instrument": self.config.get("environment", {}).get("instrument", "ES"),
+            "timeframes": self.config.get("environment", {}).get("timeframes", [1, 5, 15]),
+        }
+        self.elliott_wave_enabled = elliott_config.get("enabled", True)
+        
+        if self.elliott_wave_enabled:
+            self.elliott_wave_agent = ElliottWaveAgent(
+                shared_context=self.shared_context,
+                market_data_provider=self.market_data_provider,
+                config=elliott_config
+            )
+        else:
+            self.elliott_wave_agent = None
+        
         # Analyst Agent
         analyst_config = self.swarm_config.get("analyst", {})
         analyst_config["reasoning"] = reasoning_config  # Include reasoning config
@@ -189,13 +213,31 @@ class SwarmOrchestrator:
             config=recommendation_config
         )
         
-        # Store agent list
+        # Adaptive Learning Agent (runs independently, continuously)
+        adaptive_learning_config = self.swarm_config.get("adaptive_learning", {})
+        adaptive_learning_config["reasoning"] = reasoning_config  # Include reasoning config
+        self.adaptive_learning_enabled = adaptive_learning_config.get("enabled", False)
+        
+        if self.adaptive_learning_enabled:
+            from src.agentic_swarm.agents.adaptive_learning_agent import AdaptiveLearningAgent
+            self.adaptive_learning_agent = AdaptiveLearningAgent(
+                shared_context=self.shared_context,
+                reasoning_engine=self.reasoning_engine,
+                config=adaptive_learning_config
+            )
+            print("[OK] Adaptive Learning Agent enabled (runs independently)")
+        else:
+            self.adaptive_learning_agent = None
+        
+        # Store agent list (main workflow agents only - adaptive learning runs separately)
         self.agents = [
             self.market_research_agent,
             self.sentiment_agent,
         ]
         if self.contrarian_agent:
             self.agents.append(self.contrarian_agent)
+        if self.elliott_wave_agent:
+            self.agents.append(self.elliott_wave_agent)
         self.agents.extend([
             self.analyst_agent,
             self.recommendation_agent
@@ -313,34 +355,66 @@ class SwarmOrchestrator:
             Final result with all agent outputs
         """
         # Phase 1: Parallel execution of Market Research, Sentiment, and Contrarian agents
-        research_task = asyncio.create_task(
-            asyncio.to_thread(self.market_research_agent.analyze, market_state)
-        )
-        sentiment_task = asyncio.create_task(
-            asyncio.to_thread(self.sentiment_agent.analyze, market_state)
-        )
+        parallel_tasks = [
+            (
+                "research",
+                asyncio.create_task(
+                    asyncio.to_thread(self.market_research_agent.analyze, market_state)
+                ),
+            ),
+            (
+                "sentiment",
+                asyncio.create_task(
+                    asyncio.to_thread(self.sentiment_agent.analyze, market_state)
+                ),
+            ),
+        ]
         
         if self.contrarian_agent:
-            contrarian_task = asyncio.create_task(
-                asyncio.to_thread(self.contrarian_agent.analyze, market_state)
-            )
-            research_findings, sentiment_findings, contrarian_findings = await asyncio.gather(
-                research_task,
-                sentiment_task,
-                contrarian_task
+            parallel_tasks.append(
+                (
+                    "contrarian",
+                    asyncio.create_task(
+                        asyncio.to_thread(self.contrarian_agent.analyze, market_state)
+                    ),
+                )
             )
         else:
-            # Clear any stale contrarian data in shared context
             self.shared_context.set("contrarian_analysis", None, "contrarian_signals")
-            research_findings, sentiment_findings = await asyncio.gather(
-                research_task,
-                sentiment_task
+        
+        if self.elliott_wave_agent:
+            parallel_tasks.append(
+                (
+                    "elliott_wave",
+                    asyncio.create_task(
+                        asyncio.to_thread(self.elliott_wave_agent.analyze, market_state)
+                    ),
+                )
             )
-            contrarian_findings = {
+        else:
+            self.shared_context.set("elliott_wave_analysis", None, "analysis_results")
+        
+        task_results = await asyncio.gather(*[task for _, task in parallel_tasks])
+        task_map = {name: result for (name, _), result in zip(parallel_tasks, task_results)}
+        
+        research_findings = task_map.get("research")
+        sentiment_findings = task_map.get("sentiment")
+        contrarian_findings = task_map.get(
+            "contrarian",
+            {
                 "status": "disabled",
                 "message": "Contrarian agent disabled via settings",
                 "timestamp": datetime.now().isoformat()
             }
+        )
+        elliott_findings = task_map.get(
+            "elliott_wave",
+            {
+                "status": "disabled",
+                "message": "Elliott Wave agent disabled via settings",
+                "timestamp": datetime.now().isoformat()
+            }
+        )
         
         # Phase 2: Analyst Agent (synthesizes research + sentiment)
         analyst_task = asyncio.create_task(
@@ -371,6 +445,7 @@ class SwarmOrchestrator:
                 "research": research_findings,
                 "sentiment": sentiment_findings,
                 "contrarian": contrarian_findings,
+                "elliott_wave": elliott_findings,
                 "analyst": analyst_analysis
             },
             "shared_context": {
@@ -433,3 +508,77 @@ class SwarmOrchestrator:
     def get_agent_history(self) -> list:
         """Get agent execution history."""
         return self.shared_context.get_agent_history()
+    
+    def start_adaptive_learning(self, performance_data_provider):
+        """
+        Start periodic adaptive learning analysis.
+        
+        Args:
+            performance_data_provider: Callable that returns performance data dict
+        """
+        if not self.adaptive_learning_enabled or not self.adaptive_learning_agent:
+            return
+        
+        self.adaptive_learning_running = True
+        self.performance_data_provider = performance_data_provider
+        
+        # Start background thread for periodic analysis
+        def run_adaptive_learning():
+            while self.adaptive_learning_running:
+                try:
+                    # Get performance data
+                    performance_data = performance_data_provider()
+                    
+                    if performance_data:
+                        # Run analysis
+                        result = self.adaptive_learning_agent.analyze(
+                            market_state={},  # Can be enhanced to get from shared context
+                            performance_data=performance_data
+                        )
+                        
+                        if result.get("status") == "success":
+                            recommendations = result.get("recommendations", {})
+                            if recommendations.get("type") != "NO_CHANGE":
+                                print(f"\n[ADAPTIVE LEARNING] Recommendation: {recommendations['type']}")
+                                print(f"  Reasoning: {recommendations.get('reasoning', 'N/A')}")
+                                print(f"  Parameters: {recommendations.get('parameters', {})}")
+                                print(f"  Confidence: {recommendations.get('confidence', 0.0):.2f}")
+                                print(f"  ⚠️  Requires manual approval\n")
+                    
+                    # Wait for next analysis (configurable frequency)
+                    analysis_frequency = self.adaptive_learning_agent.analysis_frequency
+                    time.sleep(analysis_frequency)
+                    
+                except Exception as e:
+                    print(f"[ERROR] Adaptive learning analysis failed: {e}")
+                    time.sleep(60)  # Wait 1 minute before retry
+        
+        # Start thread
+        self.adaptive_learning_thread = threading.Thread(
+            target=run_adaptive_learning,
+            daemon=True,
+            name="AdaptiveLearning"
+        )
+        self.adaptive_learning_thread.start()
+        print("[OK] Adaptive Learning Agent started (periodic analysis)")
+    
+    def stop_adaptive_learning(self):
+        """Stop periodic adaptive learning analysis"""
+        self.adaptive_learning_running = False
+        if hasattr(self, 'adaptive_learning_thread'):
+            self.adaptive_learning_thread.join(timeout=5.0)
+        print("[OK] Adaptive Learning Agent stopped")
+    
+    def get_adaptive_learning_recommendations(self) -> Optional[Dict[str, Any]]:
+        """Get latest adaptive learning recommendations from shared context"""
+        if not self.adaptive_learning_enabled:
+            return None
+        
+        return self.shared_context.get("adaptive_learning_analysis", namespace="adaptive_learning")
+    
+    def apply_adaptive_learning_recommendation(self, recommendation: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply an approved adaptive learning recommendation"""
+        if not self.adaptive_learning_enabled or not self.adaptive_learning_agent:
+            return {"status": "error", "message": "Adaptive learning not enabled"}
+        
+        return self.adaptive_learning_agent.apply_recommendation(recommendation)
