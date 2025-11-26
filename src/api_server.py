@@ -685,6 +685,119 @@ async def list_data():
     return {"files": files}
 
 
+@app.get("/api/data/statistics")
+async def get_data_statistics():
+    """
+    Get statistics about available training data.
+    Returns number of bars available per timeframe to help calculate total_timesteps.
+    """
+    try:
+        import pickle
+        
+        processed_dir = Path("data/processed")
+        instrument = "ES"  # Could be made configurable
+        timeframes = [1, 5, 15]
+        
+        statistics = {
+            "instrument": instrument,
+            "timeframes": {},
+            "total_bars": 0,
+            "suggested_timesteps": None,
+            "cache_available": False
+        }
+        
+        # Check for cached files
+        total_bars = 0
+        
+        for timeframe in timeframes:
+            cache_file_parquet = processed_dir / f"{instrument}_{timeframe}min_processed.parquet"
+            cache_file_pkl = processed_dir / f"{instrument}_{timeframe}min_processed.pkl"
+            
+            cache_file = None
+            cache_format = None
+            
+            if cache_file_parquet.exists():
+                cache_file = cache_file_parquet
+                cache_format = "parquet"
+                statistics["cache_available"] = True
+            elif cache_file_pkl.exists():
+                cache_file = cache_file_pkl
+                cache_format = "pickle"
+                statistics["cache_available"] = True
+            
+            if cache_file:
+                try:
+                    if cache_format == "parquet":
+                        df = pd.read_parquet(cache_file)
+                    else:
+                        with open(cache_file, 'rb') as f:
+                            df = pickle.load(f)
+                    
+                    num_bars = len(df)
+                    # Count 1min bars only for total calculation
+                    if timeframe == min(timeframes):
+                        total_bars = num_bars
+                    
+                    # Get date range
+                    date_range = {}
+                    if 'timestamp' in df.columns:
+                        date_range = {
+                            "start": str(df['timestamp'].min()),
+                            "end": str(df['timestamp'].max())
+                        }
+                    
+                    statistics["timeframes"][f"{timeframe}min"] = {
+                        "bars": num_bars,
+                        "cache_file": str(cache_file.name),
+                        "date_range": date_range,
+                        "format": cache_format
+                    }
+                    
+                except Exception as e:
+                    statistics["timeframes"][f"{timeframe}min"] = {
+                        "error": str(e),
+                        "bars": 0
+                    }
+            else:
+                statistics["timeframes"][f"{timeframe}min"] = {
+                    "bars": 0,
+                    "cache_file": None,
+                    "cache_available": False
+                }
+        
+        # Calculate suggested total_timesteps based on available data
+        # Formula: For large datasets, suggest 10-20M timesteps to allow multiple passes through data
+        if total_bars > 0:
+            # For large datasets (5M+ bars), suggest moderate to extensive training
+            if total_bars > 5_000_000:
+                suggested_timesteps = 20_000_000  # 20M for extensive dataset
+            elif total_bars > 1_000_000:
+                suggested_timesteps = 10_000_000  # 10M for medium dataset
+            elif total_bars > 100_000:
+                suggested_timesteps = 5_000_000   # 5M for smaller dataset
+            else:
+                suggested_timesteps = 1_000_000   # 1M for small dataset
+            
+            statistics["total_bars"] = total_bars
+            statistics["suggested_timesteps"] = suggested_timesteps
+            statistics["calculation"] = {
+                "description": f"Based on {total_bars:,} bars available",
+                "reasoning": "Suggests 10-20M timesteps for large datasets to allow multiple passes through data"
+            }
+        
+        return {
+            "status": "success",
+            "statistics": statistics
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "statistics": {}
+        }
+
+
 @app.get("/api/config/list")
 async def list_configs():
     """List available training config files"""
@@ -3550,6 +3663,375 @@ async def get_forecast_performance(since: Optional[str] = None):
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/monitoring/logs")
+async def get_log_messages(limit: int = 100, last_seen: Optional[str] = None):
+    """
+    Get recent log messages matching key patterns (critical 0% win rate, adaptive learning, etc.)
+    Similar to monitor_backend_logs.py functionality but as an API endpoint.
+    
+    Args:
+        limit: Maximum number of log messages to return
+        last_seen: Timestamp of last seen message (ISO format) to only return new messages
+        
+    Returns:
+        Dict with log messages categorized by type
+    """
+    import re
+    from collections import defaultdict
+    
+    try:
+        log_files = []
+        
+        # Check backend_logs.txt (from --save-logs)
+        backend_log = project_root / "backend_logs.txt"
+        if backend_log.exists():
+            log_files.append(backend_log)
+        
+        # Check training log directories
+        logs_dir = project_root / "logs"
+        if logs_dir.exists():
+            training_dirs = sorted(
+                logs_dir.glob("ppo_training_*"),
+                key=lambda x: x.stat().st_mtime if x.exists() else 0,
+                reverse=True
+            )
+            if training_dirs:
+                log_dir = training_dirs[0]
+                log_files.extend(list(log_dir.glob("*.log")) + list(log_dir.glob("*.txt")))
+        
+        # Define CRITICAL patterns only (from monitor_backend_logs.py)
+        # Exclude trade and GPU noise - focus on adaptive learning and critical events
+        patterns = {
+            "critical_0_percent": [
+                r'\[CRITICAL\]\s*0%\s*WIN\s*RATE\s*DETECTED',
+                r'CRITICAL.*0%\s*WIN\s*RATE',
+                r'0%\s*WIN\s*RATE\s*DETECTED\s*\(Quick\s*Adjustment',
+                r'FIX 4.*FORCING.*EVALUATION.*0%.*win.*rate'
+            ],
+            "adaptive_adjustment": [
+                r'\[ADAPT\]\s*Quick\s*adjustment',
+                r'\[CRITICAL\]\s*0%\s*WIN\s*RATE\s*DETECTED.*Quick\s*Adjustment',
+                r'Entropy:.*->.*\(increased\s*exploration\)',
+                r'Inaction\s*Penalty:.*->.*\(encouraging\s*trading\)',
+                r'Confidence:.*->.*\(relaxed\)',
+                r'Quality:.*->.*\(relaxed\)',
+                r'EXPLORATION INCREASED|INACTION PENALTY INCREASED',
+                r'ADAPTIVE LEARNING FIX WORKING'
+            ],
+            "adaptive_stop_loss": [
+                r'\[ADAPTIVE STOP LOSS\]',
+                r'Adaptive\s*value:.*Change:',
+                r'ADAPTIVE STOP LOSS.*Overriding'
+            ],
+            "short_position": [
+                r'SHORT\s*@',
+                r'\[TRADE OPEN\].*SHORT',
+                r'Model Action=-.*SHORT',
+                r'DEBUG TRADE.*Action=-.*SHORT'
+            ],
+            "overconfident_model": [
+                r'\[ACTION DISTRIBUTION\].*Episode End Statistics',
+                r'WARNING:.*% of actions are near maximum.*overconfident',
+                r'⚠️.*WARNING:.*actions are near maximum',
+                r'100\.0% of actions are near maximum'
+            ],
+            "directional_bias": [
+                r'WARNING:.*% of actions are (LONG|SHORT).*directional bias',
+                r'DIRECTIONAL BIAS DETECTED',
+                r'\[CRITICAL\] DIRECTIONAL BIAS',
+                r'directional bias detected!'
+            ],
+            "rapid_drawdown": [
+                r'\[CRITICAL\] RAPID DRAWDOWN DETECTED',
+                r'RAPID DRAWDOWN RESPONSE',
+                r'drawdown.*10\.0%',
+                r'Drawdown:.*10\.[0-9]+%'
+            ],
+            "reward_collapse": [
+                r'\[CRITICAL\] REWARD COLLAPSE DETECTED',
+                r'REWARD COLLAPSE RESPONSE',
+                r'Mean Reward.*Last 20.*-0\.[5-9]',
+                r'reward collapse'
+            ]
+        }
+        
+        # Exclusion patterns - skip lines matching these (GPU, trade noise, etc.)
+        # BUT allow ACTION DISTRIBUTION warnings (overconfident model) - they're critical
+        exclusion_patterns = [
+            r'GPU|CUDA|cuda|gpu|memory|Memory',
+            r'\[TRADE OPEN\].*LONG',  # Only show SHORT, exclude LONG trades
+            r'\[TRADE CLOSE\]',  # Exclude trade close messages
+            r'DEBUG TRADE.*Action=1\.000',  # Exclude LONG action messages
+            r'Episode reset',  # Too noisy (but ACTION DISTRIBUTION is allowed)
+            r'\[DEBUG\]\s*Episode\s*reset',
+            r'Starting at step',  # Too noisy
+            # Don't exclude ACTION DISTRIBUTION - we want to capture overconfident warnings
+            r'INFO:.*GET.*api',  # Exclude API request logs
+            r'INFO:.*POST.*api',
+            r'WebSocket.*accepted',
+            r'connection open'
+        ]
+        
+        messages_by_category = defaultdict(list)
+        all_messages = []
+        
+        # Read recent lines from each log file
+        for log_file in log_files[:5]:  # Limit to first 5 files
+            if not log_file.exists():
+                continue
+            
+            try:
+                # Read last N lines (configurable, default to last 1000 lines)
+                max_lines_to_read = 1000
+                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                    recent_lines = [l.rstrip('\n\r') for l in (lines[-max_lines_to_read:] if len(lines) > max_lines_to_read else lines)]
+                    
+                    # Extract timestamp if available (format: [HH:MM:SS] or ISO format)
+                    for line in recent_lines:
+                        if not line.strip():
+                            continue
+                        
+                        # Skip lines matching exclusion patterns (GPU, trade noise, etc.)
+                        skip_line = False
+                        for exclusion_pattern in exclusion_patterns:
+                            if re.search(exclusion_pattern, line, re.IGNORECASE):
+                                skip_line = True
+                                break
+                        
+                        if skip_line:
+                            continue
+                        
+                        # Extract timestamp
+                        timestamp_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]|(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', line)
+                        timestamp = timestamp_match.group(1) or timestamp_match.group(2) if timestamp_match else None
+                        
+                        # Check if we should skip (based on last_seen timestamp)
+                        if last_seen and timestamp:
+                            try:
+                                if timestamp < last_seen:
+                                    continue
+                            except:
+                                pass  # If comparison fails, include the message
+                        
+                        # Special handling for ACTION DISTRIBUTION (multi-line messages)
+                        if 'ACTION DISTRIBUTION' in line.upper() or 'Episode End Statistics' in line:
+                            # Find current line index and capture following lines
+                            try:
+                                line_idx = recent_lines.index(line)
+                                context_lines = [line]
+                                # Capture up to 15 following lines for full statistics
+                                for i in range(1, min(15, len(recent_lines) - line_idx)):
+                                    if line_idx + i < len(recent_lines):
+                                        next_line = recent_lines[line_idx + i]
+                                        if next_line.strip():
+                                            # Stop if we hit another timestamp (new log entry)
+                                            if re.search(r'\[(\d{2}:\d{2}:\d{2})\]', next_line):
+                                                break
+                                            # Always include the line if it's part of statistics or warning
+                                            # Check if it looks like a statistics line (has numbers, colons, percentages, etc.)
+                                            if any(keyword in next_line.upper() for keyword in [
+                                                'TOTAL', 'MEAN', 'STD', 'RANGE', 'POSITIVE', 'NEGATIVE', 
+                                                'NEUTRAL', 'WARNING', 'OVERCONFIDENT', 'NEAR MAXIMUM', 
+                                                '100%', 'STATISTICS', ':', '%'
+                                            ]) or 'WARNING' in next_line.upper() or '⚠️' in next_line:
+                                                context_lines.append(next_line)
+                                            # Also stop if we've captured enough lines or hit an empty line followed by non-statistics
+                                            elif len(context_lines) > 10:
+                                                break
+                                                
+                                combined_message = '\n'.join(context_lines)
+                                # Only include if it contains the overconfidence warning (check for warning about 100% or near max)
+                                if 'WARNING' in combined_message.upper() and (
+                                    'overconfident' in combined_message.lower() or 
+                                    'near maximum' in combined_message.lower() or 
+                                    '100.0%' in combined_message or
+                                    re.search(r'100\.0?%\s+of\s+actions', combined_message, re.IGNORECASE)
+                                ):
+                                    msg_obj = {
+                                        "timestamp": timestamp or "",
+                                        "message": combined_message[:1000],  # Allow more for multi-line
+                                        "category": "overconfident_model",
+                                        "file": log_file.name
+                                    }
+                                    messages_by_category["overconfident_model"].append(msg_obj)
+                                    all_messages.append(msg_obj)
+                            except (ValueError, IndexError):
+                                pass  # Skip if can't process
+                            continue  # Skip to next line since we've handled ACTION DISTRIBUTION
+                        
+                        # Search for other CRITICAL patterns
+                        category = None
+                        for cat, cat_patterns in patterns.items():
+                            # Skip overconfident_model - handled above
+                            if cat == "overconfident_model":
+                                continue
+                            for pattern in cat_patterns:
+                                if re.search(pattern, line, re.IGNORECASE):
+                                    category = cat
+                                    break
+                            if category:
+                                break
+                        
+                        # ONLY include messages that match critical patterns
+                        if category:
+                            msg_obj = {
+                                "timestamp": timestamp or "",
+                                "message": line[:500],  # Truncate very long lines
+                                "category": category,
+                                "file": log_file.name
+                            }
+                            messages_by_category[category].append(msg_obj)
+                            all_messages.append(msg_obj)
+                            
+            except Exception as e:
+                # Skip files that can't be read
+                continue
+        
+        # Sort all messages by timestamp (newest first) and limit
+        # Prioritize critical messages first (rapid drawdown, 0% win rate, reward collapse, directional bias, overconfident model)
+        all_messages.sort(key=lambda x: (
+            0 if x.get("category") == "rapid_drawdown" else (
+                1 if x.get("category") == "critical_0_percent" else (
+                    2 if x.get("category") == "reward_collapse" else (
+                        3 if x.get("category") == "directional_bias" else (
+                            4 if x.get("category") == "overconfident_model" else 5
+                        )
+                    )
+                )
+            ),
+            x.get("timestamp", "").__str__()
+        ), reverse=True)
+        all_messages = all_messages[:limit]
+        
+        # Get summary counts (only for critical categories)
+        summary = {
+            "total_messages": len(all_messages),
+            "by_category": {cat: len(msgs) for cat, msgs in messages_by_category.items()},
+            "last_timestamp": all_messages[0].get("timestamp", "") if all_messages else None
+        }
+        
+        return {
+            "status": "success",
+            "messages": all_messages,
+            "summary": summary,
+            "log_files_checked": [str(f.name) for f in log_files[:5]]
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "message": str(e),
+            "messages": [],
+            "summary": {}
+        }
+
+
+@app.post("/api/data/restore")
+async def restore_data_files(source: Optional[str] = None):
+    """
+    Restore NT8 data files from archive directory to project data/raw folder.
+    
+    Args:
+        source: NT8 export directory path (default: C:\\Users\\schuo\\Documents\\NinjaTrader 8\\export)
+    
+    Returns:
+        Dict with restore results
+    """
+    try:
+        from pathlib import Path
+        from restore_nt8_data import restore_nt8_data
+        
+        # Default source directory
+        if not source:
+            source = r"C:\Users\schuo\Documents\NinjaTrader 8\export"
+        
+        source_dir = Path(source)
+        dest_dir = project_root / "data" / "raw"
+        
+        # Run restore
+        result = restore_nt8_data(source_dir, dest_dir, dry_run=False)
+        
+        return {
+            "status": "success",
+            "result": result
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "message": str(e),
+            "result": {}
+        }
+
+
+@app.post("/api/data/preprocess")
+async def preprocess_data():
+    """
+    Pre-process all data files and create cache files for fast training initialization.
+    
+    Returns:
+        Dict with preprocessing results
+    """
+    try:
+        import subprocess
+        import sys
+        from pathlib import Path
+        
+        # Run preprocess_all_data.py as a subprocess
+        script_path = project_root / "preprocess_all_data.py"
+        
+        if not script_path.exists():
+            return {
+                "status": "error",
+                "message": f"Script not found: {script_path}",
+                "result": {}
+            }
+        
+        # Run the script and capture output
+        process = subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(project_root)
+        )
+        
+        stdout, stderr = process.communicate()
+        
+        # Check if processed files were created
+        processed_dir = project_root / "data" / "processed"
+        cache_files = []
+        if processed_dir.exists():
+            cache_files = [
+                str(f.name) for f in processed_dir.glob("*.parquet")
+            ] + [
+                str(f.name) for f in processed_dir.glob("*.pkl")
+            ]
+        
+        return {
+            "status": "success" if process.returncode == 0 else "error",
+            "return_code": process.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "cache_files": cache_files,
+            "message": "Preprocessing completed successfully" if process.returncode == 0 else f"Preprocessing failed with return code {process.returncode}"
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "message": str(e),
+            "result": {}
+        }
 
 
 @app.get("/api/settings/get")

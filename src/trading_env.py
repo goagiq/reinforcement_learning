@@ -294,6 +294,7 @@ class TradingEnvironment(gym.Env):
         
         # Stop loss configuration (fixed - not adaptive)
         self.stop_loss_pct = self.reward_config.get("stop_loss_pct", 0.02)  # Default 2% stop loss
+        print(f"[STOP LOSS INIT] Initial stop_loss_pct from config: {self.stop_loss_pct:.6f} ({self.stop_loss_pct*100:.4f}%)", flush=True)
         
         # Trailing stop configuration (NEW - ATR-adaptive)
         trailing_stop_config = self.reward_config.get("trailing_stop", {}) if self.reward_config else {}
@@ -354,8 +355,12 @@ class TradingEnvironment(gym.Env):
                     # Read adaptive stop loss (NEW)
                     adaptive_stop_loss = adaptive_config.get("stop_loss_pct")
                     if adaptive_stop_loss is not None:
+                        old_stop_loss = self.stop_loss_pct
                         self.stop_loss_pct = adaptive_stop_loss
-                        print(f"[ADAPTIVE] Using adaptive stop loss: {self.stop_loss_pct:.3f} ({self.stop_loss_pct*100:.1f}%)")
+                        print(f"[ADAPTIVE STOP LOSS] Overriding config stop loss:", flush=True)
+                        print(f"[ADAPTIVE STOP LOSS]   Config value: {old_stop_loss:.6f} ({old_stop_loss*100:.4f}%)", flush=True)
+                        print(f"[ADAPTIVE STOP LOSS]   Adaptive value: {self.stop_loss_pct:.6f} ({self.stop_loss_pct*100:.4f}%)", flush=True)
+                        print(f"[ADAPTIVE STOP LOSS]   Change: {((self.stop_loss_pct/old_stop_loss - 1)*100):+.2f}%", flush=True)
             except Exception as e:
                 # Fallback to config defaults if adaptive config read fails
                 self.min_risk_reward_ratio = self.reward_config.get("min_risk_reward_ratio", 1.5)
@@ -1315,6 +1320,85 @@ class TradingEnvironment(gym.Env):
         # Reset equity curve
         self.equity_curve = [self.initial_capital]
         
+        # Initialize action tracking for distribution analysis
+        if not hasattr(self, 'action_distribution'):
+            self.action_distribution = []
+        else:
+            # Log action distribution statistics at episode end
+            if len(self.action_distribution) > 0:
+                actions = np.array(self.action_distribution)
+                action_mean = np.mean(actions)
+                action_std = np.std(actions)
+                action_min = np.min(actions)
+                action_max = np.max(actions)
+                # Count actions in different ranges
+                positive_count = np.sum(actions > 0.1)
+                negative_count = np.sum(actions < -0.1)
+                neutral_count = len(actions) - positive_count - negative_count
+                max_action_count = np.sum(np.abs(actions) > 0.95)  # Count actions near ±1.0
+                
+                print(f"\n[ACTION DISTRIBUTION] Episode End Statistics:", flush=True)
+                print(f"   Total Actions: {len(actions)}", flush=True)
+                print(f"   Mean: {action_mean:.4f}, Std: {action_std:.4f}", flush=True)
+                print(f"   Range: [{action_min:.4f}, {action_max:.4f}]", flush=True)
+                print(f"   Positive (>0.1): {positive_count} ({positive_count/len(actions)*100:.1f}%)", flush=True)
+                print(f"   Negative (<-0.1): {negative_count} ({negative_count/len(actions)*100:.1f}%)", flush=True)
+                print(f"   Neutral: {neutral_count} ({neutral_count/len(actions)*100:.1f}%)", flush=True)
+                print(f"   Near Max (|action|>0.95): {max_action_count} ({max_action_count/len(actions)*100:.1f}%)", flush=True)
+                
+                # CRITICAL: Store overconfident model warning flag for adaptive learning
+                overconfident_threshold = 0.8  # 80% of actions near maximum
+                max_action_pct = max_action_count / len(actions) if len(actions) > 0 else 0.0
+                self._last_episode_overconfident = max_action_pct > overconfident_threshold
+                
+                if self._last_episode_overconfident:
+                    print(f"   ⚠️  WARNING: {max_action_pct*100:.1f}% of actions are near maximum - model may be overconfident!", flush=True)
+                    # Store detailed stats for adaptive learning response
+                    self._last_episode_action_stats = {
+                        "total_actions": len(actions),
+                        "max_action_pct": max_action_pct,
+                        "action_std": action_std,
+                        "action_mean": action_mean,
+                        "overconfident": True
+                    }
+                else:
+                    self._last_episode_action_stats = {
+                        "total_actions": len(actions),
+                        "max_action_pct": max_action_pct,
+                        "action_std": action_std,
+                        "action_mean": action_mean,
+                        "overconfident": False
+                    }
+                
+                # CRITICAL: Store directional bias detection for adaptive learning
+                # Check if model is biased to one direction (always LONG or always SHORT)
+                directional_bias_threshold = 0.9  # 90% of actions in same direction
+                positive_pct = positive_count / len(actions) if len(actions) > 0 else 0.0
+                negative_pct = negative_count / len(actions) if len(actions) > 0 else 0.0
+                
+                if positive_pct >= directional_bias_threshold:
+                    self._last_episode_directional_bias = "LONG"
+                    self._last_episode_directional_bias_pct = positive_pct
+                    print(f"   ⚠️  WARNING: {positive_pct*100:.1f}% of actions are LONG - directional bias detected!", flush=True)
+                elif negative_pct >= directional_bias_threshold:
+                    self._last_episode_directional_bias = "SHORT"
+                    self._last_episode_directional_bias_pct = negative_pct
+                    print(f"   ⚠️  WARNING: {negative_pct*100:.1f}% of actions are SHORT - directional bias detected!", flush=True)
+                else:
+                    self._last_episode_directional_bias = None
+                    self._last_episode_directional_bias_pct = 0.0
+                
+                print("", flush=True)
+            else:
+                # No actions tracked - reset flags
+                self._last_episode_overconfident = False
+                self._last_episode_action_stats = None
+                self._last_episode_directional_bias = None
+                self._last_episode_directional_bias_pct = 0.0
+            
+            # Reset for new episode
+            self.action_distribution = []
+        
         # Optional callback for trade logging (non-intrusive)
         # Initialize if not already set (allows external setup)
         if not hasattr(self, 'trade_callback'):
@@ -1330,6 +1414,18 @@ class TradingEnvironment(gym.Env):
         
         # Track current episode for logging
         self._current_episode = getattr(options, 'episode', 0) if options else 0
+        
+        # Initialize action distribution tracking flags (will be set when episode ends)
+        if not hasattr(self, '_last_episode_overconfident'):
+            self._last_episode_overconfident = False
+            self._last_episode_action_stats = None
+            self._last_episode_directional_bias = None
+            self._last_episode_directional_bias_pct = 0.0
+        
+        # Initialize equity tracking for rapid drawdown detection
+        if not hasattr(self, '_episode_start_equity'):
+            self._episode_start_equity = self.initial_capital
+            self._equity_history = []  # Track equity at episode end for drawdown calculation
         
         if not hasattr(self, '_reset_count'):
             self._reset_count = 0
@@ -1367,6 +1463,25 @@ class TradingEnvironment(gym.Env):
         action_value = float(action[0])
         action_value = np.clip(action_value, -1.0, 1.0)
         self.action_value = action_value  # Store for quality score calculation
+        
+        # Track action for distribution analysis
+        if not hasattr(self, 'action_distribution'):
+            self.action_distribution = []
+        self.action_distribution.append(action_value)
+        
+        # Log action distribution statistics periodically (every 1000 steps)
+        if len(self.action_distribution) > 0 and len(self.action_distribution) % 1000 == 0:
+            actions = np.array(self.action_distribution)
+            action_mean = np.mean(actions)
+            action_std = np.std(actions)
+            max_action_count = np.sum(np.abs(actions) > 0.95)
+            print(f"[ACTION DISTRIBUTION] Step {self.current_step}: Mean={action_mean:.4f}, Std={action_std:.4f}, Near Max={max_action_count}/{len(actions)} ({max_action_count/len(actions)*100:.1f}%)", flush=True)
+        
+        # FIX 2: Debug logging for action value from model
+        if not hasattr(self, '_last_logged_action') or abs(action_value - getattr(self, '_last_logged_action', 0)) > 0.01:
+            action_direction = "LONG" if action_value > 0 else "SHORT" if action_value < 0 else "NEUTRAL"
+            print(f"[DEBUG TRADE] Step {self.current_step}: Model Action={action_value:.6f} (Raw from model: {action_direction})", flush=True)
+            self._last_logged_action = action_value
 
         # CRITICAL FIX: Capture old position BEFORE any position changes for commission calculation
         old_position_before_update = self.state.position if self.state else 0.0
@@ -1389,9 +1504,23 @@ class TradingEnvironment(gym.Env):
             safe_step
         )
         
+        # FIX 2: Debug logging after volatility normalization
+        if abs(normalized_action_value - action_value) > 0.001 or abs(normalized_action_value) > 0.01:
+            print(f"[DEBUG TRADE] Step {self.current_step}: After Volatility Normalization: Raw={action_value:.6f} -> Normalized={normalized_action_value:.6f}", flush=True)
+        
         # Update position (use normalized value)
         position_change = normalized_action_value - self.state.position
         new_position = normalized_action_value
+        
+        # FIX 2: Debug logging for position and direction verification
+        if abs(position_change) > self.action_threshold:
+            old_direction = "LONG" if old_position_before_update > 0 else "SHORT" if old_position_before_update < 0 else "NONE"
+            new_direction = "LONG" if new_position > 0 else "SHORT" if new_position < 0 else "NONE"
+            print(f"[DEBUG TRADE DIRECTION] Step {self.current_step}: Position Change", flush=True)
+            print(f"   Old Position: {old_position_before_update:.6f} ({old_direction})", flush=True)
+            print(f"   New Position: {new_position:.6f} ({new_direction})", flush=True)
+            print(f"   Action={action_value:.6f}, Normalized={normalized_action_value:.6f}, Final Position={new_position:.6f}", flush=True)
+            print(f"   Direction Mapping: Action > 0 -> LONG, Action < 0 -> SHORT, Action = 0 -> NEUTRAL", flush=True)
         
         # Track trade info for journaling (set when trades execute, used after commission calculation)
         trade_info_for_journal = None
@@ -1477,8 +1606,12 @@ class TradingEnvironment(gym.Env):
                     # Check if trailing stop is hit
                     if self.state.position > 0:  # Long position
                         trailing_stop_hit = current_price <= trailing_stop_price
+                        if trailing_stop_hit:
+                            print(f"[DEBUG TRAILING STOP] LONG position: current_price=${current_price:.2f} <= trailing_stop_price=${trailing_stop_price:.2f}", flush=True)
                     else:  # Short position
                         trailing_stop_hit = current_price >= trailing_stop_price
+                        if trailing_stop_hit:
+                            print(f"[DEBUG TRAILING STOP] SHORT position: current_price=${current_price:.2f} >= trailing_stop_price=${trailing_stop_price:.2f}", flush=True)
             
             # CRITICAL FIX: Enforce stop loss to cap losses
             # Check loss from ENTRY price (not from previous step!)
@@ -1501,6 +1634,16 @@ class TradingEnvironment(gym.Env):
             # Close position if either trailing stop or fixed stop loss is hit
             if trailing_stop_hit or fixed_stop_loss_hit:
                     # Stop loss hit - force close position
+                    # CRITICAL DEBUG: Log stop loss calculation details
+                    stop_type = "TRAILING STOP" if trailing_stop_hit else "FIXED STOP LOSS"
+                    print(f"\n[DEBUG STOP LOSS] {'='*60}", flush=True)
+                    print(f"[DEBUG STOP LOSS] Stop Type: {stop_type}", flush=True)
+                    print(f"[DEBUG STOP LOSS] Step: {self.current_step}", flush=True)
+                    print(f"[DEBUG STOP LOSS] Position: {self.state.position:.3f} ({'LONG' if self.state.position > 0 else 'SHORT'})", flush=True)
+                    print(f"[DEBUG STOP LOSS] Entry Price: ${self.state.entry_price:.2f}", flush=True)
+                    print(f"[DEBUG STOP LOSS] Current Price: ${current_price:.2f}", flush=True)
+                    print(f"[DEBUG STOP LOSS] stop_loss_pct Config: {self.stop_loss_pct:.6f} ({self.stop_loss_pct*100:.4f}%)", flush=True)
+                    
                     # CRITICAL FIX: Calculate exit price based on entry price and stop loss, not current_price
                     # This ensures exit price matches the stop loss level, not wherever current_price happened to be
                     if fixed_stop_loss_hit and self.state.entry_price is not None and self.state.entry_price > 0:
@@ -1508,21 +1651,58 @@ class TradingEnvironment(gym.Env):
                         if self.state.position > 0:  # Long position
                             # Long stop loss: entry - (entry * stop_loss_pct)
                             stop_loss_price = self.state.entry_price * (1.0 - self.stop_loss_pct)
+                            print(f"[DEBUG STOP LOSS] Fixed Stop Calculation (LONG):", flush=True)
+                            print(f"[DEBUG STOP LOSS]   stop_loss_price = ${self.state.entry_price:.2f} * (1 - {self.stop_loss_pct:.6f}) = ${stop_loss_price:.2f}", flush=True)
                         else:  # Short position
                             # Short stop loss: entry + (entry * stop_loss_pct)
                             stop_loss_price = self.state.entry_price * (1.0 + self.stop_loss_pct)
+                            print(f"[DEBUG STOP LOSS] Fixed Stop Calculation (SHORT):", flush=True)
+                            print(f"[DEBUG STOP LOSS]   stop_loss_price = ${self.state.entry_price:.2f} * (1 + {self.stop_loss_pct:.6f}) = ${stop_loss_price:.2f}", flush=True)
+                        
                         # Use stop loss price as base, then apply spread
                         is_buy_exit = self.state.position < 0  # Short position = buy to cover
+                        spread_pct_before = self.spread_pct if self.spread_enabled else 0.0
                         exit_price = self._apply_bid_ask_spread(stop_loss_price, is_buy_exit)
+                        spread_impact = exit_price - stop_loss_price
+                        print(f"[DEBUG STOP LOSS] Spread: enabled={self.spread_enabled}, pct={spread_pct_before:.4f}, impact=${spread_impact:.2f}", flush=True)
+                        print(f"[DEBUG STOP LOSS] Exit Price (after spread): ${exit_price:.2f}", flush=True)
                     else:
                         # For trailing stop: use current_price (trailing stop tracks current price)
                         is_buy_exit = self.state.position < 0  # Short position = buy to cover
+                        print(f"[DEBUG STOP LOSS] Trailing Stop: using current_price as base", flush=True)
                         exit_price = self._apply_bid_ask_spread(current_price, is_buy_exit)
+                        print(f"[DEBUG STOP LOSS] Exit Price (after spread): ${exit_price:.2f}", flush=True)
+                    
+                    # Calculate actual loss percentage
+                    if self.state.position > 0:  # Long
+                        actual_loss_pct = (self.state.entry_price - exit_price) / self.state.entry_price
+                    else:  # Short
+                        actual_loss_pct = (exit_price - self.state.entry_price) / self.state.entry_price
+                    
+                    print(f"[DEBUG STOP LOSS] Actual Loss: {actual_loss_pct*100:.4f}%", flush=True)
+                    print(f"[DEBUG STOP LOSS] Expected Loss: {self.stop_loss_pct*100:.4f}%", flush=True)
+                    print(f"[DEBUG STOP LOSS] Loss Difference: {(actual_loss_pct - self.stop_loss_pct)*100:.4f}%", flush=True)
+                    
+                    # CRITICAL: Check for price gaps - if current_price is way below stop loss, we have a gap
+                    if fixed_stop_loss_hit:
+                        if self.state.position > 0:  # Long
+                            price_gap_pct = (stop_loss_price - current_price) / stop_loss_price
+                            if price_gap_pct > 0.05:  # More than 5% gap
+                                print(f"[WARNING] PRICE GAP DETECTED: Current price ${current_price:.2f} is {price_gap_pct*100:.2f}% below stop loss ${stop_loss_price:.2f}", flush=True)
+                                print(f"[WARNING] Trade will exit at stop loss price ${exit_price:.2f}, not at gapped price", flush=True)
+                        else:  # Short
+                            price_gap_pct = (current_price - stop_loss_price) / stop_loss_price
+                            if price_gap_pct > 0.05:  # More than 5% gap
+                                print(f"[WARNING] PRICE GAP DETECTED: Current price ${current_price:.2f} is {price_gap_pct*100:.2f}% above stop loss ${stop_loss_price:.2f}", flush=True)
+                                print(f"[WARNING] Trade will exit at stop loss price ${exit_price:.2f}, not at gapped price", flush=True)
                     
                     # CRITICAL FIX #3: Division by zero guard (already checked entry_price > 0 above)
                     old_pnl = (exit_price - self.state.entry_price) / self.state.entry_price * self.state.position
                     trade_pnl_amount = old_pnl * self.initial_capital
                     trade_pnl_for_journal = trade_pnl_amount  # Store for journal callback
+                    
+                    print(f"[DEBUG STOP LOSS] Calculated PnL: ${trade_pnl_amount:.2f}", flush=True)
+                    print(f"[DEBUG STOP LOSS] {'='*60}\n", flush=True)
                     
                     # Log stop loss hit for diagnostics
                     import logging
@@ -1588,6 +1768,11 @@ class TradingEnvironment(gym.Env):
                             # Fallback: calculate exit_price if somehow not assigned
                             is_buy_exit = self.state.position < 0 if self.state.position != 0 else False
                             exit_price = self._apply_bid_ask_spread(current_price, is_buy_exit)
+                        
+                        # FIX 3: Determine direction and exit_reason
+                        direction = "LONG" if self.state.position > 0 else "SHORT" if self.state.position < 0 else None
+                        exit_reason = stop_type  # "TRAILING STOP" or "FIXED STOP LOSS"
+                        
                         trade_info_for_journal = {
                             "episode": getattr(self, '_current_episode', 0),
                             "step": self.current_step,
@@ -1596,7 +1781,9 @@ class TradingEnvironment(gym.Env):
                             "position_size": self._last_entry_position,
                             "pnl": trade_pnl_amount,
                             "entry_step": self._last_entry_step,
-                            "action_confidence": self._last_entry_action_confidence if self._last_entry_action_confidence is not None else abs(self._last_entry_position)  # Use stored confidence or fallback
+                            "action_confidence": self._last_entry_action_confidence if self._last_entry_action_confidence is not None else abs(self._last_entry_position),  # Use stored confidence or fallback
+                            "direction": direction,  # FIX 3: Add direction
+                            "exit_reason": exit_reason  # FIX 3: Add exit reason
                         }
                     
                     # Close position
@@ -1770,6 +1957,11 @@ class TradingEnvironment(gym.Env):
                             # Fallback: calculate exit_price if somehow not assigned
                             is_buy_exit = self.state.position < 0 if self.state.position != 0 else False
                             exit_price = self._apply_bid_ask_spread(current_price, is_buy_exit)
+                        
+                        # FIX 3: Determine direction and exit_reason for reversal
+                        old_direction = "LONG" if self.state.position > 0 else "SHORT" if self.state.position < 0 else None
+                        exit_reason = "REVERSAL"
+                        
                         trade_info_for_journal = {
                             "episode": getattr(self, '_current_episode', 0),
                             "step": self.current_step,
@@ -1778,7 +1970,9 @@ class TradingEnvironment(gym.Env):
                             "position_size": self._last_entry_position,
                             "pnl": trade_pnl_amount,
                             "entry_step": self._last_entry_step,
-                            "action_confidence": self._last_entry_action_confidence if self._last_entry_action_confidence is not None else abs(self._last_entry_position)
+                            "action_confidence": self._last_entry_action_confidence if self._last_entry_action_confidence is not None else abs(self._last_entry_position),
+                            "direction": old_direction,  # FIX 3: Add direction (old position before reversal)
+                            "exit_reason": exit_reason  # FIX 3: Add exit reason
                         }
                     
                     # Clear old entry price before setting new one for reversal
@@ -1820,6 +2014,15 @@ class TradingEnvironment(gym.Env):
                     direction = "LONG" if self.state.position > 0 else "SHORT"
                     print(f"[TRADE CLOSE] Step {self.current_step}: {direction} CLOSED | {outcome} | Entry=${self.state.entry_price:.2f} Exit=${exit_price:.2f} | PnL=${trade_pnl_amount:.2f} | Trades={self.state.trades_count}", flush=True)
                     
+                    # FIX 2: Debug logging for trade closure direction verification
+                    if self._last_entry_position is not None:
+                        entry_direction = "LONG" if self._last_entry_position > 0 else "SHORT"
+                        exit_direction = direction
+                        print(f"[DEBUG TRADE DIRECTION] Step {self.current_step}: TRADE CLOSED", flush=True)
+                        print(f"   Entry Direction: {entry_direction} (Position was {self._last_entry_position:.6f})", flush=True)
+                        print(f"   Exit Direction: {exit_direction} (Position is {self.state.position:.6f})", flush=True)
+                        print(f"   Direction Consistency: {'✓ MATCH' if entry_direction == exit_direction else '✗ MISMATCH'} (Entry and exit should match)", flush=True)
+                    
                     # Track PnL for expected value calculation
                     self.recent_trades_pnl.append(trade_pnl_amount)
                     if len(self.recent_trades_pnl) > self.recent_trades_window:
@@ -1849,6 +2052,11 @@ class TradingEnvironment(gym.Env):
                             # Fallback: calculate exit_price if somehow not assigned
                             is_buy_exit = self.state.position < 0 if self.state.position != 0 else False
                             exit_price = self._apply_bid_ask_spread(current_price, is_buy_exit)
+                        
+                        # FIX 3: Determine direction and exit_reason for position closed
+                        direction = "LONG" if self.state.position > 0 else "SHORT" if self.state.position < 0 else None
+                        exit_reason = "POSITION CLOSED"
+                        
                         trade_info_for_journal = {
                             "episode": getattr(self, '_current_episode', 0),
                             "step": self.current_step,
@@ -1857,7 +2065,9 @@ class TradingEnvironment(gym.Env):
                             "position_size": self._last_entry_position,
                             "pnl": trade_pnl_amount,
                             "entry_step": self._last_entry_step,
-                            "action_confidence": self._last_entry_action_confidence if self._last_entry_action_confidence is not None else abs(self._last_entry_position)  # Use stored confidence or fallback
+                            "action_confidence": self._last_entry_action_confidence if self._last_entry_action_confidence is not None else abs(self._last_entry_position),  # Use stored confidence or fallback
+                            "direction": direction,  # FIX 3: Add direction
+                            "exit_reason": exit_reason  # FIX 3: Add exit reason
                         }
                 self.state.entry_price = None
                 # Reset trailing stop tracking when position closed
@@ -1937,6 +2147,22 @@ class TradingEnvironment(gym.Env):
                 # Log trade opening
                 direction = "LONG" if new_position > 0 else "SHORT"
                 print(f"[TRADE OPEN] Step {self.current_step}: {direction} @ ${self.state.entry_price:.2f} (size={new_position:.3f}, action={self.action_value:.3f})", flush=True)
+                
+                # FIX 2: Enhanced debug logging for trade direction verification
+                print(f"[DEBUG TRADE DIRECTION] Step {self.current_step}: NEW TRADE OPENED", flush=True)
+                print(f"   Model Action Value: {self.action_value:.6f} ({'POSITIVE -> LONG' if self.action_value > 0 else 'NEGATIVE -> SHORT' if self.action_value < 0 else 'ZERO -> NEUTRAL'})", flush=True)
+                print(f"   Normalized Action: {normalized_action_value:.6f}", flush=True)
+                print(f"   Final Position: {new_position:.6f}", flush=True)
+                print(f"   Direction: {direction} (Position > 0 = LONG, Position < 0 = SHORT)", flush=True)
+                print(f"   Verification: Action {self.action_value:.6f} -> Position {new_position:.6f} -> Direction {direction}", flush=True)
+                
+                # FIX 2: Enhanced debug logging for trade direction verification
+                print(f"[DEBUG TRADE DIRECTION] Step {self.current_step}:", flush=True)
+                print(f"   Model Action Value: {self.action_value:.6f} ({'POSITIVE=LONG' if self.action_value > 0 else 'NEGATIVE=SHORT' if self.action_value < 0 else 'ZERO=NEUTRAL'})", flush=True)
+                print(f"   Normalized Action: {normalized_action_value:.6f}", flush=True)
+                print(f"   Final Position: {new_position:.6f}", flush=True)
+                print(f"   Direction: {direction} (Position > 0 = LONG, Position < 0 = SHORT)", flush=True)
+                print(f"   Verification: Action > 0 -> LONG ✓, Action < 0 -> SHORT ✓, Action = 0 -> NEUTRAL ✓", flush=True)
         
         # Calculate commission cost for this trade
         # CRITICAL FIX: Pass old and new positions to prevent double-charging (entry + exit)
@@ -1960,7 +2186,9 @@ class TradingEnvironment(gym.Env):
                         pnl=trade_info_for_journal["pnl"],
                         commission=commission_cost,
                         entry_step=trade_info_for_journal["entry_step"],
-                        action_confidence=trade_info_for_journal.get("action_confidence", abs(trade_info_for_journal["position_size"]))  # Pass actual confidence
+                        action_confidence=trade_info_for_journal.get("action_confidence", abs(trade_info_for_journal["position_size"])),  # Pass actual confidence
+                        direction=trade_info_for_journal.get("direction"),  # FIX 3: Pass direction
+                        exit_reason=trade_info_for_journal.get("exit_reason")  # FIX 3: Pass exit reason
                     )
                     # Clear entry tracking after callback
                     self._last_entry_price = None

@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
-import { TrendingUp, TrendingDown, DollarSign, BarChart3, RefreshCw, BookOpen, Zap } from 'lucide-react'
+import { TrendingUp, TrendingDown, DollarSign, BarChart3, RefreshCw, BookOpen, Zap, AlertTriangle, Activity, PlayCircle } from 'lucide-react'
 import CapabilityExplainer from './CapabilityExplainer'
 
 // Import recharts components (ES6 import - works with Vite)
@@ -29,6 +29,14 @@ const MonitoringPanel = () => {
   const [forecastLastUpdated, setForecastLastUpdated] = useState(null)
   const [checkpointResumeTimestamp, setCheckpointResumeTimestamp] = useState(null)
   const [filterBySession, setFilterBySession] = useState(false)  // Toggle: false = all trades, true = current session only
+  
+  // Log monitoring state
+  const [logMessages, setLogMessages] = useState([])
+  const [logLoading, setLogLoading] = useState(false)
+  const [showLogs, setShowLogs] = useState(true)
+  const [lastLogTimestamp, setLastLogTimestamp] = useState(null)
+  const [logAutoRefresh, setLogAutoRefresh] = useState(true)
+  const logMessagesEndRef = useRef(null)
 
   // Fetch checkpoint resume timestamp from training status
   const fetchCheckpointResumeTimestamp = async () => {
@@ -696,6 +704,50 @@ const MonitoringPanel = () => {
         )}
       </div>
 
+      {/* Log Monitoring Section */}
+      <div className="bg-white rounded-lg shadow p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <Activity className="w-5 h-5 text-blue-600" />
+            <h3 className="text-lg font-semibold text-gray-800">Real-Time Log Monitoring</h3>
+            {logMessages.length > 0 && (
+              <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">
+                {logMessages.length} messages
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setLogAutoRefresh(!logAutoRefresh)}
+              className={`px-3 py-1 text-sm rounded ${logAutoRefresh ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-600'}`}
+            >
+              {logAutoRefresh ? '🔄 Auto' : '⏸️ Paused'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowLogs(!showLogs)}
+              className="px-3 py-1 text-sm bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
+            >
+              {showLogs ? 'Hide' : 'Show'}
+            </button>
+          </div>
+        </div>
+
+        {showLogs && (
+          <LogMonitoringSection
+            logMessages={logMessages}
+            setLogMessages={setLogMessages}
+            logLoading={logLoading}
+            setLogLoading={setLogLoading}
+            lastLogTimestamp={lastLogTimestamp}
+            setLastLogTimestamp={setLastLogTimestamp}
+            autoRefresh={logAutoRefresh}
+            messagesEndRef={logMessagesEndRef}
+          />
+        )}
+      </div>
+
       {/* Additional Information */}
       <div className="bg-white rounded-lg shadow p-6">
         <h3 className="text-lg font-semibold text-gray-800 mb-4">Performance Targets</h3>
@@ -717,6 +769,200 @@ const MonitoringPanel = () => {
             <div className="text-sm text-gray-600">Target: &lt; 20%</div>
           </div>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// Log Monitoring Section Component
+const LogMonitoringSection = ({
+  logMessages,
+  setLogMessages,
+  logLoading,
+  setLogLoading,
+  lastLogTimestamp,
+  setLastLogTimestamp,
+  autoRefresh,
+  messagesEndRef
+}) => {
+  const loadLogMessages = useCallback(async () => {
+    try {
+      setLogLoading(true)
+      const url = `/api/monitoring/logs?limit=50${lastLogTimestamp ? `&last_seen=${lastLogTimestamp}` : ''}&_t=${Date.now()}`
+      const response = await axios.get(url)
+      
+      if (response.data.status === 'success') {
+        const newMessages = response.data.messages || []
+        
+        // Append new messages to existing ones (avoid duplicates)
+        setLogMessages(prev => {
+          const existingIds = new Set(prev.map(m => `${m.timestamp}-${m.message.substring(0, 50)}`))
+          const uniqueNew = newMessages.filter(m => {
+            const id = `${m.timestamp}-${m.message.substring(0, 50)}`
+            return !existingIds.has(id)
+          })
+          return [...prev, ...uniqueNew].slice(-200) // Keep last 200 messages
+        })
+        
+        if (newMessages.length > 0 && response.data.summary.last_timestamp) {
+          setLastLogTimestamp(response.data.summary.last_timestamp)
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load log messages:', error)
+    } finally {
+      setLogLoading(false)
+    }
+  }, [lastLogTimestamp])
+
+  useEffect(() => {
+    // Initial load
+    loadLogMessages()
+    
+    // Auto-refresh if enabled
+    if (autoRefresh) {
+      const interval = setInterval(() => {
+        loadLogMessages()
+      }, 3000) // Refresh every 3 seconds
+      
+      return () => clearInterval(interval)
+    }
+  }, [autoRefresh, loadLogMessages])
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    if (messagesEndRef.current && autoRefresh) {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [logMessages, autoRefresh])
+
+  const getCategoryIcon = (category) => {
+    switch (category) {
+      case 'critical_0_percent':
+        return '🔴'
+      case 'adaptive_adjustment':
+        return '🔄'
+      case 'adaptive_stop_loss':
+        return '🎯'
+      case 'short_position':
+        return '🎉'
+      case 'overconfident_model':
+        return '⚠️'
+      case 'directional_bias':
+        return '↔️'
+      case 'rapid_drawdown':
+        return '📉'
+      case 'reward_collapse':
+        return '💥'
+      default:
+        return '📝'
+    }
+  }
+
+  const getCategoryColor = (category) => {
+    switch (category) {
+      case 'critical_0_percent':
+        return 'bg-red-50 border-red-200'
+      case 'adaptive_adjustment':
+        return 'bg-blue-50 border-blue-200'
+      case 'adaptive_stop_loss':
+        return 'bg-yellow-50 border-yellow-200'
+      case 'short_position':
+        return 'bg-green-50 border-green-200'
+      case 'overconfident_model':
+        return 'bg-orange-50 border-orange-200'
+      case 'directional_bias':
+        return 'bg-purple-50 border-purple-200'
+      case 'rapid_drawdown':
+        return 'bg-red-100 border-red-300'
+      case 'reward_collapse':
+        return 'bg-pink-50 border-pink-200'
+      default:
+        return 'bg-white border-gray-200'
+    }
+  }
+
+  const getCategoryLabel = (category) => {
+    switch (category) {
+      case 'critical_0_percent':
+        return '🔴 CRITICAL: 0% Win Rate'
+      case 'adaptive_adjustment':
+        return '🔄 Adaptive Learning'
+      case 'adaptive_stop_loss':
+        return '🎯 Adaptive Stop Loss'
+      case 'short_position':
+        return '🎉 SHORT Position (Breakthrough!)'
+      case 'overconfident_model':
+        return '⚠️ Overconfident Model Warning'
+      case 'directional_bias':
+        return '↔️ Directional Bias (Always LONG/SHORT)'
+      case 'rapid_drawdown':
+        return '📉 Rapid Drawdown (>10%)'
+      case 'reward_collapse':
+        return '💥 Reward Collapse (Negative Rewards)'
+      default:
+        return '📝 Other'
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between text-sm text-gray-600">
+        <div>
+          Monitoring: Critical 0% win rate, Directional bias, Rapid drawdown, Reward collapse, Overconfident model, Adaptive learning, Stop loss changes, SHORT positions
+        </div>
+        <button
+          type="button"
+          onClick={loadLogMessages}
+          disabled={logLoading}
+          className="px-3 py-1 text-sm bg-blue-500 text-white rounded hover:bg-blue-600 disabled:opacity-50"
+        >
+          {logLoading ? 'Loading...' : 'Refresh'}
+        </button>
+      </div>
+
+      <div className="bg-gray-50 rounded-lg border border-gray-200 max-h-96 overflow-y-auto p-4 font-mono text-sm">
+        {logMessages.length === 0 ? (
+          <div className="text-center py-8 text-gray-500">
+            <p>No critical log messages found</p>
+            <p className="text-xs mt-2">Critical messages (0% win rate, directional bias, rapid drawdown, reward collapse, overconfident model, adaptive learning, SHORT positions) will appear here</p>
+            <p className="text-xs mt-1 text-gray-400">GPU and trade noise are filtered out</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {logMessages.map((msg, idx) => (
+              <div
+                key={idx}
+                className={`p-2 rounded border ${getCategoryColor(msg.category)}`}
+              >
+                <div className="flex items-start gap-2">
+                  <span className="text-lg">{getCategoryIcon(msg.category)}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="font-semibold text-xs text-gray-700">
+                        {getCategoryLabel(msg.category)}
+                      </span>
+                      {msg.timestamp && (
+                        <span className="text-xs text-gray-500">
+                          {msg.timestamp}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-gray-800 break-words whitespace-pre-wrap">
+                      {msg.message}
+                    </div>
+                    {msg.file && (
+                      <div className="text-xs text-gray-400 mt-1">
+                        From: {msg.file}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+        )}
       </div>
     </div>
   )

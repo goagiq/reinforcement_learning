@@ -1377,6 +1377,130 @@ class Trainer:
                 self.episode_win_rates.append(episode_win_rate)
                 self.episode_max_drawdowns.append(episode_max_drawdown)
                 
+                # CRITICAL: Check for overconfident model warning (IMMEDIATE RESPONSE REQUIRED)
+                # Similar to 0% win rate - this indicates degenerate policy needing immediate intervention
+                if self.adaptive_trainer and hasattr(self.env, '_last_episode_overconfident'):
+                    if self.env._last_episode_overconfident and self.env._last_episode_action_stats:
+                        action_stats = self.env._last_episode_action_stats
+                        print(f"\n[CRITICAL] OVERCONFIDENT MODEL DETECTED after episode {self.episode}:")
+                        print(f"   Max Action %: {action_stats['max_action_pct']*100:.1f}%")
+                        print(f"   Action Std: {action_stats['action_std']:.4f}")
+                        print(f"   Total Actions: {action_stats['total_actions']}")
+                        
+                        # Trigger immediate adaptive learning response
+                        adjustments = self.adaptive_trainer.respond_to_overconfident_model(
+                            action_stats=action_stats,
+                            agent=self.agent,
+                            timestep=self.timestep,
+                            episode=self.episode
+                        )
+                        
+                        if adjustments:
+                            print(f"[ADAPTIVE] ⚡ IMMEDIATE OVERCONFIDENT MODEL RESPONSE triggered after episode {self.episode}!")
+                            for key, value in adjustments.items():
+                                if isinstance(value, dict):
+                                    if 'old' in value and 'new' in value:
+                                        print(f"   {key}: {value.get('old', 'N/A')} -> {value.get('new', 'N/A')} ({value.get('reason', '')})")
+                                    else:
+                                        for sub_key, sub_value in value.items():
+                                            if isinstance(sub_value, dict) and 'old' in sub_value:
+                                                print(f"   {key}.{sub_key}: {sub_value.get('old', 'N/A')} -> {sub_value.get('new', 'N/A')}")
+                        
+                        # Also force evaluation if enough time has passed since last eval
+                        force_eval = self.adaptive_trainer.should_force_evaluate_for_overconfident_model(
+                            timestep=self.timestep,
+                            episode=self.episode,
+                            action_stats=action_stats
+                        )
+                        if force_eval:
+                            print(f"[ADAPTIVE] 🔥 FORCING EVALUATION due to overconfident model (bypassing normal eval frequency)")
+                
+                # CRITICAL: Check for directional bias (IMMEDIATE RESPONSE REQUIRED)
+                # Model always predicting LONG or SHORT indicates loss of market adaptability
+                if self.adaptive_trainer and hasattr(self.env, '_last_episode_directional_bias'):
+                    if self.env._last_episode_directional_bias:
+                        bias_direction = self.env._last_episode_directional_bias
+                        bias_pct = self.env._last_episode_directional_bias_pct
+                        print(f"\n[CRITICAL] DIRECTIONAL BIAS DETECTED after episode {self.episode}:")
+                        print(f"   Bias Direction: {bias_direction}")
+                        print(f"   Bias Percentage: {bias_pct*100:.1f}%")
+                        
+                        # Trigger immediate adaptive learning response
+                        adjustments = self.adaptive_trainer.respond_to_directional_bias(
+                            bias_direction=bias_direction,
+                            bias_pct=bias_pct,
+                            agent=self.agent,
+                            timestep=self.timestep,
+                            episode=self.episode
+                        )
+                        
+                        if adjustments:
+                            print(f"[ADAPTIVE] ⚡ IMMEDIATE DIRECTIONAL BIAS RESPONSE triggered after episode {self.episode}!")
+                            for key, value in adjustments.items():
+                                if isinstance(value, dict) and 'old' in value:
+                                    print(f"   {key}: {value.get('old', 'N/A')} -> {value.get('new', 'N/A')} ({value.get('reason', '')})")
+                
+                # CRITICAL: Check for rapid drawdown (IMMEDIATE RESPONSE REQUIRED)
+                # Rapid equity decline indicates risk management failure
+                if self.adaptive_trainer and len(self.episode_equities) >= 10:
+                    recent_equities = self.episode_equities[-10:]
+                    if len(recent_equities) > 0:
+                        peak_equity = max(recent_equities)
+                        current_equity = recent_equities[-1]
+                        drawdown_pct = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
+                        
+                        # Check for rapid drawdown (10% in last 10 episodes = CRITICAL)
+                        rapid_drawdown_threshold = 0.10  # 10%
+                        if drawdown_pct >= rapid_drawdown_threshold:
+                            print(f"\n[CRITICAL] RAPID DRAWDOWN DETECTED after episode {self.episode}:")
+                            print(f"   Peak Equity: ${peak_equity:,.2f}")
+                            print(f"   Current Equity: ${current_equity:,.2f}")
+                            print(f"   Drawdown: {drawdown_pct*100:.1f}%")
+                            
+                            # Trigger immediate adaptive learning response
+                            adjustments = self.adaptive_trainer.respond_to_rapid_drawdown(
+                                drawdown_pct=drawdown_pct,
+                                peak_equity=peak_equity,
+                                current_equity=current_equity,
+                                agent=self.agent,
+                                timestep=self.timestep,
+                                episode=self.episode
+                            )
+                            
+                            if adjustments:
+                                print(f"[ADAPTIVE] ⚡ IMMEDIATE RAPID DRAWDOWN RESPONSE triggered after episode {self.episode}!")
+                                for key, value in adjustments.items():
+                                    if isinstance(value, dict) and 'old' in value:
+                                        print(f"   {key}: {value.get('old', 'N/A')} -> {value.get('new', 'N/A')} ({value.get('reason', '')})")
+                
+                # CRITICAL: Check for reward collapse (IMMEDIATE RESPONSE REQUIRED)
+                # Consistently negative rewards indicate model not learning
+                if self.adaptive_trainer and len(self.episode_rewards) >= 20:
+                    recent_rewards = self.episode_rewards[-20:]
+                    mean_reward = sum(recent_rewards) / len(recent_rewards)
+                    
+                    # Check for reward collapse (< -0.5 for 20 episodes = CRITICAL)
+                    reward_collapse_threshold = -0.5
+                    if mean_reward <= reward_collapse_threshold:
+                        print(f"\n[CRITICAL] REWARD COLLAPSE DETECTED after episode {self.episode}:")
+                        print(f"   Mean Reward (Last 20): {mean_reward:.4f}")
+                        print(f"   Threshold: {reward_collapse_threshold:.4f}")
+                        
+                        # Trigger immediate adaptive learning response
+                        adjustments = self.adaptive_trainer.respond_to_reward_collapse(
+                            mean_reward=mean_reward,
+                            recent_rewards=recent_rewards,
+                            agent=self.agent,
+                            timestep=self.timestep,
+                            episode=self.episode
+                        )
+                        
+                        if adjustments:
+                            print(f"[ADAPTIVE] ⚡ IMMEDIATE REWARD COLLAPSE RESPONSE triggered after episode {self.episode}!")
+                            for key, value in adjustments.items():
+                                if isinstance(value, dict) and 'old' in value:
+                                    print(f"   {key}: {value.get('old', 'N/A')} -> {value.get('new', 'N/A')} ({value.get('reason', '')})")
+                
                 # CRITICAL FIX: Update adaptive trainer's consecutive_no_trade_episodes counter
                 if self.adaptive_trainer:
                     if episode_trades == 0:
@@ -1436,13 +1560,39 @@ class Trainer:
                         # Quick adjustment without full evaluation (ENHANCED: now uses journal data)
                         # Calculate total trades in recent episodes
                         recent_total_trades = sum(self.episode_trades[-10:]) if len(self.episode_trades) >= 10 else sum(self.episode_trades)
+                        recent_win_rate = sum(self.episode_win_rates[-10:]) / 10 if len(self.episode_win_rates) >= 10 else 0.0
+                        
+                        # CRITICAL FIX: Also check cumulative win rate from journal for 0% win rate detection
+                        # Use cumulative data if available (more reliable for 0% win rate check)
+                        cumulative_win_rate = None
+                        cumulative_total_trades = self.total_trades
+                        if cumulative_total_trades >= 10:
+                            cumulative_win_rate = (self.total_winning_trades / cumulative_total_trades) if cumulative_total_trades > 0 else 0.0
+                            
+                            # Try to get more accurate data from journal
+                            try:
+                                from src.trading_journal import TradingJournal
+                                journal = TradingJournal()
+                                stats = journal.get_statistics()
+                                journal_total_trades = stats.get('total_trades', 0)
+                                journal_winning_trades = stats.get('winning_trades', 0)
+                                if journal_total_trades > cumulative_total_trades:
+                                    cumulative_total_trades = journal_total_trades
+                                    cumulative_win_rate = (journal_winning_trades / journal_total_trades) if journal_total_trades > 0 else 0.0
+                            except Exception:
+                                pass
+                        
+                        # Use cumulative win rate for 0% win rate check (more reliable)
+                        # Fall back to recent_win_rate if cumulative not available
+                        win_rate_for_check = cumulative_win_rate if cumulative_win_rate is not None else recent_win_rate
+                        total_trades_for_check = cumulative_total_trades if cumulative_total_trades >= 10 else recent_total_trades
                         
                         quick_adjustments = self.adaptive_trainer.quick_adjust_for_negative_trend(
                             recent_mean_pnl=recent_mean_pnl,
-                            recent_win_rate=sum(self.episode_win_rates[-10:]) / 10 if len(self.episode_win_rates) >= 10 else 0.0,
+                            recent_win_rate=win_rate_for_check,  # Use cumulative or recent win rate
                             agent=self.agent,
                             recent_trades_data=recent_trades_data,  # NEW: Pass journal data
-                            recent_total_trades=recent_total_trades  # NEW: Pass total trades count
+                            recent_total_trades=total_trades_for_check  # Use cumulative or recent trades count
                         )
                         if quick_adjustments:
                             print(f"[ADAPT] Quick adjustment triggered: {len(quick_adjustments)} adjustments")
@@ -1540,21 +1690,97 @@ class Trainer:
                         )
             
             # Evaluation and adaptive adjustment
+            # FIX 4: Check for 0% win rate and force evaluation immediately
+            force_eval_zero_win_rate = False
+            if self.adaptive_trainer:
+                # Get cumulative trades and win rate (not just current episode)
+                total_trades = self.total_trades  # Cumulative across all episodes
+                win_rate = (self.total_winning_trades / total_trades) if total_trades > 0 else 0.0
+                
+                # FIX 4: Also check journal for more accurate cumulative stats
+                try:
+                    from src.trading_journal import TradingJournal
+                    import sqlite3
+                    from pathlib import Path
+                    
+                    journal_path = Path("logs/trading_journal.db")
+                    if journal_path.exists():
+                        conn = sqlite3.connect(str(journal_path))
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT COUNT(*) FROM trades")
+                        journal_total_trades = cursor.fetchone()[0]
+                        cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1")
+                        journal_winning_trades = cursor.fetchone()[0]
+                        journal_win_rate = journal_winning_trades / journal_total_trades if journal_total_trades > 0 else 0.0
+                        conn.close()
+                        
+                        # Use journal stats if they have more trades (more reliable)
+                        if journal_total_trades > total_trades:
+                            total_trades = journal_total_trades
+                            win_rate = journal_win_rate
+                except Exception:
+                    # Journal check failed - use trainer stats
+                    pass
+                
+                # FIX 4: Force evaluation if 0% win rate with 10+ cumulative trades
+                force_eval_zero_win_rate = self.adaptive_trainer.should_force_evaluate_for_zero_win_rate(
+                    total_trades=total_trades,
+                    win_rate=win_rate,
+                    timestep=self.timestep
+                )
+            
             # CRITICAL FIX: Also check for evaluation if timestep is stuck at 0
             # Use episode-based evaluation when timestep is 0
             # FIX: Check both eval_freq (config) and adaptive_trainer.should_evaluate() to ensure evaluations happen
-            should_eval = False
-            if self.timestep > 0:
-                # Check if timestep matches eval_freq OR if adaptive trainer says we should evaluate
-                should_eval = (self.timestep % self.eval_freq == 0) or \
-                             (self.adaptive_trainer and self.adaptive_trainer.should_evaluate(self.timestep))
-            elif self.timestep == 0 and self.adaptive_trainer:
-                # If timestep is stuck at 0, use episode-based evaluation (every 10 episodes)
-                should_eval = (self.episode > 0 and self.episode % 10 == 0)
+            # FIX 4: Also check if we should force evaluation due to 0% win rate
+            should_eval = force_eval_zero_win_rate  # Force eval takes priority
+            if not should_eval:
+                if self.timestep > 0:
+                    # Check if timestep matches eval_freq OR if adaptive trainer says we should evaluate
+                    should_eval = (self.timestep % self.eval_freq == 0) or \
+                                 (self.adaptive_trainer and self.adaptive_trainer.should_evaluate(self.timestep))
+                elif self.timestep == 0 and self.adaptive_trainer:
+                    # If timestep is stuck at 0, use episode-based evaluation (every 10 episodes)
+                    should_eval = (self.episode > 0 and self.episode % 10 == 0)
             
             if should_eval:
-                if self.adaptive_trainer and (self.timestep > 0 and self.adaptive_trainer.should_evaluate(self.timestep)) or \
-                   (self.timestep == 0 and self.adaptive_trainer):
+                # FIX 4: Check if this is a forced evaluation due to 0% win rate
+                if force_eval_zero_win_rate:
+                    print(f"\n{'='*70}")
+                    print(f"[FIX 4] FORCING ADAPTIVE LEARNING EVALUATION")
+                    print(f"{'='*70}")
+                    # Get cumulative trades count
+                    cumulative_trades = self.total_trades
+                    cumulative_win_rate = (self.total_winning_trades / cumulative_trades) if cumulative_trades > 0 else 0.0
+                    
+                    # Try journal for more accurate count
+                    try:
+                        from src.trading_journal import TradingJournal
+                        import sqlite3
+                        from pathlib import Path
+                        journal_path = Path("logs/trading_journal.db")
+                        if journal_path.exists():
+                            conn = sqlite3.connect(str(journal_path))
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT COUNT(*) FROM trades")
+                            journal_total_trades = cursor.fetchone()[0]
+                            if journal_total_trades > cumulative_trades:
+                                cumulative_trades = journal_total_trades
+                                cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1")
+                                journal_winning_trades = cursor.fetchone()[0]
+                                cumulative_win_rate = journal_winning_trades / journal_total_trades if journal_total_trades > 0 else 0.0
+                            conn.close()
+                    except Exception:
+                        pass
+                    
+                    print(f"Reason: 0% win rate detected with {cumulative_trades} cumulative trades")
+                    print(f"Win Rate: {cumulative_win_rate:.1%} (Wins: {int(cumulative_trades * cumulative_win_rate)}, Losses: {int(cumulative_trades * (1 - cumulative_win_rate))})")
+                    print(f"This evaluation will trigger immediately (bypassing normal {self.eval_freq:,} timestep interval)")
+                    print(f"{'='*70}\n", flush=True)
+                
+                # FIX 4: Allow forced evaluation even if normal should_evaluate() would return False
+                if self.adaptive_trainer and ((self.timestep > 0 and (self.adaptive_trainer.should_evaluate(self.timestep) or force_eval_zero_win_rate)) or \
+                   (self.timestep == 0 and self.adaptive_trainer) or force_eval_zero_win_rate):
                     # Use adaptive trainer for intelligent evaluation and adjustment
                     checkpoint_path = self.model_dir / f"checkpoint_{self.timestep}.pt"
                     if not checkpoint_path.exists():

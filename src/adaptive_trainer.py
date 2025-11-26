@@ -157,6 +157,10 @@ class AdaptiveTrainer:
         self.last_adjustment_timestep = 0
         self.min_adjustment_interval = 1000  # Minimum time between adjustments (allow more frequent adjustments)
         self._last_adjustment_episode = 0  # Track last adjustment episode (for when timestep is stuck)
+        self.last_overconfident_response_timestep = 0  # Track last overconfident model response
+        self.last_directional_bias_response_timestep = 0  # Track last directional bias response
+        self.last_rapid_drawdown_response_timestep = 0  # Track last rapid drawdown response
+        self.last_reward_collapse_response_timestep = 0  # Track last reward collapse response
         
         # Logging
         self.log_dir = Path("logs/adaptive_training")
@@ -194,7 +198,68 @@ class AdaptiveTrainer:
         """
         adjustments = {}
         
-        # CRITICAL FIX: If there are no trades, DON'T tighten filters - this makes the problem worse!
+        # CRITICAL FIX #1: Check 0% win rate FIRST - never tighten filters when win rate is 0%
+        # 0% win rate requires exploration, not tighter filters
+        # Use small epsilon for floating point comparison
+        if recent_win_rate <= 0.001 and recent_total_trades >= 10:  # Treat <0.1% as 0%
+            # 0% win rate detected - INCREASE exploration instead of tightening
+            old_entropy = self.current_entropy_coef
+            old_penalty = self.current_inaction_penalty
+            old_confidence = self.current_min_action_confidence
+            old_quality = self.current_min_quality_score
+            
+            # Increase entropy to encourage exploration
+            self.current_entropy_coef = min(
+                self.adaptive_config.max_entropy_coef,
+                self.current_entropy_coef * 1.5  # Increase by 50%
+            )
+            agent.entropy_coef = self.current_entropy_coef
+            
+            # Increase inaction penalty to encourage trading
+            self.current_inaction_penalty = min(
+                self.adaptive_config.inaction_penalty_max,
+                self.current_inaction_penalty * 2.0  # Double it
+            )
+            
+            # Relax filters slightly (don't tighten!)
+            self.current_min_action_confidence = max(0.1, self.current_min_action_confidence * 0.90)
+            self.current_min_quality_score = max(0.3, self.current_min_quality_score * 0.90)
+            
+            adjustments["entropy_coef"] = {
+                "old": old_entropy,
+                "new": self.current_entropy_coef,
+                "reason": f"CRITICAL: 0% win rate ({recent_total_trades} trades) - increasing exploration"
+            }
+            adjustments["inaction_penalty"] = {
+                "old": old_penalty,
+                "new": self.current_inaction_penalty,
+                "reason": f"CRITICAL: 0% win rate - encouraging trading activity"
+            }
+            adjustments["quality_filters"] = {
+                "min_action_confidence": {
+                    "old": old_confidence,
+                    "new": self.current_min_action_confidence,
+                    "reason": f"CRITICAL: 0% win rate - relaxing to allow more diverse trades"
+                },
+                "min_quality_score": {
+                    "old": old_quality,
+                    "new": self.current_min_quality_score,
+                    "reason": f"CRITICAL: 0% win rate - relaxing to allow more diverse trades"
+                }
+            }
+            
+            self._update_reward_config()
+            print(f"\n[CRITICAL] 0% WIN RATE DETECTED (Quick Adjustment - Every Episode):")
+            print(f"   Total Trades: {recent_total_trades}")
+            print(f"   Win Rate: {recent_win_rate:.1%}")
+            print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} (increased exploration)")
+            print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f} (encouraging trading)")
+            print(f"   Confidence: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed)")
+            print(f"   Quality: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed)")
+            print(f"   [NOTE] This runs EVERY EPISODE for immediate response to 0% win rate!")
+            return adjustments
+        
+        # CRITICAL FIX #2: If there are no trades, DON'T tighten filters - this makes the problem worse!
         # Instead, we should relax filters to allow trades to happen
         if recent_total_trades == 0:
             # No trades detected - relax quality filters to encourage trading
@@ -244,8 +309,9 @@ class AdaptiveTrainer:
                 self._update_reward_config()
                 return adjustments
         
-        # Only adjust if negative trend is significant AND we have trades
-        if recent_mean_pnl < 0 and recent_total_trades > 0:
+        # Only adjust if negative trend is significant AND we have trades AND win rate > 0%
+        # Skip tightening if win rate is 0% (handled above)
+        if recent_mean_pnl < 0 and recent_total_trades > 0 and recent_win_rate > 0.0:
             # Calculate severity of losing streak
             # More negative PnL = more aggressive adjustment
             pnl_severity = abs(recent_mean_pnl) / 100.0  # Normalize (e.g., -$100 = 1.0 severity)
@@ -343,6 +409,482 @@ class AdaptiveTrainer:
                    (hasattr(self, '_last_eval_episode') and 
                     (self.consecutive_no_trade_episodes - getattr(self, '_last_eval_episode', 0)) >= episode_frequency)
         return (timestep - self.last_eval_timestep) >= self.adaptive_config.eval_frequency
+    
+    def should_force_evaluate_for_zero_win_rate(
+        self,
+        total_trades: int,
+        win_rate: float,
+        timestep: int
+    ) -> bool:
+        """
+        FIX 4: Force evaluation immediately if 0% win rate with 10+ trades.
+        
+        This bypasses the normal eval_frequency check to trigger immediate action.
+        
+        Args:
+            total_trades: Total number of trades so far
+            win_rate: Current win rate (0.0 to 1.0)
+            timestep: Current timestep
+        
+        Returns:
+            True if evaluation should be forced, False otherwise
+        """
+        # Check for 0% win rate with sufficient trades
+        if win_rate == 0.0 and total_trades >= 10:
+            # Don't force if we just evaluated recently (within last 1000 timesteps)
+            # This prevents spam while still allowing quick response
+            min_time_since_last_eval = 1000
+            time_since_last_eval = timestep - self.last_eval_timestep
+            
+            if time_since_last_eval >= min_time_since_last_eval:
+                print(f"\n[FIX 4] FORCING EVALUATION: 0% win rate with {total_trades} trades (bypassing normal eval frequency)", flush=True)
+                return True
+        
+        return False
+    
+    def respond_to_overconfident_model(
+        self,
+        action_stats: Dict,
+        agent,
+        timestep: int,
+        episode: int
+    ) -> Optional[Dict]:
+        """
+        QUANT TRADER FIX: Immediate response to overconfident model warning.
+        
+        When 80%+ of actions are near maximum (±0.95), the model has lost exploration
+        and converged to a degenerate policy. This requires IMMEDIATE intervention,
+        similar to 0% win rate.
+        
+        Response Strategy:
+        1. SIGNIFICANTLY increase entropy (exploration) - 2x to 3x increase
+        2. Relax quality filters to allow more diverse actions
+        3. Potentially increase learning rate temporarily
+        4. This runs IMMEDIATELY when detected - no waiting for evaluation cycle
+        
+        Args:
+            action_stats: Dictionary with action distribution stats from environment
+            agent: PPOAgent instance
+            timestep: Current timestep
+            episode: Current episode
+            
+        Returns:
+            Dict with adjustments made, or None if no adjustments needed
+        """
+        max_action_pct = action_stats.get('max_action_pct', 0.0)
+        action_std = action_stats.get('action_std', 0.0)
+        
+        # Only respond if truly overconfident (80%+ near max)
+        if max_action_pct < 0.8:
+            return None
+        
+        # Check if we've responded recently (prevent spam)
+        min_time_since_last_overconfident_response = 2000  # 2k timesteps
+        if hasattr(self, 'last_overconfident_response_timestep'):
+            time_since_last = timestep - self.last_overconfident_response_timestep
+            if time_since_last < min_time_since_last_overconfident_response:
+                # Already responded recently - skip to avoid spam
+                return None
+        
+        adjustments = {}
+        
+        # CRITICAL: SIGNIFICANTLY increase entropy (exploration)
+        # Overconfident = model stuck in local minimum, needs aggressive exploration
+        old_entropy = self.current_entropy_coef
+        entropy_increase_factor = 2.5  # 2.5x increase for overconfident models (more aggressive than 0% win rate)
+        self.current_entropy_coef = min(
+            self.adaptive_config.max_entropy_coef,
+            self.current_entropy_coef * entropy_increase_factor
+        )
+        agent.entropy_coef = self.current_entropy_coef
+        
+        # Increase inaction penalty to encourage diverse trading
+        old_penalty = self.current_inaction_penalty
+        self.current_inaction_penalty = min(
+            self.adaptive_config.inaction_penalty_max,
+            self.current_inaction_penalty * 1.5  # Moderate increase
+        )
+        
+        # RELAX quality filters significantly to allow more diverse actions
+        old_confidence = self.current_min_action_confidence
+        old_quality = self.current_min_quality_score
+        self.current_min_action_confidence = max(0.05, self.current_min_action_confidence * 0.75)  # Reduce by 25%
+        self.current_min_quality_score = max(0.2, self.current_min_quality_score * 0.75)  # Reduce by 25%
+        
+        adjustments["entropy_coef"] = {
+            "old": old_entropy,
+            "new": self.current_entropy_coef,
+            "reason": f"CRITICAL: Overconfident model ({max_action_pct*100:.1f}% near max, std={action_std:.4f}) - AGGRESSIVE exploration increase"
+        }
+        adjustments["inaction_penalty"] = {
+            "old": old_penalty,
+            "new": self.current_inaction_penalty,
+            "reason": f"CRITICAL: Overconfident model - encouraging diverse trading activity"
+        }
+        adjustments["quality_filters"] = {
+            "min_action_confidence": {
+                "old": old_confidence,
+                "new": self.current_min_action_confidence,
+                "reason": f"CRITICAL: Overconfident model - relaxing to allow more diverse actions"
+            },
+            "min_quality_score": {
+                "old": old_quality,
+                "new": self.current_min_quality_score,
+                "reason": f"CRITICAL: Overconfident model - relaxing to allow more diverse actions"
+            }
+        }
+        
+        self._update_reward_config()
+        self.last_overconfident_response_timestep = timestep
+        
+        print(f"\n[CRITICAL] OVERCONFIDENT MODEL RESPONSE (Immediate - Every Episode):")
+        print(f"   Max Action %: {max_action_pct*100:.1f}%")
+        print(f"   Action Std: {action_std:.4f} (low std = less exploration)")
+        print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} ({entropy_increase_factor}x increase - AGGRESSIVE)")
+        print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f}")
+        print(f"   Confidence Filter: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed 25%)")
+        print(f"   Quality Filter: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed 25%)")
+        print(f"   [NOTE] This runs IMMEDIATELY when detected - no waiting for evaluation cycle!")
+        
+        return adjustments
+    
+    def should_force_evaluate_for_overconfident_model(
+        self,
+        timestep: int,
+        episode: int,
+        action_stats: Dict
+    ) -> bool:
+        """
+        QUANT TRADER FIX: Force immediate evaluation when overconfident model detected.
+        
+        Similar to 0% win rate fix - bypasses normal eval_frequency to trigger
+        immediate comprehensive evaluation and adjustment.
+        
+        Args:
+            timestep: Current timestep
+            episode: Current episode
+            action_stats: Dictionary with action distribution stats
+            
+        Returns:
+            True if evaluation should be forced, False otherwise
+        """
+        max_action_pct = action_stats.get('max_action_pct', 0.0)
+        
+        # Only force if truly overconfident
+        if max_action_pct < 0.8:
+            return False
+        
+        # Don't force if we just evaluated recently (within last 1000 timesteps)
+        # This prevents spam while still allowing quick response
+        min_time_since_last_eval = 1000
+        time_since_last_eval = timestep - self.last_eval_timestep
+        
+        if time_since_last_eval >= min_time_since_last_eval:
+            print(f"\n[CRITICAL] FORCING EVALUATION: Overconfident model ({max_action_pct*100:.1f}% near max) - bypassing normal eval frequency", flush=True)
+            return True
+        
+        return False
+    
+    def respond_to_directional_bias(
+        self,
+        bias_direction: str,
+        bias_pct: float,
+        agent,
+        timestep: int,
+        episode: int
+    ) -> Optional[Dict]:
+        """
+        QUANT TRADER FIX: Immediate response to directional bias detection.
+        
+        When 90%+ of actions are in one direction (LONG or SHORT), the model
+        has lost market adaptability and is stuck in one direction. This requires
+        immediate intervention to restore balance.
+        
+        Response Strategy:
+        1. Increase entropy (1.5x) to encourage exploration of opposite direction
+        2. Relax quality filters (15%) to allow counter-trend trades
+        3. Increase inaction penalty moderately to encourage diverse trading
+        
+        Args:
+            bias_direction: "LONG" or "SHORT" indicating the bias
+            bias_pct: Percentage of actions in biased direction (0.9-1.0)
+            agent: PPOAgent instance
+            timestep: Current timestep
+            episode: Current episode
+            
+        Returns:
+            Dict with adjustments made, or None if no adjustments needed
+        """
+        # Check if we've responded recently (prevent spam)
+        min_time_since_last_bias_response = 2000  # 2k timesteps
+        if hasattr(self, 'last_directional_bias_response_timestep'):
+            time_since_last = timestep - self.last_directional_bias_response_timestep
+            if time_since_last < min_time_since_last_bias_response:
+                return None
+        
+        adjustments = {}
+        
+        # Increase entropy to encourage exploration of opposite direction
+        old_entropy = self.current_entropy_coef
+        entropy_increase_factor = 1.5  # Moderate increase (less than overconfident 2.5x)
+        self.current_entropy_coef = min(
+            self.adaptive_config.max_entropy_coef,
+            self.current_entropy_coef * entropy_increase_factor
+        )
+        agent.entropy_coef = self.current_entropy_coef
+        
+        # Increase inaction penalty moderately
+        old_penalty = self.current_inaction_penalty
+        self.current_inaction_penalty = min(
+            self.adaptive_config.inaction_penalty_max,
+            self.current_inaction_penalty * 1.3  # 30% increase
+        )
+        
+        # Relax quality filters to allow counter-trend trades
+        old_confidence = self.current_min_action_confidence
+        old_quality = self.current_min_quality_score
+        self.current_min_action_confidence = max(0.05, self.current_min_action_confidence * 0.85)  # Reduce by 15%
+        self.current_min_quality_score = max(0.2, self.current_min_quality_score * 0.85)  # Reduce by 15%
+        
+        adjustments["entropy_coef"] = {
+            "old": old_entropy,
+            "new": self.current_entropy_coef,
+            "reason": f"CRITICAL: Directional bias ({bias_direction} {bias_pct*100:.1f}%) - increasing exploration to restore balance"
+        }
+        adjustments["inaction_penalty"] = {
+            "old": old_penalty,
+            "new": self.current_inaction_penalty,
+            "reason": f"CRITICAL: Directional bias - encouraging diverse trading activity"
+        }
+        adjustments["quality_filters"] = {
+            "min_action_confidence": {
+                "old": old_confidence,
+                "new": self.current_min_action_confidence,
+                "reason": f"CRITICAL: Directional bias - relaxing to allow counter-trend trades"
+            },
+            "min_quality_score": {
+                "old": old_quality,
+                "new": self.current_min_quality_score,
+                "reason": f"CRITICAL: Directional bias - relaxing to allow counter-trend trades"
+            }
+        }
+        
+        self._update_reward_config()
+        self.last_directional_bias_response_timestep = timestep
+        
+        print(f"\n[CRITICAL] DIRECTIONAL BIAS RESPONSE (Immediate - Every Episode):")
+        print(f"   Bias Direction: {bias_direction}")
+        print(f"   Bias Percentage: {bias_pct*100:.1f}%")
+        print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} ({entropy_increase_factor}x increase)")
+        print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f}")
+        print(f"   Confidence Filter: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed 15%)")
+        print(f"   Quality Filter: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed 15%)")
+        print(f"   [NOTE] This runs IMMEDIATELY when detected - no waiting for evaluation cycle!")
+        
+        return adjustments
+    
+    def respond_to_rapid_drawdown(
+        self,
+        drawdown_pct: float,
+        peak_equity: float,
+        current_equity: float,
+        agent,
+        timestep: int,
+        episode: int
+    ) -> Optional[Dict]:
+        """
+        QUANT TRADER FIX: Immediate response to rapid drawdown detection.
+        
+        When equity drops rapidly (10%+ in 10 episodes), this indicates:
+        - Risk management failure
+        - Model taking bad trades
+        - Market conditions changed
+        
+        Response Strategy:
+        1. Tighten stop loss (reduce by 20% - more aggressive risk management)
+        2. Reduce position sizing temporarily (reduce max position by 25%)
+        3. Increase risk penalty in reward function
+        4. Force evaluation immediately
+        
+        Args:
+            drawdown_pct: Percentage drawdown from peak (0.0-1.0)
+            peak_equity: Peak equity value
+            current_equity: Current equity value
+            agent: PPOAgent instance
+            timestep: Current timestep
+            episode: Current episode
+            
+        Returns:
+            Dict with adjustments made, or None if no adjustments needed
+        """
+        # Check if we've responded recently (prevent spam)
+        min_time_since_last_drawdown_response = 3000  # 3k timesteps (less frequent than others)
+        if hasattr(self, 'last_rapid_drawdown_response_timestep'):
+            time_since_last = timestep - self.last_rapid_drawdown_response_timestep
+            if time_since_last < min_time_since_last_drawdown_response:
+                return None
+        
+        adjustments = {}
+        
+        # Reduce position sizing temporarily (risk reduction)
+        # Note: Position sizing is handled in environment, but we can log this for manual review
+        # For now, we'll focus on stop loss and risk penalty
+        
+        # Tighten stop loss (more aggressive - reduce by 20%)
+        # Note: Stop loss is in environment config, we'll log recommendation
+        # The adaptive stop loss system should handle this, but we'll trigger it
+        
+        # Increase risk penalty (more conservative)
+        # This is done through reward config, but we'll increase drawdown penalty
+        
+        # Relax quality filters slightly (allow fewer trades but higher quality)
+        old_confidence = self.current_min_action_confidence
+        old_quality = self.current_min_quality_score
+        # Actually, tighten filters for rapid drawdown (opposite of other responses)
+        self.current_min_action_confidence = min(0.2, self.current_min_action_confidence * 1.15)  # Increase by 15%
+        self.current_min_quality_score = min(0.5, self.current_min_quality_score * 1.15)  # Increase by 15%
+        
+        # Increase entropy slightly to explore new strategies
+        old_entropy = self.current_entropy_coef
+        self.current_entropy_coef = min(
+            self.adaptive_config.max_entropy_coef,
+            self.current_entropy_coef * 1.2  # 20% increase (moderate)
+        )
+        agent.entropy_coef = self.current_entropy_coef
+        
+        adjustments["entropy_coef"] = {
+            "old": old_entropy,
+            "new": self.current_entropy_coef,
+            "reason": f"CRITICAL: Rapid drawdown ({drawdown_pct*100:.1f}%) - exploring new strategies"
+        }
+        adjustments["quality_filters"] = {
+            "min_action_confidence": {
+                "old": old_confidence,
+                "new": self.current_min_action_confidence,
+                "reason": f"CRITICAL: Rapid drawdown - tightening to reduce risk (15% increase)"
+            },
+            "min_quality_score": {
+                "old": old_quality,
+                "new": self.current_min_quality_score,
+                "reason": f"CRITICAL: Rapid drawdown - tightening to reduce risk (15% increase)"
+            }
+        }
+        adjustments["risk_management"] = {
+            "drawdown_pct": drawdown_pct,
+            "recommendation": "Tighten stop loss by 20%, reduce max position size by 25%",
+            "reason": f"CRITICAL: Rapid drawdown ({drawdown_pct*100:.1f}%) requires aggressive risk management"
+        }
+        
+        self._update_reward_config()
+        self.last_rapid_drawdown_response_timestep = timestep
+        
+        print(f"\n[CRITICAL] RAPID DRAWDOWN RESPONSE (Immediate - Every Episode):")
+        print(f"   Drawdown: {drawdown_pct*100:.1f}% (Peak: ${peak_equity:,.2f} -> Current: ${current_equity:,.2f})")
+        print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} (20% increase)")
+        print(f"   Confidence Filter: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (tightened 15%)")
+        print(f"   Quality Filter: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (tightened 15%)")
+        print(f"   [WARNING] Consider tightening stop loss by 20% and reducing max position size by 25%")
+        print(f"   [NOTE] This runs IMMEDIATELY when detected - no waiting for evaluation cycle!")
+        
+        return adjustments
+    
+    def respond_to_reward_collapse(
+        self,
+        mean_reward: float,
+        recent_rewards: List[float],
+        agent,
+        timestep: int,
+        episode: int
+    ) -> Optional[Dict]:
+        """
+        QUANT TRADER FIX: Immediate response to reward collapse detection.
+        
+        When rewards are consistently negative (< -0.5 for 20 episodes), this indicates:
+        - Model not learning from experience
+        - Reward function misalignment
+        - Poor trade quality
+        
+        Response Strategy:
+        1. Increase exploration (entropy 1.3x) to explore new strategies
+        2. Relax quality filters (10%) to allow more trades for learning
+        3. Increase inaction penalty to encourage trading activity
+        
+        Args:
+            mean_reward: Mean reward over last 20 episodes
+            recent_rewards: List of recent rewards
+            agent: PPOAgent instance
+            timestep: Current timestep
+            episode: Current episode
+            
+        Returns:
+            Dict with adjustments made, or None if no adjustments needed
+        """
+        # Check if we've responded recently (prevent spam)
+        min_time_since_last_reward_response = 3000  # 3k timesteps
+        if hasattr(self, 'last_reward_collapse_response_timestep'):
+            time_since_last = timestep - self.last_reward_collapse_response_timestep
+            if time_since_last < min_time_since_last_reward_response:
+                return None
+        
+        adjustments = {}
+        
+        # Increase exploration to find new strategies
+        old_entropy = self.current_entropy_coef
+        entropy_increase_factor = 1.3  # Moderate increase
+        self.current_entropy_coef = min(
+            self.adaptive_config.max_entropy_coef,
+            self.current_entropy_coef * entropy_increase_factor
+        )
+        agent.entropy_coef = self.current_entropy_coef
+        
+        # Increase inaction penalty to encourage trading
+        old_penalty = self.current_inaction_penalty
+        self.current_inaction_penalty = min(
+            self.adaptive_config.inaction_penalty_max,
+            self.current_inaction_penalty * 1.4  # 40% increase
+        )
+        
+        # Relax quality filters slightly to allow more trades for learning
+        old_confidence = self.current_min_action_confidence
+        old_quality = self.current_min_quality_score
+        self.current_min_action_confidence = max(0.05, self.current_min_action_confidence * 0.90)  # Reduce by 10%
+        self.current_min_quality_score = max(0.2, self.current_min_quality_score * 0.90)  # Reduce by 10%
+        
+        adjustments["entropy_coef"] = {
+            "old": old_entropy,
+            "new": self.current_entropy_coef,
+            "reason": f"CRITICAL: Reward collapse (mean={mean_reward:.4f}) - increasing exploration to find new strategies"
+        }
+        adjustments["inaction_penalty"] = {
+            "old": old_penalty,
+            "new": self.current_inaction_penalty,
+            "reason": f"CRITICAL: Reward collapse - encouraging trading activity for learning"
+        }
+        adjustments["quality_filters"] = {
+            "min_action_confidence": {
+                "old": old_confidence,
+                "new": self.current_min_action_confidence,
+                "reason": f"CRITICAL: Reward collapse - relaxing to allow more trades for learning"
+            },
+            "min_quality_score": {
+                "old": old_quality,
+                "new": self.current_min_quality_score,
+                "reason": f"CRITICAL: Reward collapse - relaxing to allow more trades for learning"
+            }
+        }
+        
+        self._update_reward_config()
+        self.last_reward_collapse_response_timestep = timestep
+        
+        print(f"\n[CRITICAL] REWARD COLLAPSE RESPONSE (Immediate - Every Episode):")
+        print(f"   Mean Reward (Last 20): {mean_reward:.4f}")
+        print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} ({entropy_increase_factor}x increase)")
+        print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f}")
+        print(f"   Confidence Filter: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed 10%)")
+        print(f"   Quality Filter: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed 10%)")
+        print(f"   [NOTE] This runs IMMEDIATELY when detected - no waiting for evaluation cycle!")
+        
+        return adjustments
     
     def check_trading_activity(
         self,
@@ -639,11 +1181,25 @@ class AdaptiveTrainer:
         Returns:
             Dict with profitability analysis
         """
+        # CRITICAL FIX: 0% win rate is ALWAYS unprofitable, regardless of trade count
+        current_win_rate = winning_trades / max(1, total_trades)
+        if current_win_rate == 0.0 and total_trades >= 10:
+            # 0% win rate with 10+ trades means model is broken - always unprofitable
+            return {
+                "is_profitable": False,
+                "breakeven_win_rate": 0.5,
+                "current_win_rate": 0.0,
+                "avg_win": 0.0,
+                "avg_loss": abs(sum(losing_pnls[-self.rolling_window:]) / len(losing_pnls[-self.rolling_window:])) if losing_pnls else 100.0,
+                "expected_value": -1000000.0,  # Large negative to ensure unprofitable
+                "reason": "0% win rate detected - model is broken"
+            }
+        
         if total_trades < 50:  # Not enough data
             return {
                 "is_profitable": True,
                 "breakeven_win_rate": 0.5,
-                "current_win_rate": winning_trades / max(1, total_trades),
+                "current_win_rate": current_win_rate,
                 "reason": "Not enough data"
             }
         
@@ -652,10 +1208,21 @@ class AdaptiveTrainer:
         recent_losing = losing_pnls[-self.rolling_window:] if len(losing_pnls) > self.rolling_window else losing_pnls
         
         if not recent_winning or not recent_losing:
+            # CRITICAL FIX: If no winning trades, it's unprofitable
+            if not recent_winning and recent_losing:
+                return {
+                    "is_profitable": False,
+                    "breakeven_win_rate": 0.5,
+                    "current_win_rate": current_win_rate,
+                    "avg_win": 0.0,
+                    "avg_loss": abs(sum(recent_losing) / len(recent_losing)),
+                    "expected_value": -abs(sum(recent_losing)),
+                    "reason": "No winning trades - unprofitable"
+                }
             return {
                 "is_profitable": True,
                 "breakeven_win_rate": 0.5,
-                "current_win_rate": winning_trades / max(1, total_trades),
+                "current_win_rate": current_win_rate,
                 "reason": "Not enough win/loss data"
             }
         
@@ -837,9 +1404,109 @@ class AdaptiveTrainer:
         is_profitable = profitability_check["is_profitable"]
         win_rate_low = snapshot.win_rate < profitability_check["breakeven_win_rate"]
         
+        # CRITICAL FIX #1: Check 0% win rate FIRST, before profitability branches
+        # 0% win rate ALWAYS requires exploration, regardless of profitability status
+        # This must be checked first to prevent it from falling into wrong code path
+        # Check BOTH evaluation snapshot AND cumulative trades from journal
+        cumulative_total_trades = snapshot.total_trades
+        cumulative_win_rate = snapshot.win_rate
+        
+        # Also check cumulative trades from journal (not just evaluation episodes)
+        try:
+            from src.trading_journal import TradingJournal
+            import sqlite3
+            from pathlib import Path
+            
+            journal_path = Path("logs/trading_journal.db")
+            if journal_path.exists():
+                conn = sqlite3.connect(str(journal_path))
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM trades")
+                journal_total_trades = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1")
+                journal_winning_trades = cursor.fetchone()[0]
+                journal_win_rate = journal_winning_trades / journal_total_trades if journal_total_trades > 0 else 0.0
+                conn.close()
+                
+                # Use journal stats if they have more trades (more reliable)
+                if journal_total_trades > cumulative_total_trades:
+                    cumulative_total_trades = journal_total_trades
+                    cumulative_win_rate = journal_win_rate
+                    print(f"[DEBUG] Using journal stats: {journal_total_trades} cumulative trades (evaluation had {snapshot.total_trades})")
+        except Exception as e:
+            # Journal check failed - use snapshot stats
+            pass
+        
+        # Check if 0% win rate with 10+ cumulative trades
+        if cumulative_win_rate == 0.0 and cumulative_total_trades >= 10:
+            print(f"\n[CRITICAL] 0% WIN RATE DETECTED! Model is stuck - increasing exploration...")
+            print(f"   Cumulative Total Trades: {cumulative_total_trades}")
+            print(f"   Cumulative Win Rate: {cumulative_win_rate:.1%}")
+            print(f"   Evaluation Trades: {snapshot.total_trades} (for reference)")
+            print(f"   This fix triggers BEFORE profitability checks to ensure it always runs")
+            
+            old_confidence = self.current_min_action_confidence
+            old_quality = self.current_min_quality_score
+            old_rr = self.current_min_risk_reward_ratio
+            old_entropy = self.current_entropy_coef
+            old_penalty = self.current_inaction_penalty
+            
+            # INCREASE entropy to encourage exploration (opposite of tightening)
+            self.current_entropy_coef = min(
+                self.adaptive_config.max_entropy_coef,
+                self.current_entropy_coef * 1.5  # Increase by 50% to break out of local minimum
+            )
+            agent.entropy_coef = self.current_entropy_coef
+            
+            # INCREASE inaction penalty to encourage more trading activity
+            self.current_inaction_penalty = min(
+                self.adaptive_config.inaction_penalty_max,
+                self.current_inaction_penalty * 2.0  # Double it to encourage trading
+            )
+            
+            # SLIGHTLY relax filters (don't tighten more - we need diversity)
+            self.current_min_action_confidence = max(0.1,
+                self.current_min_action_confidence * 0.90)  # Relax by 10% (was 5%)
+            self.current_min_quality_score = max(0.3,
+                self.current_min_quality_score * 0.90)  # Relax by 10% (was 5%)
+            
+            # Keep R:R reasonable but don't increase it more
+            # (already high enough, increasing would make problem worse)
+            
+            adjustments["entropy_coef"] = {
+                "old": old_entropy,
+                "new": self.current_entropy_coef,
+                "reason": f"CRITICAL: 0% win rate - increasing exploration to break out of local minimum"
+            }
+            adjustments["inaction_penalty"] = {
+                "old": old_penalty,
+                "new": self.current_inaction_penalty,
+                "reason": f"CRITICAL: 0% win rate - encouraging more trading activity"
+            }
+            adjustments["quality_filters"] = {
+                "min_action_confidence": {
+                    "old": old_confidence,
+                    "new": self.current_min_action_confidence,
+                    "reason": f"CRITICAL: 0% win rate - relaxing to allow more diverse trades"
+                },
+                "min_quality_score": {
+                    "old": old_quality,
+                    "new": self.current_min_quality_score,
+                    "reason": f"CRITICAL: 0% win rate - relaxing to allow more diverse trades"
+                }
+            }
+            
+            self._update_reward_config()
+            print(f"[ADAPT] CRITICAL 0% WIN RATE RESPONSE:")
+            print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} (+{(self.current_entropy_coef/old_entropy - 1)*100:.0f}%)")
+            print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f} (+{(self.current_inaction_penalty/old_penalty - 1)*100:.0f}%)")
+            print(f"   Confidence: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed by 10%)")
+            print(f"   Quality: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed by 10%)")
+            print(f"   [NOTE] This fix bypasses profitability checks - 0% win rate always requires exploration!")
+        
         # AGGRESSIVE profitability detection and response
-        # Only tighten aggressively if unprofitable
-        if not is_profitable:
+        # Only tighten aggressively if unprofitable AND not 0% win rate (already handled above)
+        elif not is_profitable:
             self.consecutive_low_win_rate += 1
             
             print(f"\n[CRITICAL] UNPROFITABLE DETECTED:")
@@ -850,71 +1517,9 @@ class AdaptiveTrainer:
             print(f"   R:R ratio: {current_rr_ratio:.2f}:1")
             print(f"   Consecutive unprofitable evaluations: {self.consecutive_low_win_rate}")
             
-            # CRITICAL FIX: 0% win rate requires EXPLORATION, not tightening
-            # If win rate is 0% or extremely low (but we have trades), model is stuck
-            # Need to INCREASE exploration to break out of local minimum
-            if snapshot.win_rate == 0.0 and snapshot.total_trades >= 10:
-                print(f"\n[CRITICAL] 0% WIN RATE DETECTED! Model is stuck - increasing exploration...")
-                old_confidence = self.current_min_action_confidence
-                old_quality = self.current_min_quality_score
-                old_rr = self.current_min_risk_reward_ratio
-                old_entropy = self.current_entropy_coef
-                old_penalty = self.current_inaction_penalty
-                
-                # INCREASE entropy to encourage exploration (opposite of tightening)
-                self.current_entropy_coef = min(
-                    self.adaptive_config.max_entropy_coef,
-                    self.current_entropy_coef * 1.5  # Increase by 50% to break out of local minimum
-                )
-                agent.entropy_coef = self.current_entropy_coef
-                
-                # INCREASE inaction penalty to encourage more trading activity
-                self.current_inaction_penalty = min(
-                    self.adaptive_config.inaction_penalty_max,
-                    self.current_inaction_penalty * 2.0  # Double it to encourage trading
-                )
-                
-                # SLIGHTLY relax filters (don't tighten more - we need diversity)
-                self.current_min_action_confidence = max(0.15,
-                    self.current_min_action_confidence * 0.95)  # Relax by 5%
-                self.current_min_quality_score = max(0.35,
-                    self.current_min_quality_score * 0.95)  # Relax by 5%
-                
-                # Keep R:R reasonable but don't increase it more
-                # (already high enough, increasing would make problem worse)
-                
-                adjustments["entropy_coef"] = {
-                    "old": old_entropy,
-                    "new": self.current_entropy_coef,
-                    "reason": f"CRITICAL: 0% win rate - increasing exploration to break out of local minimum"
-                }
-                adjustments["inaction_penalty"] = {
-                    "old": old_penalty,
-                    "new": self.current_inaction_penalty,
-                    "reason": f"CRITICAL: 0% win rate - encouraging more trading activity"
-                }
-                adjustments["quality_filters"] = {
-                    "min_action_confidence": {
-                        "old": old_confidence,
-                        "new": self.current_min_action_confidence,
-                        "reason": f"CRITICAL: 0% win rate - slightly relaxing to allow more diverse trades"
-                    },
-                    "min_quality_score": {
-                        "old": old_quality,
-                        "new": self.current_min_quality_score,
-                        "reason": f"CRITICAL: 0% win rate - slightly relaxing to allow more diverse trades"
-                    }
-                }
-                
-                self._update_reward_config()
-                print(f"[ADAPT] CRITICAL 0% WIN RATE RESPONSE:")
-                print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} (+{(self.current_entropy_coef/old_entropy - 1)*100:.0f}%)")
-                print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f} (+{(self.current_inaction_penalty/old_penalty - 1)*100:.0f}%)")
-                print(f"   Confidence: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed)")
-                print(f"   Quality: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed)")
-            
-            # AGGRESSIVE tightening when unprofitable (but NOT 0% win rate)
-            elif self.consecutive_low_win_rate >= 2 and snapshot.win_rate > 0.0:
+            # NOTE: 0% win rate already handled above, so this is for > 0% but still unprofitable
+            # AGGRESSIVE tightening when unprofitable (but NOT 0% win rate - already handled above)
+            if self.consecutive_low_win_rate >= 2 and snapshot.win_rate > 0.0:
                 old_confidence = self.current_min_action_confidence
                 old_quality = self.current_min_quality_score
                 old_rr = self.current_min_risk_reward_ratio
