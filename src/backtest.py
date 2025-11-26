@@ -20,6 +20,7 @@ from src.data_extraction import DataExtractor
 from src.trading_env import TradingEnvironment
 from src.rl_agent import PPOAgent
 from src.trading_hours import TradingHoursManager
+from src.walk_forward import WalkForwardAnalyzer
 
 
 class Backtester:
@@ -156,11 +157,140 @@ class Backtester:
         
         return results
     
-    def _calculate_sharpe(self, returns: list) -> float:
-        """Calculate Sharpe ratio"""
-        if len(returns) < 2 or np.std(returns) == 0:
+    def run_walk_forward(
+        self,
+        train_window: int = 252,  # 1 year
+        test_window: int = 63,     # 3 months
+        step_size: int = 21,       # 1 month
+        window_type: str = "rolling"
+    ) -> dict:
+        """
+        Run walk-forward analysis to prevent overfitting.
+        
+        Args:
+            train_window: Number of periods for training
+            test_window: Number of periods for testing
+            step_size: Step size between windows
+            window_type: "rolling" or "expanding"
+        
+        Returns:
+            Dictionary with walk-forward results
+        """
+        from src.walk_forward import WalkForwardAnalyzer
+        
+        # Get primary timeframe data for walk-forward
+        primary_tf = min(self.config["environment"]["timeframes"])
+        primary_data = self.multi_tf_data[primary_tf]
+        
+        # Create walk-forward analyzer
+        analyzer = WalkForwardAnalyzer(
+            train_window=train_window,
+            test_window=test_window,
+            step_size=step_size,
+            window_type=window_type
+        )
+        
+        # Define training function
+        def train_model(train_data: pd.DataFrame) -> str:
+            """Train model on training data"""
+            # Create temporary config with training data
+            # For now, we'll use a simplified approach
+            # In production, you'd retrain the model here
+            import tempfile
+            import shutil
+            
+            # For walk-forward, we'll use the existing model
+            # In a full implementation, you'd retrain here
+            temp_model_path = f"models/walkforward_temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+            shutil.copy(self.model_path, temp_model_path)
+            return temp_model_path
+        
+        # Define backtest function
+        def backtest_model(model_path: str, test_data: pd.DataFrame) -> dict:
+            """Backtest model on test data"""
+            # Create temporary multi-timeframe data with test data
+            test_multi_tf = {tf: test_data for tf in self.config["environment"]["timeframes"]}
+            
+            # Create environment with test data
+            test_env = TradingEnvironment(
+                data=test_multi_tf,
+                timeframes=self.config["environment"]["timeframes"],
+                initial_capital=self.config["risk_management"]["initial_capital"],
+                transaction_cost=self.config["risk_management"]["commission"] / self.config["risk_management"]["initial_capital"],
+                reward_config=self.config["environment"]["reward"]
+            )
+            
+            # Load model
+            test_agent = PPOAgent(
+                state_dim=test_env.state_dim,
+                action_range=tuple(self.config["environment"]["action_range"]),
+                device="cpu"
+            )
+            test_agent.load(model_path)
+            
+            # Run backtest
+            state, info = test_env.reset()
+            done = False
+            pnls = []
+            
+            while not done:
+                action, _, _ = test_agent.select_action(state, deterministic=True)
+                state, reward, terminated, truncated, step_info = test_env.step(action)
+                done = terminated or truncated
+                if step_info.get("pnl") is not None:
+                    pnls.append(step_info["pnl"])
+            
+            # Calculate metrics
+            if len(pnls) == 0:
+                return {"total_return": 0.0, "sharpe_ratio": 0.0, "win_rate": 0.0}
+            
+            total_return = sum(pnls) / self.config["risk_management"]["initial_capital"]
+            sharpe = self._calculate_sharpe(pnls)
+            win_rate = step_info.get("win_rate", 0.0)
+            
+            return {
+                "total_return": total_return,
+                "sharpe_ratio": sharpe,
+                "win_rate": win_rate,
+                "total_pnl": sum(pnls)
+            }
+        
+        # Run walk-forward analysis
+        results = analyzer.run_walk_forward(
+            data=primary_data,
+            train_func=train_model,
+            backtest_func=backtest_model
+        )
+        
+        return results
+    
+    def _calculate_sharpe(self, pnls: list) -> float:
+        """
+        Calculate Sharpe ratio from PnL values.
+        
+        CRITICAL FIX #5: Converts PnL to percentage returns before calculation.
+        """
+        if len(pnls) < 2:
             return 0.0
-        return np.mean(returns) / np.std(returns) * np.sqrt(252)  # Annualized
+        
+        # Get initial capital from config
+        initial_capital = self.config["risk_management"]["initial_capital"]
+        if initial_capital <= 0:
+            return 0.0
+        
+        # Convert PnL to percentage returns (standard Sharpe formula)
+        returns = np.array(pnls) / initial_capital
+        
+        mean_return = float(np.mean(returns))
+        std_return = float(np.std(returns))
+        risk_free_rate = 0.0  # Default risk-free rate
+        
+        if std_return == 0:
+            return 0.0
+        
+        # Sharpe ratio = (mean_return - risk_free_rate) / std_return * sqrt(periods_per_year)
+        # Using 252 trading days for annualization (standard)
+        return (mean_return - risk_free_rate) / std_return * np.sqrt(252)
     
     def _calculate_sortino(self, returns: list) -> float:
         """Calculate Sortino ratio (only penalizes downside volatility)"""

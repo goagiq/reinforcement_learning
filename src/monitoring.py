@@ -6,6 +6,7 @@ Monitors trading performance, logs metrics, and provides real-time dashboards.
 
 import json
 import time
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -121,12 +122,26 @@ class PerformanceMonitor:
         gross_loss = abs(sum(t.pnl for t in losing))
         self.current_metrics.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
         
-        # Sharpe ratio (simplified)
+        # CRITICAL FIX #5: Sharpe ratio (from percentage returns, not raw PnL)
         if len(self.trades) > 1:
-            returns = [t.pnl for t in self.trades]
+            # Get initial capital (default 100000.0)
+            initial_capital = getattr(self, 'initial_capital', 100000.0)
+            if initial_capital <= 0:
+                initial_capital = 100000.0
+            
+            # Convert PnL to percentage returns
+            pnl_values = [t.pnl for t in self.trades]
+            returns = [pnl / initial_capital for pnl in pnl_values]
+            
             mean_return = sum(returns) / len(returns)
             std_return = (sum((r - mean_return)**2 for r in returns) / len(returns))**0.5
-            self.current_metrics.sharpe_ratio = mean_return / std_return if std_return > 0 else 0.0
+            risk_free_rate = 0.0  # Default risk-free rate
+            
+            # Sharpe ratio = (mean_return - risk_free_rate) / std_return * sqrt(periods_per_year)
+            if std_return > 0:
+                self.current_metrics.sharpe_ratio = (mean_return - risk_free_rate) / std_return * np.sqrt(252)
+            else:
+                self.current_metrics.sharpe_ratio = 0.0
         
         # Current equity
         if self.equity_history:
@@ -146,6 +161,19 @@ class PerformanceMonitor:
             "runtime_hours": (datetime.now() - self.start_time).total_seconds() / 3600,
             "trades_per_hour": self.current_metrics.total_trades / \
                               max(0.1, (datetime.now() - self.start_time).total_seconds() / 3600)
+        }
+    
+    def get_current_metrics(self) -> Dict:
+        """Get current metrics as a dictionary for API responses"""
+        return {
+            "total_pnl": self.current_metrics.total_pnl,
+            "sharpe_ratio": self.current_metrics.sharpe_ratio,
+            "sortino_ratio": self.current_metrics.sharpe_ratio,  # Simplified - same as Sharpe for now
+            "win_rate": self.current_metrics.win_rate,
+            "profit_factor": self.current_metrics.profit_factor,
+            "max_drawdown": self.current_metrics.max_drawdown,
+            "total_trades": self.current_metrics.total_trades,
+            "average_trade": self.current_metrics.total_pnl / self.current_metrics.total_trades if self.current_metrics.total_trades > 0 else 0.0
         }
     
     def print_summary(self):

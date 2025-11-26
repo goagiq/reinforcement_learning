@@ -171,17 +171,28 @@ class ModelEvaluator:
     ) -> ModelMetrics:
         """Calculate performance metrics"""
         # Basic stats
-        total_return = sum(pnls) / self.config["risk_management"]["initial_capital"]
-        mean_return = np.mean(pnls)
-        std_return = np.std(pnls)
+        initial_capital = self.config["risk_management"]["initial_capital"]
+        total_return = sum(pnls) / initial_capital if initial_capital > 0 else 0.0
         
-        # Sharpe ratio
-        sharpe = mean_return / std_return * np.sqrt(252) if std_return > 0 else 0.0
-        
-        # Sortino ratio (only downside volatility)
-        downside_returns = [r for r in pnls if r < 0]
-        downside_std = np.std(downside_returns) if downside_returns else 0.0
-        sortino = mean_return / downside_std * np.sqrt(252) if downside_std > 0 else 0.0
+        # CRITICAL FIX #5: Sharpe ratio (from percentage returns, not raw PnL)
+        if len(pnls) > 1 and initial_capital > 0:
+            # Convert PnL to percentage returns
+            returns = np.array(pnls) / initial_capital
+            
+            mean_return = float(np.mean(returns))
+            std_return = float(np.std(returns))
+            risk_free_rate = 0.0  # Default risk-free rate
+            
+            # Sharpe ratio = (mean_return - risk_free_rate) / std_return * sqrt(periods_per_year)
+            sharpe = (mean_return - risk_free_rate) / std_return * np.sqrt(252) if std_return > 0 else 0.0
+            
+            # Sortino ratio (only downside volatility)
+            downside_returns = returns[returns < 0]
+            downside_std = float(np.std(downside_returns)) if len(downside_returns) > 0 else 0.0
+            sortino = (mean_return - risk_free_rate) / downside_std * np.sqrt(252) if downside_std > 0 else 0.0
+        else:
+            sharpe = 0.0
+            sortino = 0.0
         
         # Max drawdown
         max_drawdown = max(drawdowns) if drawdowns else 0.0

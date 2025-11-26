@@ -21,7 +21,7 @@ model:
 environment:
   instrument: "ES"                     # ES or MES
   timeframes: [1, 5, 15]             # Timeframes in minutes
-  state_features: 900                 # State dimension (15 features * 3 timeframes * 20 lookback = 900; must match environment)
+  state_features: 905                 # State dimension (15 features * 3 timeframes * 20 lookback = 900 + 5 regime features = 905; must match environment)
   action_space: "continuous"          # continuous or discrete
   action_range: [-1.0, 1.0]          # Position size range
   max_episode_steps: 10000            # Maximum steps per episode (episodes will terminate at this limit)
@@ -53,6 +53,11 @@ environment:
     transaction_cost: 0.0001          # Transaction cost per trade
     risk_penalty: 0.1                  # Further reduced to avoid excessive idle bleed
     drawdown_penalty: 0.1             # Reduced from 0.3 to allow positive rewards
+    # CRITICAL FIX: Stop loss to cap losses (tightened from 2% to 1.5% to reduce average loss)
+    stop_loss_pct: 0.015              # Stop loss at 1.5% of entry price (was 0.02 = 2%)
+    min_risk_reward_ratio: 1.5        # Minimum risk/reward ratio (1.5:1) - reject trades with poor R:R
+    # Phase 1: Regime-aware RL features
+    include_regime_features: true      # Enable regime features in RL state (adds 5 features)
 
 # Training Configuration
 training:
@@ -62,7 +67,7 @@ training:
   device: "cuda"                      # cuda or cpu
   num_envs: 1                         # Number of parallel environments
   transfer_learning: true             # Enable transfer learning
-  transfer_checkpoint: "models/best_model.pt"  # Base checkpoint to fine-tune from
+  transfer_checkpoint: "models/checkpoint_1950000.pt"  # Latest checkpoint (1.95M timesteps, state_dim=900)
   transfer_strategy: "copy_and_extend"  # Transfer learning strategy when architecture changes:
                                         # - "copy_and_extend": Copy weights, init new dims with small random values (recommended)
                                         # - "interpolate": Interpolate from existing neurons

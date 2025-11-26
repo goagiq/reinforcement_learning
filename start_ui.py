@@ -530,12 +530,17 @@ def main():
             print("⚠ Docker not found - Skipping monitoring services startup")
             print()
     
+    # Only check ports 8200 (backend) and 3200 (frontend) for safety
+    # This prevents interfering with other node.exe or python.exe processes
+    BACKEND_PORT = 8200
+    FRONTEND_PORT = 3200
+    
     # Check if backend is already running on port 8200
     print("Checking if backend is already running...")
     try:
-        response = requests.get("http://localhost:8200/", timeout=2)
+        response = requests.get(f"http://localhost:{BACKEND_PORT}/", timeout=2)
         if response.status_code == 200:
-            print("⚠ Backend is already running on port 8200")
+            print(f"⚠ Backend is already running on port {BACKEND_PORT}")
             print("  Stop it first with: python stop_ui.py")
             print("  Or use: python stop_ui.py --yes (non-interactive)")
             print()
@@ -607,11 +612,11 @@ def main():
                 except:
                     pass
         
-        # Check port status
-        port_status = check_port_status(8200)
+        # Check port status (only port 8200 for backend)
+        port_status = check_port_status(BACKEND_PORT)
         
         if port_status == "time_wait":
-            print("⚠ Port 8200 is in TIME_WAIT state (connection recently closed)")
+            print(f"⚠ Port {BACKEND_PORT} is in TIME_WAIT state (connection recently closed)")
             print("  This usually clears in 30-120 seconds.")
             print("  Waiting for TIME_WAIT to clear (max 60 seconds)...")
             
@@ -621,9 +626,9 @@ def main():
             while waited < max_wait:
                 time.sleep(2)
                 waited += 2
-                port_status = check_port_status(8200)
+                port_status = check_port_status(BACKEND_PORT)
                 if port_status == "available":
-                    print(f"✓ Port 8200 is now available (waited {waited}s)")
+                    print(f"✓ Port {BACKEND_PORT} is now available (waited {waited}s)")
                     break
                 if waited % 10 == 0:
                     print(f"  Still waiting... ({waited}s/{max_wait}s)")
@@ -638,9 +643,9 @@ def main():
                 if response != 'y' and response != 'yes':
                     sys.exit(1)
         elif port_status == "in_use":
-            print("⚠ Port 8200 is in use by another process")
+            print(f"⚠ Port {BACKEND_PORT} is in use by another process")
             print("  Stop it first with: python stop_ui.py")
-            print("  Or manually kill the process using port 8200")
+            print(f"  Or manually kill the process using port {BACKEND_PORT}")
             sys.exit(1)
         
         # Port is free, will start new backend
@@ -664,28 +669,34 @@ def main():
         venv_info = detect_venv_type()
         if venv_info["uv_available"]:
             # Use uv run to ensure correct environment with all dependencies
-            backend_command = ["uv", "run", "python", "-m", "uvicorn", "src.api_server:app", "--host", "0.0.0.0", "--port", "8200"]
+            backend_command = ["uv", "run", "python", "-m", "uvicorn", "src.api_server:app", "--host", "0.0.0.0", "--port", str(BACKEND_PORT)]
             print("Using uv run to start backend (ensures correct environment)")
         elif venv_python:
             # Use venv Python directly
-            backend_command = [venv_python, "-m", "uvicorn", "src.api_server:app", "--host", "0.0.0.0", "--port", "8200"]
+            backend_command = [venv_python, "-m", "uvicorn", "src.api_server:app", "--host", "0.0.0.0", "--port", str(BACKEND_PORT)]
             print(f"Using venv Python: {venv_python}")
         else:
             venv_python = sys.executable
-            backend_command = [venv_python, "-m", "uvicorn", "src.api_server:app", "--host", "0.0.0.0", "--port", "8200"]
+            backend_command = [venv_python, "-m", "uvicorn", "src.api_server:app", "--host", "0.0.0.0", "--port", str(BACKEND_PORT)]
             print(f"Using system Python: {venv_python} (WARNING: may not have CUDA PyTorch)")
         
         print("Starting backend API server...")
         try:
+            # Enable unbuffered output to ensure Priority 1 messages appear immediately
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            
             # Don't redirect stdout/stderr so we can see errors
             backend_process = subprocess.Popen(
                 backend_command,
                 stdout=None,  # Show output in console
-                stderr=subprocess.STDOUT  # Merge stderr into stdout
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout
+                env=env  # Pass environment with PYTHONUNBUFFERED
             )
             
             print(f"✓ Backend API server process started (PID: {backend_process.pid})")
-            print("  API will be available at: http://localhost:8200")
+            print(f"  API will be available at: http://localhost:{BACKEND_PORT}")
             print("  Waiting for server to initialize...")
             print()
             
@@ -705,7 +716,7 @@ def main():
                 print("    - Import errors in src/api_server.py or imported modules")
                 print("    - Missing type imports (e.g., Tuple from typing)")
                 print("    - Configuration issues")
-                print("    - Port 8200 already in use (check with: python stop_ui.py)")
+                print(f"    - Port {BACKEND_PORT} already in use (check with: python stop_ui.py)")
                 print()
                 print("  Please check the error messages above and fix any issues.")
                 sys.exit(1)
@@ -721,7 +732,7 @@ def main():
             else:
                 print("  Make sure you're in a virtual environment with all dependencies installed.")
                 print("  Install dependencies with: pip install -r requirements.txt")
-            print("  Also check if port 8200 is already in use: python stop_ui.py")
+            print(f"  Also check if port {BACKEND_PORT} is already in use: python stop_ui.py")
             sys.exit(1)
     else:
         # Using existing backend
@@ -752,7 +763,7 @@ def main():
                 )
             
             print(f"✓ Frontend server starting (PID: {frontend_process.pid})")
-            print("  UI will be available at: http://localhost:3200")
+            print(f"  UI will be available at: http://localhost:{FRONTEND_PORT}")
             print()
         except Exception as e:
             print(f"⚠ WARNING: Failed to start frontend: {e}")
@@ -775,14 +786,14 @@ def main():
         print("Monitoring:")
         print("  - Prometheus: http://localhost:9090")
         print("  - Grafana: http://localhost:3000 (admin/admin)")
-    print("Backend API: http://localhost:8200")
-    print("  - Direct API: http://localhost:8200/api/...")
+    print(f"Backend API: http://localhost:{BACKEND_PORT}")
+    print(f"  - Direct API: http://localhost:{BACKEND_PORT}/api/...")
     if kong_started:
         print("  - Via Kong: http://localhost:8300/api/... (requires API key)")
-        print("  - Monitoring API: http://localhost:8200/api/monitoring/...")
-    print("  - WebSocket: ws://localhost:8200/ws")
+        print(f"  - Monitoring API: http://localhost:{BACKEND_PORT}/api/monitoring/...")
+    print(f"  - WebSocket: ws://localhost:{BACKEND_PORT}/ws")
     if (frontend_dir / "package.json").exists():
-        print("Frontend UI: http://localhost:3200")
+        print(f"Frontend UI: http://localhost:{FRONTEND_PORT}")
         print("  - Web interface will open automatically")
     print()
     if cuda_available:

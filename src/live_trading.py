@@ -31,6 +31,7 @@ from src.drift_monitor import DriftMonitor, TradeMetrics
 from src.decision_gate import DecisionGate, DecisionResult
 from src.agentic_swarm import SwarmOrchestrator
 from src.trading_hours import TradingHoursManager
+from src.signal_calculator import SignalCalculator
 import asyncio
 
 
@@ -289,6 +290,19 @@ class LiveTradingSystem:
         # NT8 Bridge Server
         self.bridge_server = None
         
+        # Initialize signal calculator for NinjaScript signals
+        signal_config = config.get("signals", {})
+        self.signal_calculator = SignalCalculator(
+            action_change_threshold=signal_config.get("action_change_threshold", 0.15),
+            pullback_detection_bars=signal_config.get("pullback_detection_bars", 3),
+            trend_strength_threshold=signal_config.get("trend_strength_threshold", 0.5)
+        )
+        
+        # Load Markov regime (if available) - will be updated periodically
+        self.markov_regime = None
+        self.markov_regime_confidence = 0.0
+        self._load_markov_regime()
+        
     def start(self):
         """Start the live trading system"""
         print("\n" + "="*60)
@@ -427,10 +441,12 @@ class LiveTradingSystem:
             swarm_recommendation = self._run_swarm_analysis(primary_bar, rl_rec)
         
         # Use DecisionGate to combine RL + Swarm
+        # Phase 3.4: Pass current timestamp for time-of-day filtering
         decision = self.decision_gate.make_decision(
             rl_action=rl_action_value,
             rl_confidence=rl_confidence,
-            swarm_recommendation=swarm_recommendation
+            swarm_recommendation=swarm_recommendation,
+            current_timestamp=primary_bar.timestamp
         )
         
         # Apply risk management (DecisionGate already handles basic risk, but apply final validation)
@@ -480,7 +496,10 @@ class LiveTradingSystem:
         
         # Execute trade
         if abs(final_action - self.current_position) > 0.01:
-            self._execute_trade(final_action, primary_bar)
+            self._execute_trade(final_action, primary_bar, decision)
+        
+        # Store original RL action for signal calculation
+        decision.original_rl_action = rl_action_value
         
         # Log decision diagnostics for post-trade analysis
         self._log_decision(
@@ -595,24 +614,48 @@ class LiveTradingSystem:
         # Auto-approve for now (set to False to require manual approval)
         return True
     
-    def _execute_trade(self, target_position: float, bar: MarketBar):
+    def _execute_trade(self, target_position: float, bar: MarketBar, decision: Optional[DecisionResult] = None):
         """
         Execute trade via NT8 bridge.
         
         Args:
             target_position: Target position size (-1.0 to 1.0)
             bar: Current market bar
+            decision: Decision result (optional, for signal calculation)
         """
         position_change = target_position - self.current_position
         
         if abs(position_change) < 0.01:
             return  # No significant change
         
+        # Calculate NinjaScript signals if decision is available
+        signal_trend = 0
+        signal_trade = 0
+        
+        if decision:
+            # Get RL action and confidence from decision
+            # Use original RL action if stored, otherwise use target_position as proxy
+            rl_action = getattr(decision, 'original_rl_action', target_position)
+            rl_confidence = getattr(decision, 'rl_confidence', getattr(decision, 'confidence', 0.0))
+            swarm_recommendation = getattr(decision, 'swarm_recommendation', None)
+            
+            # Calculate signals
+            signal_trend, signal_trade = self.signal_calculator.calculate_signals(
+                rl_action=rl_action,
+                rl_confidence=rl_confidence,
+                swarm_recommendation=swarm_recommendation,
+                current_position=self.current_position,
+                markov_regime=self.markov_regime,
+                markov_regime_confidence=self.markov_regime_confidence
+            )
+        
         # Create trade signal
         signal = {
             "action": "buy" if position_change > 0 else "sell",
             "position_size": target_position,
             "confidence": min(abs(target_position), 1.0),
+            "signal_trend": signal_trend,
+            "signal_trade": signal_trade,
             "timestamp": datetime.now().isoformat()
         }
         
@@ -620,7 +663,7 @@ class LiveTradingSystem:
         if self.bridge_server:
             self.bridge_server.send_trade_signal(signal)
             self.stats["trades_executed"] += 1
-            print(f"📊 Signal sent: {signal['action']} @ size {target_position:.2f}")
+            print(f"📊 Signal sent: {signal['action']} @ size {target_position:.2f} | Trend: {signal_trend}, Trade: {signal_trade}")
             
             # Update position
             self.current_position = target_position
@@ -826,6 +869,37 @@ class LiveTradingSystem:
             json.dump(stats, f, indent=2)
         
         print(f"\n📊 Statistics saved to: {stats_path}")
+    
+    def _load_markov_regime(self):
+        """Load latest Markov regime from report file (if available)."""
+        try:
+            import json
+            from pathlib import Path
+            
+            # Look for latest Markov regime report
+            report_path = Path("reports/markov_regime_report.json")
+            if not report_path.exists():
+                return
+            
+            with open(report_path, 'r') as f:
+                report = json.load(f)
+            
+            # Extract current regime (simplified - would need real-time regime detection in production)
+            # For now, use the most probable regime from stationary distribution
+            if "stationary_distribution" in report:
+                stationary = report["stationary_distribution"]
+                if isinstance(stationary, dict):
+                    # Find regime with highest probability
+                    max_regime = max(stationary.items(), key=lambda x: x[1])
+                    self.markov_regime = max_regime[0]
+                    self.markov_regime_confidence = float(max_regime[1])
+                elif isinstance(stationary, list) and len(stationary) > 0:
+                    # If it's a list, use the first regime (would need proper mapping)
+                    self.markov_regime = "NEUTRAL"
+                    self.markov_regime_confidence = 0.5
+        except Exception as e:
+            # Silently fail - Markov regime is optional
+            pass
 
 
 def load_config(config_path: str) -> dict:

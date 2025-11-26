@@ -72,3 +72,6 @@ strands-agents
 strands-agents-tools
 anthropic>=0.40.0                  # Anthropic Claude API client (required by strands.models.anthropic)
 ollama>=0.3.0                      # Ollama Python client (required by strands.models.ollama)
+
+# Forecasting (Optional - graceful fallback to simple predictor)
+chronos-forecasting>=2.1.0          # Amazon Chronos time series forecasting (optional)

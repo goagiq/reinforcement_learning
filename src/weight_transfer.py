@@ -94,7 +94,7 @@ def transfer_network_weights(
     new_network: nn.Module,
     old_hidden_dims: List[int],
     new_hidden_dims: List[int],
-    state_dim: int,
+    old_state_dim: int,  # Old state dimension (e.g., 900)
     transfer_strategy: str = "copy_and_extend"
 ) -> Dict[str, torch.Tensor]:
     """
@@ -105,18 +105,30 @@ def transfer_network_weights(
         new_network: New network module (ActorNetwork or CriticNetwork)
         old_hidden_dims: Hidden dimensions of old network [128, 128, 64]
         new_hidden_dims: Hidden dimensions of new network [256, 256, 128]
-        state_dim: State dimension (should match: 900)
+        old_state_dim: Old state dimension (e.g., 900)
         transfer_strategy: Strategy for transferring weights
     
     Returns:
         New state dict with transferred weights
+    
+    Note:
+        This function handles state_dim increases. If new_state_dim > old_state_dim,
+        the new input dimensions will be initialized with small random values.
     """
     new_state_dict = {}
     
+    # Get actual new state_dim from first layer
+    first_layer = dict(new_network.named_modules())["feature_layers.0"]
+    new_state_dim = first_layer.weight.shape[1]
+    
+    # Log state_dim change if applicable
+    if old_state_dim != new_state_dim:
+        print(f"  📊 State dimension change: {old_state_dim} → {new_state_dim} (+{new_state_dim - old_state_dim})")
+    
     # Calculate layer indices
     # Structure: feature_layers.0 (Linear), .1 (ReLU), .2 (Dropout), .3 (Linear), ...
-    old_layer_dims = [state_dim] + old_hidden_dims
-    new_layer_dims = [state_dim] + new_hidden_dims
+    old_layer_dims = [old_state_dim] + old_hidden_dims
+    new_layer_dims = [new_state_dim] + new_hidden_dims
     
     # Transfer feature layers
     layer_idx = 0
@@ -251,20 +263,30 @@ def transfer_checkpoint_weights(
     print(f"   Old: state_dim={old_state_dim}, hidden_dims={old_hidden_dims}")
     print(f"   New: state_dim={new_state_dim}, hidden_dims={new_hidden_dims}")
     
+    # Handle state dimension changes
     if old_state_dim != new_state_dim:
-        raise ValueError(
-            f"State dimension mismatch: old={old_state_dim}, new={new_state_dim}. "
-            f"Cannot transfer weights with different input dimensions."
-        )
+        if new_state_dim < old_state_dim:
+            raise ValueError(
+                f"State dimension cannot decrease: old={old_state_dim}, new={new_state_dim}. "
+                f"Cannot transfer weights when input dimension decreases. "
+                f"Use old_state_dim={new_state_dim} or retrain from scratch."
+            )
+        else:
+            # State dimension increased - allow transfer
+            print(f"\n⚠️  State dimension increased: {old_state_dim} → {new_state_dim}")
+            print(f"   New input dimensions (+{new_state_dim - old_state_dim}) will be initialized with small random values")
+            print(f"   Existing weights will be preserved")
     
     # Transfer actor weights
+    # Note: transfer_network_weights will detect new_state_dim from the network
+    # and handle input dimension changes automatically via transfer_linear_weights
     print(f"\n🧠 Transferring Actor Network:")
     new_actor_state = transfer_network_weights(
         old_actor_state,
         new_actor,
         old_hidden_dims,
         new_hidden_dims,
-        old_state_dim,
+        old_state_dim,  # Pass old_state_dim, function will detect new_state_dim from network
         transfer_strategy
     )
     
@@ -275,7 +297,7 @@ def transfer_checkpoint_weights(
         new_critic,
         old_hidden_dims,
         new_hidden_dims,
-        old_state_dim,
+        old_state_dim,  # Pass old_state_dim, function will detect new_state_dim from network
         transfer_strategy
     )
     

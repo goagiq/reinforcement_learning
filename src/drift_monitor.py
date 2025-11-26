@@ -157,12 +157,26 @@ class DriftMonitor:
         gross_loss = abs(sum(t.pnl for t in losing))
         metrics["profit_factor"] = gross_profit / gross_loss if gross_loss > 0 else float('inf')
         
-        # Sharpe ratio
+        # CRITICAL FIX #5: Sharpe ratio (from percentage returns, not raw PnL)
         if len(self.recent_trades) > 1:
-            returns = [t.pnl for t in self.recent_trades]
+            # Get initial capital (default 100000.0)
+            initial_capital = getattr(self, 'initial_capital', 100000.0)
+            if initial_capital <= 0:
+                initial_capital = 100000.0
+            
+            # Convert PnL to percentage returns
+            pnl_values = [t.pnl for t in self.recent_trades]
+            returns = [pnl / initial_capital for pnl in pnl_values]
+            
             mean_return = sum(returns) / len(returns)
             std_return = (sum((r - mean_return)**2 for r in returns) / len(returns))**0.5
-            metrics["sharpe_ratio"] = mean_return / std_return if std_return > 0 else 0.0
+            risk_free_rate = 0.0  # Default risk-free rate
+            
+            # Sharpe ratio = (mean_return - risk_free_rate) / std_return * sqrt(periods_per_year)
+            if std_return > 0:
+                metrics["sharpe_ratio"] = (mean_return - risk_free_rate) / std_return * np.sqrt(252)
+            else:
+                metrics["sharpe_ratio"] = 0.0
         else:
             metrics["sharpe_ratio"] = 0.0
         

@@ -10,9 +10,11 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
+from datetime import datetime
 
 from src.reasoning_engine import ReasoningAnalysis, RecommendationType
 from src.quality_scorer import QualityScorer, QualityScore
+from src.time_of_day_filter import TimeOfDayFilter
 
 
 @dataclass
@@ -109,13 +111,20 @@ class DecisionGate:
         self.adaptive_config_read_interval = 1000  # Read every 1000 calls (to avoid too frequent file I/O)
         self.adaptive_call_count = 0
         self._load_adaptive_parameters()
+        
+        # Phase 3.4: Time-of-day filter for entry timing
+        time_filter_config = config.get("time_of_day_filter", {})
+        self.time_filter = TimeOfDayFilter(time_filter_config) if time_filter_config.get("enabled", True) else None
+        if self.time_filter and self.time_filter.enabled:
+            print(f"[TIME FILTER] {self.time_filter.get_avoid_periods_description()}")
     
     def make_decision(
         self,
         rl_action: float,
         rl_confidence: float,
         reasoning_analysis: Optional[ReasoningAnalysis] = None,
-        swarm_recommendation: Optional[Dict] = None
+        swarm_recommendation: Optional[Dict] = None,
+        current_timestamp: Optional[datetime] = None
     ) -> DecisionResult:
         """
         Make final trading decision by combining RL, reasoning, and swarm recommendations.
@@ -129,9 +138,62 @@ class DecisionGate:
         Returns:
             DecisionResult with final action and confidence
         """
+        # Phase 3.4: Apply time-of-day filter before making decision
+        if self.time_filter and current_timestamp:
+            filtered_action, filtered_confidence, filter_reason = self.time_filter.filter_decision(
+                current_timestamp, rl_action, rl_confidence
+            )
+            if filter_reason == "rejected_time_of_day":
+                # Trade rejected due to time of day
+                return DecisionResult(
+                    action=0.0,
+                    confidence=0.0,
+                    rl_confidence=rl_confidence,
+                    reasoning_confidence=0.0,
+                    swarm_confidence=0.0,
+                    agreement="no_swarm",
+                    reasoning=f"Trade rejected: {filter_reason}",
+                    swarm_recommendation=None,
+                    confluence_count=0,
+                    confluence_score=0.0
+                )
+            elif filter_reason == "reduced_confidence_time_of_day":
+                # Reduce confidence but continue
+                rl_confidence = filtered_confidence
+        
         # If no swarm recommendation and no reasoning, use RL only
-        # BUT: Set confluence_count to 0 (will be rejected by should_execute if min_confluence_required > 0)
+        # BUT: Still calculate quality_score and expected_value for filtering
         if swarm_recommendation is None and reasoning_analysis is None:
+            # Calculate quality score and expected value even for RL-only trades
+            # This ensures quality filters are applied during training
+            quality_score = None
+            expected_value = None
+            risk_reward_ratio = None
+            
+            if self.quality_scorer_enabled and self.quality_scorer:
+                # Calculate expected value from recent trade performance (if available)
+                # For RL-only, we need to estimate from historical data or use defaults
+                # Commission cost estimate (will be calculated properly if we have market data)
+                commission_cost = 0.0002  # Default commission rate
+                
+                # Try to get expected value from quality scorer
+                # This requires recent trade history, which may not be available in training
+                # But we can still calculate quality score based on confidence and action magnitude
+                try:
+                    # Calculate basic quality score components
+                    # Use RL confidence as base, and action magnitude as confidence indicator
+                    quality_score = self.quality_scorer.calculate_quality_score(
+                        confidence=rl_confidence,
+                        confluence_count=0,  # No confluence for RL-only
+                        expected_profit=0.0,  # Unknown for RL-only without history
+                        commission_cost=commission_cost,
+                        risk_reward_ratio=1.5,  # Default assumption
+                        market_conditions={}  # Empty - no market data in RL-only mode
+                    )
+                except Exception:
+                    # If quality scorer fails, set to None (will be checked in should_execute)
+                    quality_score = None
+            
             return DecisionResult(
                 action=rl_action,
                 confidence=rl_confidence,
@@ -142,7 +204,10 @@ class DecisionGate:
                 reasoning=None,
                 swarm_recommendation=None,
                 confluence_count=0,  # No confluence for RL-only trades
-                confluence_score=0.0
+                confluence_score=0.0,
+                quality_score=quality_score,  # Include quality score for filtering
+                expected_value=expected_value,  # Include expected value for filtering
+                risk_reward_ratio=risk_reward_ratio
             )
         
         # Use swarm recommendation if available (preferred over legacy reasoning)
@@ -323,19 +388,41 @@ class DecisionGate:
             win_rate_factor = 0.8 + (win_rate - 0.5) * 1.5
         scale_factor *= win_rate_factor
         
-        # ENHANCEMENT: Adjust based on market conditions
+        # ENHANCEMENT: Regime-aware position sizing (Phase 2)
+        # Extract regime information from market conditions
         regime = market_conditions.get("regime", "unknown")
+        regime_confidence = market_conditions.get("regime_confidence", 0.5)
         volatility = market_conditions.get("volatility", 0.0)
         
-        if regime == "trending" and volatility > 0.01:
-            # Favorable conditions: trending market with good volatility
-            market_factor = 1.1
-        elif regime == "ranging" or volatility < 0.005:
-            # Unfavorable conditions: ranging market or low volatility
-            market_factor = 0.9
+        # Regime-aware adjustments based on plan
+        regime_factor = 1.0  # Default: no adjustment
+        
+        if regime == "trending" and regime_confidence > 0.7:
+            # Trending market with high confidence: increase size
+            # This is favorable for trend-following strategies
+            regime_factor = 1.2
+        elif regime == "trending" and regime_confidence <= 0.7:
+            # Trending but low confidence: slight increase
+            regime_factor = 1.1
+        elif regime == "ranging":
+            # Ranging market: reduce size (trend-following struggles in ranges)
+            regime_factor = 0.7
+        elif regime == "volatile":
+            # Volatile market: reduce size more (high risk, choppy price action)
+            regime_factor = 0.6
         else:
-            market_factor = 1.0  # Neutral conditions
-        scale_factor *= market_factor
+            # Unknown or neutral regime: no adjustment
+            regime_factor = 1.0
+        
+        # Additional volatility-based adjustment (if regime not available)
+        if regime == "unknown" and volatility > 0.01:
+            # High volatility without regime info: slight reduction
+            regime_factor = 0.9
+        elif regime == "unknown" and volatility < 0.005:
+            # Low volatility without regime info: slight reduction
+            regime_factor = 0.9
+        
+        scale_factor *= regime_factor
 
         scale_factor = float(np.clip(scale_factor, self.min_scale, self.max_scale))
         scaled_action = float(np.clip(final_action * scale_factor, -self.max_scale, self.max_scale))
@@ -472,6 +559,21 @@ class DecisionGate:
         
         # Extract market conditions and win rate for enhanced position sizing
         market_conditions = swarm_recommendation.get("market_conditions", {}) if swarm_recommendation else {}
+        
+        # Phase 2: Extract regime information from swarm recommendation
+        # Try to get regime from multiple sources in order of preference
+        if not market_conditions.get("regime") or market_conditions.get("regime") == "unknown":
+            # Try to get from swarm recommendation directly
+            regime = swarm_recommendation.get("regime") or swarm_recommendation.get("market_regime")
+            if regime:
+                market_conditions["regime"] = regime.lower() if isinstance(regime, str) else "unknown"
+        
+        # Extract regime confidence if available
+        if "regime_confidence" not in market_conditions:
+            regime_confidence = swarm_recommendation.get("regime_confidence") or swarm_recommendation.get("market_regime_confidence")
+            if regime_confidence is not None:
+                market_conditions["regime_confidence"] = float(regime_confidence)
+        
         win_rate = swarm_recommendation.get("win_rate", 0.5) if swarm_recommendation else 0.5
         
         # Enhanced position sizing (with confidence, win rate, market conditions)
@@ -667,7 +769,11 @@ class DecisionGate:
         
         # Check quality score (if quality scorer is enabled)
         # Quality scorer now uses adaptive min_quality_score from _load_adaptive_parameters
-        if self.quality_scorer_enabled and decision.quality_score:
+        # CRITICAL: If quality scorer is enabled but quality_score is None, reject the trade
+        # This ensures RL-only trades must calculate quality score
+        if self.quality_scorer_enabled:
+            if decision.quality_score is None:
+                return False  # Reject if quality scorer enabled but no score calculated
             if not self.quality_scorer.should_trade(decision.quality_score):
                 return False  # Reject if quality score is too low
         

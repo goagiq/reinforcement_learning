@@ -1,0 +1,108 @@
+{
+  "timestamp": "2025-11-24T12:47:22.718627",
+  "total_trades": 1000,
+  "winners": 455,
+  "losers": 545,
+  "win_rate": 0.455,
+  "analysis": {
+    "entry_timing": {
+      "hourly_stats": {},
+      "worst_hours": {},
+      "best_hours": {},
+      "summary": {
+        "total_hours_analyzed": 0,
+        "worst_hour": null,
+        "best_hour": null
+      }
+    },
+    "stop_loss": {
+      "avg_loss_pct": 0.0010708519370446615,
+      "median_loss_pct": 0.0011255285998558377,
+      "max_loss_pct": 0.0023617430567822372,
+      "min_loss_pct": 2.9457607684741566e-05,
+      "std_loss_pct": 0.0006491941651078691,
+      "loss_distribution": {
+        "under_1pct": 545,
+        "1_to_1.5pct": 0,
+        "1.5_to_2pct": 0,
+        "over_2pct": 0
+      },
+      "hitting_stop_loss": {
+        "count": 0,
+        "percentage": 0.0
+      }
+    },
+    "quality_filters": {
+      "winners": {
+        "avg_confidence": 0.9538404376952203,
+        "median_confidence": 1.0,
+        "min_confidence": 0.2300710678100586,
+        "max_confidence": 1.0
+      },
+      "losers": {
+        "avg_confidence": 0.9561241153183333,
+        "median_confidence": 1.0,
+        "min_confidence": 0.2300710678100586,
+        "max_confidence": 1.0
+      },
+      "low_confidence_trades": {
+        "count": 22,
+        "win_rate": 0.5,
+        "avg_pnl": -9.396808443720204
+      },
+      "high_confidence_trades": {
+        "count": 934,
+        "win_rate": 0.4539614561027837,
+        "avg_pnl": -33.28643629451085
+      }
+    },
+    "comparison": {
+      "count": {
+        "winners": 455,
+        "losers": 545,
+        "total": 1000,
+        "win_rate": 0.455
+      },
+      "pnl": {
+        "winners_avg": 89.37519196775207,
+        "losers_avg": -133.25540927869142,
+        "winners_total": 40665.71234532719,
+        "losers_total": -72624.19805688682,
+        "profit_factor": 0.5599471447997757
+      },
+      "duration": {
+        "winners_avg_steps": 0.0,
+        "losers_avg_steps": 0.0
+      },
+      "position_size": {
+        "winners_avg": 0.9538404376952203,
+        "losers_avg": 0.9561241153183333
+      },
+      "strategy": {
+        "RL": {
+          "total_trades": 1000,
+          "wins": 455,
+          "win_rate": 0.455,
+          "avg_pnl": -31.9585
+        }
+      }
+    },
+    "patterns": {
+      "most_common_strategies": {
+        "RL": 545
+      },
+      "confidence_distribution": {
+        "avg": 0.9561241153183333,
+        "median": 1.0,
+        "std": 0.15293978762092647,
+        "min": 0.2300710678100586,
+        "max": 1.0
+      },
+      "loss_magnitude_patterns": {
+        "small_losses_under_1pct": 545,
+        "medium_losses_1_to_1.5pct": 0,
+        "large_losses_over_1.5pct": 0
+      }
+    }
+  }
+}

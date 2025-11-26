@@ -15,6 +15,7 @@ const TradingPanel = ({ models }) => {
   const [tradingStatus, setTradingStatus] = useState(null)
   const [messages, setMessages] = useState([])
   const [ws, setWs] = useState(null)
+  const [tradingMetrics, setTradingMetrics] = useState(null)
 
   useEffect(() => {
     // Auto-select model using universal default setting
@@ -89,7 +90,17 @@ const TradingPanel = ({ models }) => {
           if (!isMounted) return
           try {
             const data = JSON.parse(event.data)
+            // Only process bridge and trading messages, ignore training messages
             if (data.type === 'bridge' || data.type === 'trading') {
+              // Filter out any training-related error messages
+              if (data.message && (
+                data.message.includes('training') && 
+                !data.message.includes('trading')
+              )) {
+                // Skip training messages in trading panel
+                return
+              }
+              
               setMessages(prev => [...prev, data])
               if (data.type === 'bridge' && data.status === 'running') {
                 setBridgeRunning(true)
@@ -156,6 +167,12 @@ const TradingPanel = ({ models }) => {
         const tradingResponse = await axios.get('/api/trading/status')
         setTradingStatus(tradingResponse.data)
         setTrading(tradingResponse.data.status === 'running')
+        
+        // Load trading metrics (with cache-busting to ensure fresh data)
+        const metricsResponse = await axios.get(`/api/monitoring/performance?_t=${Date.now()}`)
+        if (metricsResponse.data.status === 'success') {
+          setTradingMetrics(metricsResponse.data.metrics)
+        }
       } catch (error) {
         // Ignore errors for now
         console.debug('Status check error:', error)
@@ -163,7 +180,7 @@ const TradingPanel = ({ models }) => {
     }
 
     checkStatus() // Check immediately
-    const interval = setInterval(checkStatus, 2000)
+    const interval = setInterval(checkStatus, 5000) // Refresh every 5 seconds
     return () => clearInterval(interval)
   }, [])
 
@@ -231,10 +248,21 @@ const TradingPanel = ({ models }) => {
       })
     } catch (error) {
       setTrading(false)
+      const errorMessage = error.response?.data?.detail || error.response?.data?.message || error.message || 'Unknown error'
+      
+      // Clean up error message - remove any training references if this is a trading error
+      let cleanErrorMessage = errorMessage
+      if (errorMessage.includes('Training already in progress')) {
+        cleanErrorMessage = 'Trading cannot start while training is in progress. Please stop training first.'
+      } else if (errorMessage.includes('training') && !errorMessage.includes('trading')) {
+        // Generic fix for training-related errors appearing in trading
+        cleanErrorMessage = errorMessage.replace(/training/gi, 'trading').replace(/Training/gi, 'Trading')
+      }
+      
       setMessages(prev => [...prev, {
         type: 'trading',
         status: 'error',
-        message: `Failed to start trading: ${error.message}`
+        message: `Failed to start trading: ${cleanErrorMessage}`
       }])
     }
   }
@@ -474,6 +502,39 @@ const TradingPanel = ({ models }) => {
           )}
         </div>
       </div>
+
+      {/* Trading Metrics */}
+      {tradingMetrics && (
+        <div className="bg-white rounded-lg shadow p-6">
+          <h3 className="text-lg font-semibold text-gray-800 mb-4">Trading Performance</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="bg-blue-50 rounded-lg p-4">
+              <div className="text-xs text-gray-600 mb-1">Total Trades</div>
+              <div className="text-2xl font-bold text-blue-700">
+                {tradingMetrics.total_trades || 0}
+              </div>
+            </div>
+            <div className="bg-green-50 rounded-lg p-4">
+              <div className="text-xs text-gray-600 mb-1">Win Rate</div>
+              <div className="text-2xl font-bold text-green-700">
+                {((tradingMetrics.win_rate || 0) * 100).toFixed(1)}%
+              </div>
+            </div>
+            <div className={`rounded-lg p-4 ${(tradingMetrics.total_pnl || 0) >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
+              <div className="text-xs text-gray-600 mb-1">Total P&L</div>
+              <div className={`text-2xl font-bold ${(tradingMetrics.total_pnl || 0) >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                ${(tradingMetrics.total_pnl || 0).toFixed(2)}
+              </div>
+            </div>
+            <div className="bg-purple-50 rounded-lg p-4">
+              <div className="text-xs text-gray-600 mb-1">Profit Factor</div>
+              <div className="text-2xl font-bold text-purple-700">
+                {(tradingMetrics.profit_factor || 0).toFixed(2)}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Volatility Prediction & Adaptive Risk Management */}
       <VolatilityPanel />

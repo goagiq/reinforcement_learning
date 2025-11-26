@@ -4,10 +4,11 @@ import TrainingPanel from './TrainingPanel'
 import BacktestPanel from './BacktestPanel'
 import TradingPanel from './TradingPanel'
 import MonitoringPanel from './MonitoringPanel'
+import SystemsPanel from './SystemsPanel'
 import SettingsPanel from './SettingsPanel'
 import ScenarioSimulationPanel from './ScenarioSimulationPanel'
 import MarkovAnalysisPanel from './MarkovAnalysisPanel'
-import { Activity, Brain, TrendingUp, Play, Settings, BarChart3, TestTube, PieChart } from 'lucide-react'
+import { Activity, Brain, TrendingUp, Play, Settings, BarChart3, TestTube, PieChart, Cpu } from 'lucide-react'
 import { getDefaultModel, isDefaultModel } from '../utils/modelUtils'
 import CapabilityExplainer from './CapabilityExplainer'
 
@@ -218,6 +219,7 @@ const Dashboard = ({ onSetupChange }) => {
     { id: 'analytics', label: 'Analytics', icon: PieChart },
     { id: 'trading', label: 'Trading', icon: Play },
     { id: 'monitoring', label: 'Monitoring', icon: TrendingUp },
+    { id: 'systems', label: 'Systems', icon: Cpu },
   ]
 
   return (
@@ -571,6 +573,10 @@ const Dashboard = ({ onSetupChange }) => {
 
         {activeTab === 'monitoring' && (
           <MonitoringPanel />
+        )}
+
+        {activeTab === 'systems' && (
+          <SystemsPanel />
         )}
       </main>
 

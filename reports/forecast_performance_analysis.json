@@ -1,0 +1,14 @@
+{
+  "label": "With Forecast Features",
+  "total_trades": 1000,
+  "win_count": 456,
+  "loss_count": 544,
+  "win_rate": 0.456,
+  "total_pnl": -31699.279534187343,
+  "avg_pnl": -31.699279534187344,
+  "avg_win": 90.07346893868986,
+  "avg_loss": -133.7734951658638,
+  "profit_factor": 0.5644074757440154,
+  "sharpe_like": -3.9248708536916794,
+  "max_drawdown": -31843.85762424898
+}

@@ -48,6 +48,7 @@ from src.analysis.markov_regime import (
 )
 from src.ai_analysis_service import generate_analysis, record_feedback
 from src.capability_registry import list_capabilities_by_tab, get_capability
+from src.utils.colors import error, warn
 
 # Monte Carlo risk assessment
 try:
@@ -136,6 +137,7 @@ class TrainingRequest(BaseModel):
     reasoning_model: Optional[str] = None
     checkpoint_path: Optional[str] = None  # Resume from checkpoint
     transfer_strategy: Optional[str] = None  # Transfer learning strategy: "copy_and_extend", "interpolate", "zero_pad"
+    flush_old_data: bool = False  # Clear trading journal and caches when starting fresh training
 
 
 class BacktestRequest(BaseModel):
@@ -727,7 +729,7 @@ async def list_configs():
         
         return {"configs": config_files}
     except Exception as e:
-        print(f"Error listing configs: {e}")
+        print(error(f"Error listing configs: {e}"))
         import traceback
         traceback.print_exc()
         return {"configs": [], "error": str(e)}
@@ -812,7 +814,7 @@ async def get_cuda_status():
                 print(f"   Device count: {result['device_count']}")
                 print(f"   GPU Memory: {result['gpu_memory_gb']} GB")
             except Exception as gpu_error:
-                print(f"[WARN] Error getting GPU info: {gpu_error}")
+                print(warn(f"[WARN] Error getting GPU info: {gpu_error}"))
                 import traceback
                 traceback.print_exc()
                 result["gpu_name"] = "Unknown"
@@ -825,16 +827,16 @@ async def get_cuda_status():
             result["device_count"] = 0
             if not has_cuda_build:
                 result["error"] = "PyTorch was not compiled with CUDA support. Install CUDA-enabled PyTorch."
-                print("[ERROR] CUDA not available - PyTorch is CPU-only build")
+                print(error("[ERROR] CUDA not available - PyTorch is CPU-only build"))
             else:
                 result["error"] = "CUDA runtime not available. Check NVIDIA drivers."
-                print("[ERROR] CUDA not available - CUDA runtime not detected")
+                print(error("[ERROR] CUDA not available - CUDA runtime not detected"))
         
         print(f"Returning result: {result}")
         print("="*60)
         return result
     except ImportError as e:
-        print(f"PyTorch import error: {e}")
+        print(error(f"PyTorch import error: {e}"))
         return {
             "cuda_available": False,
             "device": "cpu",
@@ -844,7 +846,7 @@ async def get_cuda_status():
             "error": "PyTorch not installed"
         }
     except Exception as e:
-        print(f"CUDA check error: {e}")
+        print(error(f"CUDA check error: {e}"))
         import traceback
         traceback.print_exc()
         return {
@@ -874,7 +876,7 @@ def _on_auto_retrain_triggered(files):
         system = active_systems["training"]
         thread_alive = system.get("thread") and system["thread"].is_alive()
         if thread_alive:
-            print("[WARN]  Training already in progress. New data detected but will not retrain yet.")
+            print(warn("[WARN]  Training already in progress. New data detected but will not retrain yet."))
             print("   Retraining will be queued after current training completes.")
             # TODO: Implement queue system
             # For now, just notify
@@ -946,7 +948,7 @@ def _on_auto_retrain_triggered(files):
             print("[OK] Auto-retraining triggered successfully")
             print("   Training should start shortly...")
         except Exception as e:
-            print(f"[ERROR] Error triggering auto-retraining: {e}")
+            print(error(f"[ERROR] Error triggering auto-retraining: {e}"))
             import traceback
             traceback.print_exc()
             
@@ -964,7 +966,7 @@ def _on_auto_retrain_triggered(files):
             except:
                 pass
     else:
-        print("[WARN]  Main event loop not available, cannot trigger training automatically")
+        print(warn("[WARN]  Main event loop not available, cannot trigger training automatically"))
         print("   Please start training manually from the UI or use the API endpoint")
 
 
@@ -974,6 +976,14 @@ async def startup_event():
     global main_event_loop, auto_retrain_monitor
     
     main_event_loop = asyncio.get_event_loop()
+    
+    # Initialize trading journal database to ensure tables exist
+    try:
+        from src.trading_journal import TradingJournal
+        journal = TradingJournal()
+        print("[OK] Trading journal database initialized")
+    except Exception as e:
+        print(warn(f"[WARN] Could not initialize trading journal database: {e}"))
     
     # Initialize auto-retrain monitor if settings are configured
     settings_file = project_root / "settings.json"
@@ -995,7 +1005,7 @@ async def startup_event():
                     auto_retrain_monitor.start()
                     print(f"[OK] Auto-retrain monitoring started on: {nt8_path}")
         except Exception as e:
-            print(f"[WARN] Could not initialize auto-retrain monitor: {e}")
+            print(warn(f"[WARN] Could not initialize auto-retrain monitor: {e}"))
     
     print("[OK] API server initialized")
 
@@ -1014,7 +1024,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
     if "training" in active_systems:
         system = active_systems["training"]
         thread_alive = system.get("thread") and system["thread"].is_alive()
-        print(f"[WARN]  Training start requested but training already in active_systems")
+        print(warn(f"[WARN]  Training start requested but training already in active_systems"))
         print(f"   Thread alive: {thread_alive}")
         print(f"   Completed flag: {system.get('completed', False)}")
         if not thread_alive and system.get("completed", False):
@@ -1026,12 +1036,37 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
     
     # Log the incoming request for debugging
     print(f"\n{'='*60}")
-    print(f"ðŸ“¥ Training Start Request Received")
+    print(f"📥 Training Start Request Received")
     print(f"   Device: {request.device}")
     print(f"   Config: {request.config_path}")
     print(f"   Total timesteps: {request.total_timesteps}")
     print(f"   Checkpoint path: {request.checkpoint_path if request.checkpoint_path else 'None (fresh start)'}")
+    print(f"   Flush old data: {request.flush_old_data}")
     print(f"{'='*60}\n")
+    
+    # Clear old training data if requested (fresh start only)
+    if request.flush_old_data and not request.checkpoint_path:
+        print(f"[INFO] Flushing old training data (fresh start requested)...")
+        try:
+            from src.clear_training_data import clear_all_training_data
+            clear_result = clear_all_training_data(
+                archive_db=True,  # Archive old database before clearing
+                clear_caches_flag=True,  # Clear cache files
+                clear_processed=False  # Keep processed data (can be regenerated)
+            )
+            if clear_result.get("success"):
+                print(f"[OK] Old training data flushed successfully")
+                print(f"   Journal: {clear_result['journal'].get('message', 'N/A')}")
+                print(f"   Caches: {clear_result['caches'].get('message', 'N/A')}")
+                if clear_result.get("journal", {}).get("backup_path"):
+                    print(f"   Backup: {clear_result['journal']['backup_path']}")
+            else:
+                print(warn(f"[WARN] Some data clearing operations failed: {clear_result.get('message', 'Unknown error')}"))
+        except Exception as e:
+            print(error(f"[ERROR] Failed to flush old training data: {e}"))
+            import traceback
+            traceback.print_exc()
+            # Continue with training even if flush failed
     
     async def _train():
         # Force immediate output to verify function is called
@@ -1056,7 +1091,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             print(f"[_train] [OK] Broadcast message sent successfully")
             sys.stdout.flush()
         except Exception as e:
-            print(f"[_train] [ERROR] ERROR sending broadcast: {e}")
+            print(error(f"[_train] [ERROR] ERROR sending broadcast: {e}"))
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
@@ -1070,7 +1105,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             print(f"[_train]   Instrument: {config.get('environment', {}).get('instrument', 'N/A')}")
             print(f"[_train]   Timeframes: {config.get('environment', {}).get('timeframes', 'N/A')}")
         except Exception as e:
-            print(f"[_train] [ERROR] ERROR loading config: {e}")
+            print(error(f"[_train] [ERROR] ERROR loading config: {e}"))
             import traceback
             traceback.print_exc()
             raise
@@ -1145,7 +1180,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                         checkpoint_path_to_use = str(relative_checkpoint.resolve())
                         print(f"   [OK] Using checkpoint: {checkpoint_path_to_use}")
                     else:
-                        print(f"   [WARN]  WARNING: Checkpoint not found! Will start fresh training.")
+                        print(warn(f"   [WARN]  WARNING: Checkpoint not found! Will start fresh training."))
                         print(f"      Tried: {checkpoint_test}")
                         print(f"      Tried: {relative_checkpoint}")
                         await broadcast_message({
@@ -1175,6 +1210,11 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                 init_elapsed = time.time() - init_start_time
                 print(f"[_train] [OK] Trainer created successfully (took {init_elapsed:.1f}s)")
                 
+                # CRITICAL FIX: Update training_start_episode when trainer is created
+                if "training" in active_systems and hasattr(trainer, 'episode'):
+                    active_systems["training"]["training_start_episode"] = trainer.episode
+                    print(f"[INFO] Training started at episode: {trainer.episode}")
+                
                 # Send success update
                 await broadcast_message({
                     "type": "training",
@@ -1187,10 +1227,10 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                 error_trace = traceback.format_exc()
                 init_elapsed = time.time() - init_start_time
                 print(f"\n{'='*80}")
-                print(f"[_train] [ERROR][ERROR][ERROR] ERROR CREATING TRAINER AFTER {init_elapsed:.1f}s [ERROR][ERROR][ERROR]")
-                print(f"[_train] Error: {e}")
+                print(error(f"[_train] [ERROR][ERROR][ERROR] ERROR CREATING TRAINER AFTER {init_elapsed:.1f}s [ERROR][ERROR][ERROR]"))
+                print(error(f"[_train] Error: {e}"))
                 print(f"[_train] Full traceback:")
-                print(error_trace)
+                print(error(error_trace))
                 print(f"{'='*80}\n")
                 sys.stdout.flush()
                 
@@ -1258,8 +1298,8 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                 except Exception as e:
                     import traceback
                     error_trace = traceback.format_exc()
-                    print(f"[ERROR] ERROR in training worker thread: {str(e)}")
-                    print(f"   Traceback:\n{error_trace}")
+                    print(error(f"[ERROR] ERROR in training worker thread: {str(e)}"))
+                    print(error(f"   Traceback:\n{error_trace}"))
                     # Use the main event loop to send async messages from thread
                     try:
                         if main_event_loop and main_event_loop.is_running():
@@ -1283,8 +1323,8 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                             }))
                             loop.close()
                     except Exception as broadcast_error:
-                        print(f"[ERROR] Failed to broadcast training error: {broadcast_error}")
-                        print(f"   Original error: {str(e)}")
+                        print(error(f"[ERROR] Failed to broadcast training error: {broadcast_error}"))
+                        print(error(f"   Original error: {str(e)}"))
                     
                     # Mark training as completed with error
                     if "training" in active_systems:
@@ -1295,12 +1335,24 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             thread.daemon = True
             thread.start()
             
+            # Store checkpoint resume timestamp - ALWAYS set when training starts
+            # This filters out old trades from previous training sessions
+            # Set to current time so only NEW trades from this training session are shown
+            checkpoint_resume_timestamp = datetime.now().isoformat()
+            if checkpoint_path_to_use:
+                print(f"[INFO] Resuming from checkpoint: {checkpoint_path_to_use}")
+            print(f"[INFO] Training start timestamp: {checkpoint_resume_timestamp} (filters trades before this time)")
+            
             # Update the placeholder entry with actual trainer and thread
+            # CRITICAL FIX: Store training_start_episode for filtering adjustments
+            training_start_episode = trainer.episode if hasattr(trainer, 'episode') else 0
             active_systems["training"] = {
                 "trainer": trainer,
                 "thread": thread,
                 "completed": False,
-                "status": "running"  # Update status to running
+                "training_start_episode": training_start_episode,
+                "status": "running",  # Update status to running
+                "checkpoint_resume_timestamp": checkpoint_resume_timestamp
             }
             print(f"[OK] Training thread started, trainer created successfully")
             print(f"   Thread ID: {thread.ident}")
@@ -1309,16 +1361,16 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             if "training" in active_systems and active_systems["training"].get("trainer") is not None:
                 pass  # Trainer stored successfully
             else:
-                print(f"[ERROR] WARNING: Trainer was NOT stored in active_systems!")
+                print(error(f"[ERROR] WARNING: Trainer was NOT stored in active_systems!"))
             
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
             print(f"\n{'='*80}")
-            print(f"[ERROR][ERROR][ERROR] FAILED TO START TRAINING [ERROR][ERROR][ERROR]")
-            print(f"Error: {str(e)}")
+            print(error(f"[ERROR][ERROR][ERROR] FAILED TO START TRAINING [ERROR][ERROR][ERROR]"))
+            print(error(f"Error: {str(e)}"))
             print(f"Full traceback:")
-            print(error_trace)
+            print(error(error_trace))
             print(f"{'='*80}\n")
             sys.stdout.flush()
             
@@ -1341,12 +1393,24 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
     # Add placeholder entry immediately so status endpoint knows training is starting
     # This prevents race condition where status is checked before _train() completes
     import time
+    
+    # ALWAYS set training start timestamp when training begins
+    # This ensures the monitoring panel filters out old trades from previous sessions
+    # Whether resuming from checkpoint or starting fresh, we want to see only NEW trades
+    training_start_timestamp = datetime.now().isoformat()
+    if request.checkpoint_path:
+        print(f"[INFO] Resuming from checkpoint: {request.checkpoint_path}")
+    print(f"[INFO] Training start timestamp: {training_start_timestamp} (will filter trades before this time in monitoring)")
+    
     active_systems["training"] = {
         "trainer": None,  # Will be set when trainer is created
         "thread": None,   # Will be set when actual training thread starts
         "completed": False,
         "status": "starting",  # Mark as starting
-        "start_time": time.time()  # Track when training started to detect hangs
+        "start_time": time.time(),  # Track when training started to detect hangs
+        "checkpoint_resume_timestamp": training_start_timestamp,
+        "training_start_timestamp": training_start_timestamp,
+        "training_start_episode": 0  # Will be updated when trainer is created
     }
     
     print(f"\n{'='*60}")
@@ -1390,7 +1454,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                 result = task.result()
                 print(f"   Task result: {result}")
             except Exception as task_error:
-                print(f"   [ERROR] Task error: {task_error}")
+                print(error(f"   [ERROR] Task error: {task_error}"))
                 import traceback
                 traceback.print_exc()
         sys.stdout.flush()
@@ -1400,7 +1464,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         sys.stdout.flush()
         
     except Exception as e:
-        print(f"[ERROR] ERROR creating/scheduling asyncio task: {e}")
+        print(error(f"[ERROR] ERROR creating/scheduling asyncio task: {e}"))
         import traceback
         traceback.print_exc()
         sys.stdout.flush()
@@ -1633,8 +1697,10 @@ async def training_status():
                    trainer.episode == 0 and 
                    len(trainer.episode_rewards) == 0)
         
+        # Check if training is active
+        training_is_active = trainer.timestep > 0  # Training has started (timestep is advancing)
+        
         # Use current episode metrics if we have an active episode (length > 0 and not stuck)
-        # Otherwise use the latest completed episode metrics
         has_active_episode = current_episode_length > 0 and not is_stuck
         display_reward = current_episode_reward if has_active_episode else latest_reward
         display_length = current_episode_length if has_active_episode else latest_length
@@ -1646,39 +1712,316 @@ async def training_status():
         # If stuck, still show episode 1 to indicate training is happening
         current_episode_number = trainer.episode + (1 if (has_active_episode or is_stuck) else 0)
         
-        # Calculate trading metrics
-        # Use current episode metrics if available, otherwise use latest completed
-        display_trades = getattr(trainer, 'current_episode_trades', 0) if has_active_episode else (trainer.episode_trades[-1] if hasattr(trainer, 'episode_trades') and trainer.episode_trades else 0)
-        display_pnl = getattr(trainer, 'current_episode_pnl', 0.0) if has_active_episode else (trainer.episode_pnls[-1] if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls else 0.0)
-        display_equity = getattr(trainer, 'current_episode_equity', 0.0) if has_active_episode else (trainer.episode_equities[-1] if hasattr(trainer, 'episode_equities') and trainer.episode_equities else 0.0)
-        display_win_rate = getattr(trainer, 'current_episode_win_rate', 0.0) if has_active_episode else (trainer.episode_win_rates[-1] if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates else 0.0)
-        display_max_drawdown = getattr(trainer, 'current_episode_max_drawdown', 0.0) if has_active_episode else (trainer.episode_max_drawdowns[-1] if hasattr(trainer, 'episode_max_drawdowns') and trainer.episode_max_drawdowns else 0.0)
+        # Calculate trading metrics - ALWAYS read from trainer first (updated every step)
+        # Priority 1: Trainer's current episode tracking (updated from step_info)
+        display_trades = getattr(trainer, 'current_episode_trades', 0)
+        display_pnl = getattr(trainer, 'current_episode_pnl', 0.0)
+        display_equity = getattr(trainer, 'current_episode_equity', 0.0)
+        display_win_rate = getattr(trainer, 'current_episode_win_rate', 0.0)
+        display_max_drawdown = getattr(trainer, 'current_episode_max_drawdown', 0.0)
+        
+        # Priority 2: If values are 0 but training is active, get directly from environment
+        if training_is_active and (display_trades == 0 and display_pnl == 0.0):
+            if hasattr(trainer, 'env') and trainer.env:
+                if hasattr(trainer.env, 'episode_trades'):
+                    display_trades = trainer.env.episode_trades
+                if hasattr(trainer.env, 'state') and trainer.env.state:
+                    # CRITICAL FIX: Use database for current session PnL to match Performance Monitoring
+                    # Environment state resets each episode, database accumulates across episodes
+                    current_episode_pnl = float(trainer.env.state.total_pnl)  # Current episode only
+                    display_pnl = current_episode_pnl  # Will be replaced with session total if available
+                    
+                    # Get current session PnL from database (matches Performance Monitoring)
+                    training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
+                    if training_start_ts:
+                        try:
+                            import sqlite3
+                            db_path = project_root / "logs/trading_journal.db"
+                            if db_path.exists():
+                                conn = sqlite3.connect(str(db_path))
+                                cursor = conn.cursor()
+                                cursor.execute("""
+                                    SELECT SUM(net_pnl) as session_pnl
+                                    FROM trades
+                                    WHERE timestamp >= ?
+                                """, (training_start_ts,))
+                                result = cursor.fetchone()
+                                if result and result[0] is not None:
+                                    display_pnl = float(result[0])  # Use session total instead of episode
+                                conn.close()
+                        except Exception as e:
+                            print(f"[WARN] Failed to get session PnL from database: {e}")
+                            # Fallback to episode PnL
+                            
+                    if hasattr(trainer.env, 'initial_capital'):
+                        display_equity = float(trainer.env.initial_capital + display_pnl)
+                    if trainer.env.state.trades_count > 0:
+                        display_win_rate = float(trainer.env.state.winning_trades / trainer.env.state.trades_count)
+                if hasattr(trainer.env, 'max_drawdown'):
+                    display_max_drawdown = float(trainer.env.max_drawdown)
+        
+        # Priority 3: If still no values, check for latest completed episode
+        if display_trades == 0 and display_pnl == 0.0 and hasattr(trainer, 'episode_trades') and trainer.episode_trades and len(trainer.episode_trades) > 0:
+            display_trades = trainer.episode_trades[-1]
+            display_pnl = trainer.episode_pnls[-1] if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls else 0.0
+            display_equity = trainer.episode_equities[-1] if hasattr(trainer, 'episode_equities') and trainer.episode_equities else 0.0
+            display_win_rate = trainer.episode_win_rates[-1] if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates else 0.0
+            display_max_drawdown = trainer.episode_max_drawdowns[-1] if hasattr(trainer, 'episode_max_drawdowns') and trainer.episode_max_drawdowns else 0.0
         
         # Aggregate trading metrics across all episodes
-        total_trades = getattr(trainer, 'total_trades', 0)
-        total_winning_trades = getattr(trainer, 'total_winning_trades', 0)
-        total_losing_trades = getattr(trainer, 'total_losing_trades', 0)
+        # Priority 1: Get cumulative counts from trainer (accumulates across all episodes)
+        session_trades = getattr(trainer, 'total_trades', 0)
+        session_winning = getattr(trainer, 'total_winning_trades', 0)
+        session_losing = getattr(trainer, 'total_losing_trades', 0)
+        
+        # Priority 2: Also get current episode trade counts from environment state
+        # NOTE: Environment state resets each episode, so this is only for current episode
+        env_trades = 0
+        env_winning = 0
+        env_losing = 0
+        if hasattr(trainer, 'env') and trainer.env:
+            if hasattr(trainer.env, 'state') and trainer.env.state:
+                env_trades = getattr(trainer.env.state, 'trades_count', 0)
+                env_winning = getattr(trainer.env.state, 'winning_trades', 0)
+                env_losing = getattr(trainer.env.state, 'losing_trades', 0)
+        
+        # CRITICAL FIX: If trainer's cumulative counts are 0 but we have episode trades,
+        # calculate cumulative from episode_trades list (sum all completed episodes)
+        if session_trades == 0 and hasattr(trainer, 'episode_trades') and trainer.episode_trades:
+            # Sum all completed episodes' trades
+            session_trades = sum(trainer.episode_trades)
+            # Estimate winning/losing from episode win rates if available
+            if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates:
+                for i, episode_trades in enumerate(trainer.episode_trades):
+                    if i < len(trainer.episode_win_rates):
+                        win_rate = trainer.episode_win_rates[i]
+                        estimated_wins = int(episode_trades * win_rate / 100.0) if episode_trades > 0 else 0
+                        estimated_losses = episode_trades - estimated_wins
+                        session_winning += estimated_wins
+                        session_losing += estimated_losses
+            
+            # Debug log when calculating from episode list
+            if session_trades > 0:
+                print(f"[DEBUG] Calculated cumulative trades from episode list: {session_trades} trades across {len(trainer.episode_trades)} episodes")
+        
+        # Debug log trade count sources
+        if not hasattr(trainer, '_last_logged_trade_counts') or trainer._last_logged_trade_counts != (session_trades, env_trades):
+            print(f"[DEBUG] Trade count sources - Trainer cumulative: {session_trades}, Environment current: {env_trades}, Episode list length: {len(getattr(trainer, 'episode_trades', []))}")
+            trainer._last_logged_trade_counts = (session_trades, env_trades)
+        
+        # Initialize db_total_trades for debug logging
+        db_total_trades = None
+        db_winning_trades = None
+        db_losing_trades = None
+        
+        # Get trade counts from trading journal
+        # For fresh training, filter by training_start_timestamp to show only current session
+        # For resumed training, show all-time totals
+        try:
+            import sqlite3
+            from src.trading_journal import TradingJournal
+            # Ensure database is initialized
+            journal = TradingJournal()
+            db_path = project_root / "logs/trading_journal.db"
+            if db_path.exists():
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.cursor()
+                
+                # Get training start timestamp from current system object (already loaded above)
+                # Use system variable from line 1446, don't re-fetch
+                training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
+                
+                # Filter by training start timestamp if available (fresh training)
+                if training_start_ts:
+                    # Fresh training - only show trades from current session
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ?", (training_start_ts,))
+                    db_total_trades = cursor.fetchone()[0] or 0
+                    
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1 AND timestamp >= ?", (training_start_ts,))
+                    db_winning_trades = cursor.fetchone()[0] or 0
+                    
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 0 AND timestamp >= ?", (training_start_ts,))
+                    db_losing_trades = cursor.fetchone()[0] or 0
+                else:
+                    # No timestamp filter - show all-time totals (fallback)
+                    cursor.execute("SELECT COUNT(*) FROM trades")
+                    db_total_trades = cursor.fetchone()[0] or 0
+                    
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1")
+                    db_winning_trades = cursor.fetchone()[0] or 0
+                    
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 0")
+                    db_losing_trades = cursor.fetchone()[0] or 0
+                
+                conn.close()
+                
+                # Use database counts (filtered by session if fresh training)
+                # Priority: Database > Trainer cumulative > Environment (current episode only)
+                if db_total_trades > 0:
+                    # Database has trades - use it (most reliable)
+                    total_trades = db_total_trades
+                    total_winning_trades = db_winning_trades
+                    total_losing_trades = db_losing_trades
+                elif session_trades > 0:
+                    # Database empty but trainer has cumulative counts - use trainer
+                    total_trades = session_trades
+                    total_winning_trades = session_winning
+                    total_losing_trades = session_losing
+                elif env_trades > 0:
+                    # Fallback: Only environment has trades (current episode only)
+                    # This is less ideal but better than showing 0
+                    total_trades = env_trades
+                    total_winning_trades = env_winning
+                    total_losing_trades = env_losing
+                else:
+                    # All sources are 0
+                    total_trades = 0
+                    total_winning_trades = 0
+                    total_losing_trades = 0
+            else:
+                # No database - prioritize trainer cumulative counts over environment
+                if session_trades > 0:
+                    # Trainer has cumulative counts - use it
+                    total_trades = session_trades
+                    total_winning_trades = session_winning
+                    total_losing_trades = session_losing
+                elif env_trades > 0:
+                    # Fallback: Only environment has trades (current episode only)
+                    total_trades = env_trades
+                    total_winning_trades = env_winning
+                    total_losing_trades = env_losing
+                else:
+                    # All sources are 0
+                    total_trades = 0
+                    total_winning_trades = 0
+                    total_losing_trades = 0
+        except Exception as e:
+            # If database read fails, prioritize trainer cumulative counts
+            print(f"[WARN] Failed to read trading journal for training status: {e}")
+            if session_trades > 0:
+                # Trainer has cumulative counts - use it
+                total_trades = session_trades
+                total_winning_trades = session_winning
+                total_losing_trades = session_losing
+            elif env_trades > 0:
+                # Fallback: Only environment has trades (current episode only)
+                total_trades = env_trades
+                total_winning_trades = env_winning
+                total_losing_trades = env_losing
+            else:
+                # All sources are 0
+                total_trades = 0
+                total_winning_trades = 0
+                total_losing_trades = 0
+        
         overall_win_rate = float(total_winning_trades / total_trades * 100) if total_trades > 0 else 0.0
         
+        # DEBUG: Log trade counts being returned to frontend (every 10 API calls to reduce noise)
+        if not hasattr(trainer, '_trade_counts_log_counter'):
+            trainer._trade_counts_log_counter = 0
+        trainer._trade_counts_log_counter += 1
+        
+        # Store db_total_trades for debug logging (will be set in try block above)
+        db_trades_debug = locals().get('db_total_trades', 'N/A')
+        
+        if trainer._trade_counts_log_counter % 10 == 0 or (total_trades > 0 and trainer._trade_counts_log_counter <= 5):
+            print(f"[DEBUG API] Returning trade counts - total_trades={total_trades}, winning={total_winning_trades}, losing={total_losing_trades}, win_rate={overall_win_rate:.1f}%")
+            print(f"[DEBUG API] Sources - DB={db_trades_debug}, Trainer cumulative={session_trades}, Env current={env_trades}")
+        
         # Calculate mean PnL and equity across recent episodes
-        # Use last 10 episodes if available, otherwise use all available episodes
-        if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls:
+        # Use last 10 episodes if available from CURRENT SESSION
+        # Fallback to database if trainer lists are empty (resumed from checkpoint)
+        mean_pnl_10 = 0.0
+        mean_equity_10 = 0.0
+        mean_win_rate_10 = 0.0
+        
+        # Try to get from trainer's episode lists first
+        if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls and len(trainer.episode_pnls) > 0:
             recent_pnls = trainer.episode_pnls[-10:] if len(trainer.episode_pnls) >= 10 else trainer.episode_pnls
             mean_pnl_10 = float(sum(recent_pnls) / len(recent_pnls)) if recent_pnls else 0.0
-        else:
-            mean_pnl_10 = 0.0
         
-        if hasattr(trainer, 'episode_equities') and trainer.episode_equities:
+        if hasattr(trainer, 'episode_equities') and trainer.episode_equities and len(trainer.episode_equities) > 0:
             recent_equities = trainer.episode_equities[-10:] if len(trainer.episode_equities) >= 10 else trainer.episode_equities
             mean_equity_10 = float(sum(recent_equities) / len(recent_equities)) if recent_equities else 0.0
-        else:
-            mean_equity_10 = 0.0
         
-        if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates:
+        if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates and len(trainer.episode_win_rates) > 0:
             recent_win_rates = trainer.episode_win_rates[-10:] if len(trainer.episode_win_rates) >= 10 else trainer.episode_win_rates
             mean_win_rate_10 = float(sum(recent_win_rates) / len(recent_win_rates)) if recent_win_rates else 0.0
-        else:
-            mean_win_rate_10 = 0.0
+        
+        # FALLBACK: If trainer lists are empty (resumed from checkpoint), calculate from database
+        # Group trades by episode and calculate per-episode metrics
+        if mean_pnl_10 == 0.0 and mean_equity_10 == 0.0 and training_is_active:
+            try:
+                import sqlite3
+                from src.trading_journal import TradingJournal
+                # Ensure database is initialized
+                journal = TradingJournal()
+                db_path = project_root / "logs/trading_journal.db"
+                if db_path.exists():
+                    conn = sqlite3.connect(str(db_path))
+                    cursor = conn.cursor()
+                    
+                    # Get recent trades grouped by episode (assuming episode is in trades table)
+                    # Calculate per-episode PnL, equity, win rate from last N trades
+                    cursor.execute("""
+                        SELECT episode, 
+                               SUM(net_pnl) as episode_pnl,
+                               COUNT(*) as trades,
+                               SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins
+                        FROM trades
+                        WHERE episode IS NOT NULL
+                        GROUP BY episode
+                        ORDER BY episode DESC
+                        LIMIT 10
+                    """)
+                    recent_episodes = cursor.fetchall()
+                    
+                    if recent_episodes:
+                        episode_pnls_db = [row[1] for row in recent_episodes if row[1] is not None]
+                        episode_win_rates_db = []
+                        episode_equities_db = []
+                        
+                        for row in recent_episodes:
+                            episode, ep_pnl, trades, wins = row
+                            if trades and trades > 0:
+                                win_rate = (wins / trades) * 100
+                                episode_win_rates_db.append(win_rate)
+                            
+                            # Calculate equity (need initial capital - assume 100k)
+                            # This is approximate - actual equity would need to track capital changes
+                            if ep_pnl:
+                                # For mean calculation, we can use final equity estimates
+                                # This is a simplified calculation
+                                episode_equities_db.append(100000.0 + ep_pnl)
+                        
+                        if episode_pnls_db:
+                            mean_pnl_10 = float(sum(episode_pnls_db) / len(episode_pnls_db))
+                        if episode_win_rates_db:
+                            mean_win_rate_10 = float(sum(episode_win_rates_db) / len(episode_win_rates_db))
+                        if episode_equities_db:
+                            mean_equity_10 = float(sum(episode_equities_db) / len(episode_equities_db))
+                    
+                    conn.close()
+            except Exception as e:
+                # Database fallback failed - use zeros
+                print(f"[WARN] Failed to calculate mean metrics from database: {e}")
+                pass
+        
+        # DEBUG: Add diagnostic information for timestep issue
+        debug_info = {}
+        if trainer:
+            debug_info = {
+                "timestep_raw": trainer.timestep,
+                "episode_raw": trainer.episode,
+                "current_episode_length": getattr(trainer, 'current_episode_length', 0),
+                "episode_lengths_count": len(trainer.episode_lengths) if hasattr(trainer, 'episode_lengths') else 0,
+                "last_episode_length": trainer.episode_lengths[-1] if hasattr(trainer, 'episode_lengths') and trainer.episode_lengths else 0,
+                "training_loop_active": hasattr(trainer, 'timestep') and trainer.timestep >= 0,
+                "total_timesteps": trainer.total_timesteps,
+            }
+            # Check if timestep is stuck
+            if trainer.episode > 0 and trainer.timestep == 0:
+                debug_info["warning"] = "Timestep is 0 but episodes are progressing - training loop may not be executing properly"
         
         metrics = {
             "episode": current_episode_number,  # Show current episode (completed + in-progress)
@@ -1686,6 +2029,7 @@ async def training_status():
             "timestep": trainer.timestep,
             "total_timesteps": trainer.total_timesteps,
             "progress_percent": float(trainer.timestep / trainer.total_timesteps * 100) if trainer.total_timesteps > 0 else 0.0,
+            "debug": debug_info,  # Add debug info to API response
             "latest_reward": display_reward,  # Show current or latest completed reward
             "current_episode_reward": current_episode_reward,  # Current in-progress reward
             "mean_reward_10": mean_reward_10,
@@ -1699,10 +2043,14 @@ async def training_status():
             "current_episode_equity": display_equity,
             "current_episode_win_rate": display_win_rate * 100,  # Convert to percentage
             "current_episode_max_drawdown": display_max_drawdown * 100,  # Convert to percentage
-            "total_trades": total_trades,
-            "total_winning_trades": total_winning_trades,
-            "total_losing_trades": total_losing_trades,
-            "overall_win_rate": overall_win_rate,
+            "total_trades": total_trades,  # All-time from database
+            "total_winning_trades": total_winning_trades,  # All-time from database
+            "total_losing_trades": total_losing_trades,  # All-time from database
+            "overall_win_rate": overall_win_rate,  # All-time from database
+            # Also include session-only counts for comparison
+            "session_trades": session_trades,
+            "session_winning_trades": session_winning,
+            "session_losing_trades": session_losing,
             "mean_pnl_10": mean_pnl_10,
             "mean_equity_10": mean_equity_10,
             "mean_win_rate_10": mean_win_rate_10 * 100,  # Convert to percentage
@@ -1755,21 +2103,27 @@ async def training_status():
             print(f"[INFO] Training status API: Reporting mode = {performance_mode}, status = {status}")
             trainer._last_logged_mode = performance_mode
         
+        # Include checkpoint resume timestamp if available
+        checkpoint_resume_timestamp = system.get("checkpoint_resume_timestamp")
+        
         return {
             "status": status,
             "message": message,
             "metrics": metrics,
-            "training_mode": training_mode_info
+            "training_mode": training_mode_info,
+            "checkpoint_resume_timestamp": checkpoint_resume_timestamp
         }
     
     # Fallback if trainer not available yet - check system status
     fallback_status = system.get("status", "idle")
     fallback_message = system.get("message", "Training status unknown")
+    checkpoint_resume_timestamp = system.get("checkpoint_resume_timestamp")
     
     return {
         "status": fallback_status,
         "message": fallback_message,
-        "metrics": metrics
+        "metrics": metrics,
+        "checkpoint_resume_timestamp": checkpoint_resume_timestamp
     }
 
 
@@ -1975,7 +2329,7 @@ async def get_checkpoint_info(checkpoint_path: str):
         import traceback
         error_trace = traceback.format_exc()
         print(f"[WARN]  Error loading checkpoint info for '{checkpoint_path}': {e}")
-        print(error_trace)
+        print(error(error_trace))
         return {
             "error": str(e),
             "path": checkpoint_path,
@@ -2288,8 +2642,19 @@ async def stop_bridge():
 @app.post("/api/trading/start")
 async def start_trading(request: LiveTradingRequest, background_tasks: BackgroundTasks):
     """Start live/paper trading"""
-    if "trading" in active_processes:
+    # Check if trading is already running
+    if "trading" in active_systems:
         raise HTTPException(status_code=400, detail="Trading already running")
+    
+    # Check if training is running (trading should be blocked during training)
+    if "training" in active_systems:
+        system = active_systems["training"]
+        thread_alive = system.get("thread") and system["thread"].is_alive()
+        if thread_alive:
+            raise HTTPException(
+                status_code=400, 
+                detail="Cannot start trading while training is in progress. Please stop training first."
+            )
     
     if not Path(request.model_path).exists():
         raise HTTPException(status_code=404, detail=f"Model not found: {request.model_path}")
@@ -2442,14 +2807,748 @@ async def learning_status():
     return {"status": "running", "message": "Continuous learning in progress"}
 
 
-@app.get("/api/monitoring/performance")
-async def get_performance():
-    """Get current performance metrics"""
+@app.get("/api/systems/status")
+async def systems_status():
+    """Get comprehensive system component health status"""
+    components = {}
+    
+    # 1. Adaptive Learning Component
     try:
-        monitor = PerformanceMonitor()
-        metrics = monitor.get_current_metrics()
-        return {"status": "success", "metrics": metrics}
+        adaptive_config_path = project_root / "logs/adaptive_training/current_reward_config.json"
+        config_adjustments_path = project_root / "logs/adaptive_training/config_adjustments.jsonl"
+        
+        adaptive_status = "unknown"
+        adaptive_message = "Adaptive learning not active"
+        adaptive_params = {}
+        last_adjustment = None
+        adjustment_count = 0
+        
+        # Check if adaptive training is being used
+        if "training" in active_systems:
+            system = active_systems["training"]
+            trainer = system.get("trainer")
+            if trainer and hasattr(trainer, 'adaptive_trainer') and trainer.adaptive_trainer:
+                adaptive_status = "active"
+                adaptive_message = "Adaptive learning is active"
+                
+                # Get current parameters
+                if adaptive_config_path.exists():
+                    with open(adaptive_config_path, 'r') as f:
+                        adaptive_params = json.load(f)
+                    
+                    # Get last adjustment from history
+                    # CRITICAL FIX: Filter to show only adjustments from current training session
+                    if config_adjustments_path.exists():
+                        try:
+                            with open(config_adjustments_path, 'r') as f:
+                                lines = f.readlines()
+                                adjustment_count = len(lines)
+                                
+                                # CRITICAL FIX: Filter adjustments to current training session
+                                # Use episode number to filter (more reliable than timestamp when timestep is stuck)
+                                current_episode = trainer.episode if trainer else 0
+                                session_adjustments = []
+                                
+                                # Get training start episode (if available from system)
+                                training_start_episode = system.get("training_start_episode", 0)
+                                
+                                for line in lines:
+                                    if line.strip():
+                                        try:
+                                            adj_data = json.loads(line.strip())
+                                            adj_episode = adj_data.get("episode")
+                                            adj_timestamp = adj_data.get("timestamp", "")
+                                            
+                                            # Filter by episode if available (more reliable)
+                                            if adj_episode is not None:
+                                                # Include adjustments from current session (episode >= training_start_episode)
+                                                if adj_episode >= training_start_episode:
+                                                    session_adjustments.append(adj_data)
+                                            else:
+                                                # Fallback to timestamp filtering if episode not available
+                                                training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
+                                                if training_start_ts:
+                                                    if adj_timestamp >= training_start_ts:
+                                                        session_adjustments.append(adj_data)
+                                                else:
+                                                    # No filter available - include recent adjustments (last 100)
+                                                    if len(lines) <= 100:
+                                                        session_adjustments.append(adj_data)
+                                                    elif len(session_adjustments) == 0:
+                                                        # At least include the most recent one
+                                                        session_adjustments.append(adj_data)
+                                        except:
+                                            continue
+                                
+                                # Use session adjustments count
+                                adjustment_count = len(session_adjustments)
+                                
+                                if session_adjustments:
+                                    last_adjustment_data = session_adjustments[-1]
+                                    last_adjustment = {
+                                        "timestep": last_adjustment_data.get("timestep"),
+                                        "episode": last_adjustment_data.get("episode"),  # Include episode if available
+                                        "timestamp": last_adjustment_data.get("timestamp"),
+                                        "adjustments": last_adjustment_data.get("adjustments", {})
+                                    }
+                                elif lines:
+                                    # Fallback: use last line if session filtering removed everything
+                                    last_line = lines[-1].strip()
+                                    if last_line:
+                                        last_adjustment_data = json.loads(last_line)
+                                        last_adjustment = {
+                                            "timestep": last_adjustment_data.get("timestep"),
+                                            "episode": last_adjustment_data.get("episode"),
+                                            "timestamp": last_adjustment_data.get("timestamp"),
+                                            "adjustments": last_adjustment_data.get("adjustments", {})
+                                        }
+                                        # Mark as old data
+                                        last_adjustment["_is_old_data"] = True
+                        except Exception as e:
+                            adaptive_message = f"Adaptive learning active but error reading adjustments: {str(e)}"
+            else:
+                adaptive_status = "inactive"
+                adaptive_message = "Training running but adaptive learning not enabled"
+        else:
+            adaptive_status = "inactive"
+            adaptive_message = "No training in progress"
+        
+        components["adaptive_learning"] = {
+            "status": adaptive_status,
+            "message": adaptive_message,
+            "current_parameters": adaptive_params,
+            "last_adjustment": last_adjustment,
+            "total_adjustments": adjustment_count
+        }
     except Exception as e:
+        components["adaptive_learning"] = {
+            "status": "error",
+            "message": f"Error checking adaptive learning: {str(e)}"
+        }
+    
+    # 2. Training System Component
+    try:
+        if "training" in active_systems:
+            system = active_systems["training"]
+            trainer = system.get("trainer")
+            thread = system.get("thread")
+            
+            training_status = "unknown"
+            training_message = ""
+            gpu_status = "unknown"
+            checkpoint_status = "unknown"
+            
+            if thread and thread.is_alive():
+                if trainer:
+                    # Get training status details
+                    status_info = system.get("status", "unknown")
+                    if status_info == "running":
+                        training_status = "active"
+                        training_message = "Training is running"
+                    elif status_info == "starting":
+                        training_status = "starting"
+                        training_message = "Training is initializing"
+                    else:
+                        training_status = "unknown"
+                        training_message = f"Training status: {status_info}"
+                    
+                    # Check GPU usage
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            gpu_status = "available"
+                            if hasattr(trainer, 'device') and 'cuda' in str(trainer.device):
+                                gpu_status = "active"
+                                training_message += " (GPU)"
+                            else:
+                                gpu_status = "available_not_used"
+                                training_message += " (CPU)"
+                        else:
+                            gpu_status = "not_available"
+                            training_message += " (CPU only)"
+                    except:
+                        gpu_status = "unknown"
+                    
+                    # Check checkpoint status
+                    try:
+                        checkpoint_dir = project_root / "models"
+                        if checkpoint_dir.exists():
+                            checkpoints = list(checkpoint_dir.glob("*.pt"))
+                            if checkpoints:
+                                # Get most recent checkpoint
+                                latest_checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime)
+                                checkpoint_age = time.time() - latest_checkpoint.stat().st_mtime
+                                checkpoint_status = f"last_saved_{int(checkpoint_age)}s_ago"
+                            else:
+                                checkpoint_status = "no_checkpoints"
+                        else:
+                            checkpoint_status = "no_checkpoints"
+                    except:
+                        checkpoint_status = "unknown"
+                else:
+                    training_status = "starting"
+                    training_message = "Trainer initializing..."
+            else:
+                training_status = "stopped"
+                training_message = "Training not running"
+        else:
+            training_status = "stopped"
+            training_message = "No training system active"
+            gpu_status = "unknown"
+            checkpoint_status = "not_applicable"
+        
+        components["training_system"] = {
+            "status": training_status,
+            "message": training_message,
+            "gpu_status": gpu_status,
+            "checkpoint_status": checkpoint_status
+        }
+    except Exception as e:
+        components["training_system"] = {
+            "status": "error",
+            "message": f"Error checking training system: {str(e)}"
+        }
+    
+    # 3. Trading System Component
+    try:
+        if "trading" in active_systems:
+            system = active_systems["trading"]
+            thread = system.get("thread")
+            if thread and thread.is_alive():
+                trading_status = "active"
+                trading_message = "Trading system is running"
+            else:
+                trading_status = "stopped"
+                trading_message = "Trading thread not alive - restart may be needed"
+        else:
+            # Trading not started yet - this is normal, show as inactive/ready
+            # Check if bridge is available as a prerequisite
+            bridge_running = "bridge" in active_processes
+            if bridge_running:
+                trading_status = "inactive"
+                trading_message = "Ready to start (Bridge running, use Trading tab to start trading)"
+            else:
+                trading_status = "inactive"
+                trading_message = "Not started (Start bridge server first, then start trading from Trading tab)"
+        
+        components["trading_system"] = {
+            "status": trading_status,
+            "message": trading_message
+        }
+    except Exception as e:
+        components["trading_system"] = {
+            "status": "error",
+            "message": f"Error checking trading system: {str(e)}"
+        }
+    
+    # 4. Data Pipeline Component
+    try:
+        data_path = project_root / "data"
+        raw_data_path = data_path / "raw"
+        processed_data_path = data_path / "processed"
+        
+        data_status = "unknown"
+        data_message = ""
+        data_files_count = 0
+        
+        if raw_data_path.exists():
+            # Check for data files
+            data_files = list(raw_data_path.glob("*.csv")) + list(raw_data_path.glob("*.json"))
+            data_files_count = len(data_files)
+            
+            if data_files_count > 0:
+                data_status = "available"
+                data_message = f"{data_files_count} data files found"
+            else:
+                data_status = "no_data"
+                data_message = "Data directory exists but no data files found"
+        else:
+            data_status = "no_directory"
+            data_message = "Data directory not found"
+        
+        components["data_pipeline"] = {
+            "status": data_status,
+            "message": data_message,
+            "file_count": data_files_count
+        }
+    except Exception as e:
+        components["data_pipeline"] = {
+            "status": "error",
+            "message": f"Error checking data pipeline: {str(e)}"
+        }
+    
+    # 5. Environment Component (adaptive config reading)
+    try:
+        adaptive_config_path = project_root / "logs/adaptive_training/current_reward_config.json"
+        
+        env_status = "unknown"
+        env_message = ""
+        env_config = {}
+        
+        if adaptive_config_path.exists():
+            try:
+                with open(adaptive_config_path, 'r') as f:
+                    env_config = json.load(f)
+                env_status = "reading_config"
+                env_message = "Environment reading adaptive config correctly"
+                
+                # Check if config has expected fields
+                if "min_risk_reward_ratio" in env_config:
+                    env_message += f" (R:R={env_config['min_risk_reward_ratio']})"
+            except Exception as e:
+                env_status = "error"
+                env_message = f"Error reading adaptive config: {str(e)}"
+        else:
+            env_status = "no_config"
+            env_message = "No adaptive config file (using defaults from training config)"
+        
+        components["environment"] = {
+            "status": env_status,
+            "message": env_message,
+            "config": env_config
+        }
+    except Exception as e:
+        components["environment"] = {
+            "status": "error",
+            "message": f"Error checking environment: {str(e)}"
+        }
+    
+    # 6. Decision Gate Component (quality filters)
+    try:
+        adaptive_config_path = project_root / "logs/adaptive_training/current_reward_config.json"
+        
+        decision_gate_status = "unknown"
+        decision_gate_message = ""
+        quality_filters = {}
+        
+        if adaptive_config_path.exists():
+            try:
+                with open(adaptive_config_path, 'r') as f:
+                    config = json.load(f)
+                    quality_filters = config.get("quality_filters", {})
+                
+                if quality_filters:
+                    decision_gate_status = "active"
+                    min_conf = quality_filters.get("min_action_confidence", "N/A")
+                    min_quality = quality_filters.get("min_quality_score", "N/A")
+                    decision_gate_message = f"Quality filters active (conf={min_conf}, quality={min_quality})"
+                else:
+                    decision_gate_status = "no_filters"
+                    decision_gate_message = "No quality filters in config"
+            except Exception as e:
+                decision_gate_status = "error"
+                decision_gate_message = f"Error reading quality filters: {str(e)}"
+        else:
+            decision_gate_status = "using_defaults"
+            decision_gate_message = "Using default quality filters from training config"
+        
+        components["decision_gate"] = {
+            "status": decision_gate_status,
+            "message": decision_gate_message,
+            "quality_filters": quality_filters
+        }
+    except Exception as e:
+        components["decision_gate"] = {
+            "status": "error",
+            "message": f"Error checking decision gate: {str(e)}"
+        }
+    
+    return {
+        "status": "success",
+        "components": components,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/monitoring/performance")
+async def get_performance(since: Optional[str] = None):
+    """
+    Get current performance metrics - reads from trading journal for real-time updates
+    
+    Args:
+        since: Optional ISO timestamp to filter trades (e.g., "2025-11-24T19:00:00")
+               If provided, only trades after this timestamp will be included.
+               Use this when resuming from checkpoint to see only new trades.
+    """
+    try:
+        import sqlite3
+        from src.trading_journal import TradingJournal
+        
+        # Ensure database is initialized
+        journal = TradingJournal()
+        
+        # Always read from trading journal for real-time updates
+        db_path = project_root / "logs/trading_journal.db"
+        
+        if not db_path.exists():
+            # No journal yet - return empty metrics
+            return {
+                "status": "success",
+                "metrics": {
+                    "total_pnl": 0.0,
+                    "sharpe_ratio": 0.0,
+                    "sortino_ratio": 0.0,
+                    "win_rate": 0.0,
+                    "profit_factor": 0.0,
+                    "max_drawdown": 0.0,
+                    "total_trades": 0,
+                    "average_trade": 0.0,
+                    "source": "journal",
+                    "mean_pnl_10": 0.0,
+                    "risk_reward_ratio": 0.0,
+                    "filtered_since": None
+                }
+            }
+        
+        # Build query with optional timestamp filter
+        conn = sqlite3.connect(str(db_path))
+        if since:
+            # Filter trades since the specified timestamp
+            # CRITICAL FIX: Log the filter to verify it's working
+            print(f"[PERFORMANCE API] Filtering trades since: {since}", flush=True)
+            query = """
+                SELECT 
+                    pnl, net_pnl, is_win, entry_price, exit_price, timestamp
+                FROM trades
+                WHERE timestamp >= ?
+                ORDER BY timestamp DESC
+            """
+            trades_df = pd.read_sql_query(query, conn, params=(since,))
+            print(f"[PERFORMANCE API] Found {len(trades_df)} trades after filtering (since {since})", flush=True)
+        else:
+            # Read all trades from journal (real-time data)
+            query = """
+                SELECT 
+                    pnl, net_pnl, is_win, entry_price, exit_price, timestamp
+                FROM trades
+                ORDER BY timestamp DESC
+            """
+            trades_df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        if len(trades_df) == 0:
+            # No trades yet
+            return {
+                "status": "success",
+                "metrics": {
+                    "total_pnl": 0.0,
+                    "sharpe_ratio": 0.0,
+                    "sortino_ratio": 0.0,
+                    "win_rate": 0.0,
+                    "profit_factor": 0.0,
+                    "max_drawdown": 0.0,
+                    "total_trades": 0,
+                    "average_trade": 0.0,
+                    "source": "journal",
+                    "mean_pnl_10": 0.0,
+                    "risk_reward_ratio": 0.0
+                }
+            }
+        
+        # Calculate metrics from journal (real-time)
+        total_trades = len(trades_df)
+        winning_trades = trades_df[trades_df['is_win'] == 1]
+        losing_trades = trades_df[trades_df['is_win'] == 0]
+        
+        win_count = len(winning_trades)
+        loss_count = len(losing_trades)
+        overall_win_rate = float(win_count / total_trades) if total_trades > 0 else 0.0
+        
+        # PnL metrics
+        total_pnl = float(trades_df['net_pnl'].sum())
+        average_trade = float(trades_df['net_pnl'].mean())
+        
+        # Recent 10 trades for mean PnL
+        recent_trades = trades_df.head(10) if len(trades_df) >= 10 else trades_df
+        mean_pnl_10 = float(recent_trades['net_pnl'].mean()) if len(recent_trades) > 0 else 0.0
+        
+        # Risk metrics
+        avg_win = float(winning_trades['net_pnl'].mean()) if len(winning_trades) > 0 else 0.0
+        avg_loss = float(losing_trades['net_pnl'].mean()) if len(losing_trades) > 0 else 0.0
+        
+        # Profit factor
+        if avg_loss < 0:  # Losses are negative
+            gross_profit = float(winning_trades['net_pnl'].sum()) if len(winning_trades) > 0 else 0.0
+            gross_loss = abs(float(losing_trades['net_pnl'].sum())) if len(losing_trades) > 0 else 0.0
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+        else:
+            profit_factor = 0.0
+        
+        # Risk/reward ratio
+        risk_reward_ratio = abs(avg_win / avg_loss) if avg_loss < 0 else 0.0
+        
+        # CRITICAL FIX #5: Sharpe ratio (from percentage returns, not raw PnL)
+        # Get initial capital from config (default 100000.0)
+        initial_capital = 100000.0
+        try:
+            config_path = project_root / "configs" / "train_config_adaptive.yaml"
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+                    initial_capital = config.get("risk_management", {}).get("initial_capital", 100000.0)
+        except:
+            pass  # Use default if config read fails
+        
+        if len(trades_df) > 1 and initial_capital > 0:
+            # Convert PnL to percentage returns (standard Sharpe formula)
+            pnl_values = trades_df['net_pnl'].values
+            returns = pnl_values / initial_capital  # Percentage returns
+            
+            # Calculate mean and std of returns
+            mean_return = float(np.mean(returns))
+            std_return = float(np.std(returns))
+            
+            # Risk-free rate (default 0.0 for trading, can be configured)
+            risk_free_rate = 0.0
+            
+            # Sharpe ratio = (mean_return - risk_free_rate) / std_return * sqrt(periods_per_year)
+            # Using 252 trading days for annualization (standard)
+            if std_return > 0:
+                sharpe_ratio = (mean_return - risk_free_rate) / std_return * np.sqrt(252)
+            else:
+                sharpe_ratio = 0.0
+        else:
+            sharpe_ratio = 0.0
+        
+        # CRITICAL FIX #5: Sortino ratio (from percentage returns, not raw PnL)
+        if len(trades_df) > 1 and initial_capital > 0:
+            # Convert PnL to percentage returns
+            pnl_values = trades_df['net_pnl'].values
+            returns = pnl_values / initial_capital  # Percentage returns
+            
+            mean_return = float(np.mean(returns))
+            downside_returns = returns[returns < 0]
+            downside_std = float(np.std(downside_returns)) if len(downside_returns) > 0 else 0.0
+            
+            # Sortino ratio = (mean_return - risk_free_rate) / downside_std * sqrt(periods_per_year)
+            risk_free_rate = 0.0
+            if downside_std > 0:
+                sortino_ratio = (mean_return - risk_free_rate) / downside_std * np.sqrt(252)
+            else:
+                sortino_ratio = 0.0
+        else:
+            sortino_ratio = 0.0
+        
+        # Max drawdown (cumulative)
+        cumulative = trades_df['net_pnl'].cumsum()
+        running_max = cumulative.expanding().max()
+        drawdown = cumulative - running_max
+        max_drawdown = float(abs(drawdown.min())) if len(drawdown) > 0 else 0.0
+        
+        metrics = {
+            "total_pnl": total_pnl,
+            "sharpe_ratio": sharpe_ratio,
+            "sortino_ratio": sortino_ratio,
+            "win_rate": overall_win_rate,
+            "profit_factor": profit_factor,
+            "max_drawdown": max_drawdown,
+            "total_trades": total_trades,
+            "average_trade": average_trade,
+            "source": "journal",  # Indicate this is from journal (real-time)
+            "mean_pnl_10": mean_pnl_10,
+            "risk_reward_ratio": risk_reward_ratio,
+            "filtered_since": since  # Show if filtering was applied
+        }
+        
+        return {"status": "success", "metrics": metrics}
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/journal/trades")
+async def get_journal_trades(episode: Optional[int] = None, limit: int = 100, offset: int = 0, since: Optional[str] = None):
+    """Get trades from trading journal"""
+    try:
+        from src.trading_journal import get_journal
+        journal = get_journal()
+        trades = journal.get_trades(episode=episode, limit=limit, offset=offset, since=since)
+        return {"status": "success", "trades": trades, "count": len(trades), "filtered_since": since}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/journal/equity-curve")
+async def get_equity_curve(episode: Optional[int] = None, limit: int = 10000, since: Optional[str] = None):
+    """Get equity curve from trading journal"""
+    try:
+        from src.trading_journal import get_journal
+        journal = get_journal()
+        curve = journal.get_equity_curve(episode=episode, limit=limit, since=since)
+        return {"status": "success", "equity_curve": curve, "count": len(curve), "filtered_since": since}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/journal/statistics")
+async def get_journal_statistics():
+    """Get trading statistics from journal"""
+    try:
+        from src.trading_journal import get_journal
+        journal = get_journal()
+        stats = journal.get_statistics()
+        return {"status": "success", "statistics": stats}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/monitoring/forecast-performance")
+async def get_forecast_performance(since: Optional[str] = None):
+    """Get forecast features performance analysis"""
+    try:
+        import sqlite3
+        import numpy as np
+        
+        # Check config
+        config_path = project_root / "configs/train_config_adaptive.yaml"
+        config_info = {}
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            env_config = config.get('environment', {})
+            features_config = env_config.get('features', {})
+            reward_config = env_config.get('reward', {})
+            
+            forecast_enabled = (
+                features_config.get('include_forecast_features', False) or 
+                reward_config.get('include_forecast_features', False) or
+                env_config.get('include_forecast_features', False)
+            )
+            regime_enabled = (
+                features_config.get('include_regime_features', False) or 
+                reward_config.get('include_regime_features', False) or
+                env_config.get('include_regime_features', False)
+            )
+            state_features = env_config.get('state_features', 900)
+            expected_state_dim = 900 + (5 if regime_enabled else 0) + (3 if forecast_enabled else 0)
+            
+            config_info = {
+                "forecast_enabled": forecast_enabled,
+                "regime_enabled": regime_enabled,
+                "state_features": state_features,
+                "expected_state_dim": expected_state_dim,
+                "state_dimension_match": state_features == expected_state_dim
+            }
+        
+        # Load trades from journal
+        # Ensure database is initialized
+        from src.trading_journal import TradingJournal
+        journal = TradingJournal()
+        
+        db_path = project_root / "logs/trading_journal.db"
+        trades_df = pd.DataFrame()
+        
+        if db_path.exists():
+            try:
+                conn = sqlite3.connect(str(db_path))
+                if since:
+                    query = """
+                        SELECT 
+                            timestamp, episode, strategy, entry_price, exit_price, 
+                            pnl, net_pnl, strategy_confidence, is_win
+                        FROM trades
+                        WHERE timestamp >= ?
+                        ORDER BY timestamp DESC
+                        LIMIT 1000
+                    """
+                    trades_df = pd.read_sql_query(query, conn, params=(since,))
+                else:
+                    query = """
+                        SELECT 
+                            timestamp, episode, strategy, entry_price, exit_price, 
+                            pnl, net_pnl, strategy_confidence, is_win
+                        FROM trades
+                        ORDER BY timestamp DESC
+                        LIMIT 1000
+                    """
+                    trades_df = pd.read_sql_query(query, conn)
+                conn.close()
+            except Exception as e:
+                print(f"[WARN] Failed to load trades: {e}")
+        
+        # Analyze performance
+        performance_stats = {}
+        if len(trades_df) > 0:
+            total_trades = len(trades_df)
+            winning_trades = trades_df[trades_df['is_win'] == 1]
+            losing_trades = trades_df[trades_df['is_win'] == 0]
+            
+            win_count = len(winning_trades)
+            loss_count = len(losing_trades)
+            win_rate = win_count / total_trades if total_trades > 0 else 0.0
+            
+            total_pnl = float(trades_df['net_pnl'].sum())
+            avg_pnl = float(trades_df['net_pnl'].mean())
+            
+            avg_win = float(winning_trades['net_pnl'].mean()) if len(winning_trades) > 0 else 0.0
+            avg_loss = float(losing_trades['net_pnl'].mean()) if len(losing_trades) > 0 else 0.0
+            
+            profit_factor = abs(winning_trades['net_pnl'].sum() / losing_trades['net_pnl'].sum()) if len(losing_trades) > 0 and losing_trades['net_pnl'].sum() != 0 else 0.0
+            
+            # CRITICAL FIX #5: Sharpe-like ratio (from percentage returns, not raw PnL)
+            initial_capital = 100000.0  # Default
+            try:
+                config_path = project_root / "configs" / "train_config_adaptive.yaml"
+                if config_path.exists():
+                    with open(config_path, 'r') as f:
+                        config = yaml.safe_load(f)
+                        initial_capital = config.get("risk_management", {}).get("initial_capital", 100000.0)
+            except:
+                pass
+            
+            if len(trades_df) > 1 and initial_capital > 0:
+                # Convert PnL to percentage returns
+                pnl_values = trades_df['net_pnl'].values
+                returns = pnl_values / initial_capital
+                
+                mean_return = float(np.mean(returns))
+                std_return = float(np.std(returns))
+                risk_free_rate = 0.0
+                
+                if std_return > 0:
+                    sharpe_like = (mean_return - risk_free_rate) / std_return * np.sqrt(252)
+                else:
+                    sharpe_like = 0.0
+            else:
+                sharpe_like = 0.0
+            
+            # Max drawdown
+            cumulative = trades_df['net_pnl'].cumsum()
+            running_max = cumulative.expanding().max()
+            drawdown = cumulative - running_max
+            max_drawdown = float(drawdown.min()) if len(drawdown) > 0 else 0.0
+            
+            performance_stats = {
+                "total_trades": total_trades,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate": win_rate,
+                "total_pnl": total_pnl,
+                "avg_pnl": avg_pnl,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "profit_factor": profit_factor,
+                "sharpe_like": sharpe_like,
+                "max_drawdown": max_drawdown,
+                "label": "With Forecast Features" if config_info.get("forecast_enabled", False) else "Without Forecast Features"
+            }
+        else:
+            performance_stats = {
+                "total_trades": 0,
+                "error": "No trades found"
+            }
+        
+        return {
+            "status": "success",
+            "config": config_info,
+            "performance": performance_stats
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
 
@@ -2585,7 +3684,7 @@ async def clear_auto_retrain_cache():
             "cache_file": str(cache_file)
         }
     except Exception as e:
-        print(f"[ERROR] Error clearing cache: {e}")
+        print(error(f"[ERROR] Error clearing cache: {e}"))
         raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
 
 
@@ -2604,16 +3703,16 @@ async def trigger_manual_retrain(background_tasks: BackgroundTasks):
     sys.stdout.flush()
     
     if not auto_retrain_monitor:
-        print(f"[ERROR] Auto-retrain monitor not initialized")
+        print(error(f"[ERROR] Auto-retrain monitor not initialized"))
         raise HTTPException(status_code=400, detail="Auto-retrain monitor not initialized")
     
     if not auto_retrain_monitor.nt8_export_path:
-        print(f"[ERROR] NT8 export path not configured")
+        print(error(f"[ERROR] NT8 export path not configured"))
         raise HTTPException(status_code=400, detail="NT8 export path not configured")
     
     watch_path = Path(auto_retrain_monitor.nt8_export_path)
     if not watch_path.exists():
-        print(f"[ERROR] NT8 export path does not exist: {watch_path}")
+        print(error(f"[ERROR] NT8 export path does not exist: {watch_path}"))
         raise HTTPException(status_code=404, detail=f"NT8 export path does not exist: {watch_path}")
     
     # Find all CSV and TXT files in the directory
@@ -2706,7 +3805,7 @@ async def trigger_manual_retrain(background_tasks: BackgroundTasks):
                 if training_status.get("error"):
                     # Training failed immediately during initialization
                     error_msg = training_status.get("error", "Unknown error")
-                    print(f"[ERROR] Training failed immediately: {error_msg}")
+                    print(error(f"[ERROR] Training failed immediately: {error_msg}"))
                     raise HTTPException(status_code=500, detail=f"Training failed to start: {error_msg}")
             
             return {
@@ -2722,12 +3821,12 @@ async def trigger_manual_retrain(background_tasks: BackgroundTasks):
         except Exception as e:
             # Catch any other errors from start_training
             error_msg = str(e)
-            print(f"[ERROR] Error calling start_training: {error_msg}")
+            print(error(f"[ERROR] Error calling start_training: {error_msg}"))
             import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Failed to start training: {error_msg}")
     except Exception as e:
-        print(f"[ERROR] Error triggering manual retrain: {e}")
+        print(error(f"[ERROR] Error triggering manual retrain: {e}"))
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to trigger retraining: {str(e)}")
@@ -2871,6 +3970,67 @@ async def set_settings(request: SettingsRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {str(e)}")
 
 
+@app.post("/api/config/update-forecast-features")
+async def update_forecast_features(request: Dict[str, Any]):
+    """Update forecast features setting in config file"""
+    try:
+        enabled = request.get("enabled", True)
+        config_path = request.get("config_path", "configs/train_config_adaptive.yaml")
+        
+        # Resolve config path
+        config_file = Path(str(config_path).replace('\\', '/'))
+        if not config_file.exists():
+            # Try relative to project root
+            config_file = project_root / str(config_path).replace('\\', '/').lstrip('/')
+        
+        if not config_file.exists():
+            raise HTTPException(status_code=404, detail=f"Config file not found: {config_path}")
+        
+        # Read existing config
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Update forecast features setting
+        if 'environment' not in config:
+            config['environment'] = {}
+        if 'features' not in config['environment']:
+            config['environment']['features'] = {}
+        
+        config['environment']['features']['include_forecast_features'] = enabled
+        
+        # Update state dimension
+        # Base: 900, Regime: +5, Forecast: +3
+        base_dim = 900
+        regime_enabled = config['environment']['features'].get('include_regime_features', False)
+        forecast_enabled = enabled
+        
+        regime_dim = 5 if regime_enabled else 0
+        forecast_dim = 3 if forecast_enabled else 0
+        new_state_dim = base_dim + regime_dim + forecast_dim
+        
+        config['environment']['state_features'] = new_state_dim
+        
+        # Write back to file
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        
+        print(f"✅ Updated forecast features in {config_file}")
+        print(f"   include_forecast_features: {enabled}")
+        print(f"   state_features: {new_state_dim}")
+        
+        return {
+            "status": "success",
+            "message": f"Forecast features {'enabled' if enabled else 'disabled'}",
+            "config_path": str(config_file),
+            "include_forecast_features": enabled,
+            "state_features": new_state_dim
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to update config: {str(e)}")
+
+
 # WebSocket endpoint for real-time updates
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -2932,7 +4092,7 @@ async def assess_monte_carlo_risk(request: MonteCarloRiskRequest):
         
         if price_data is None or len(price_data) < 10:
             # Use synthetic data if no real data available
-            import numpy as np
+            # Note: np is already imported at module level (line 26), no need for local import
             dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
             synthetic_prices = request.current_price * (1 + np.random.randn(100).cumsum() * 0.01)
             price_data = pd.DataFrame({

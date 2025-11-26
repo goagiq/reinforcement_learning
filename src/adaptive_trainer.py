@@ -13,12 +13,13 @@ import json
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 import yaml
 
 from src.model_evaluation import ModelEvaluator, ModelMetrics
 from src.quality_scorer import QualityScorer
+from src.utils.colors import error, warn
 
 
 @dataclass
@@ -40,7 +41,7 @@ class PerformanceSnapshot:
 class AdaptiveConfig:
     """Configuration for adaptive adjustments"""
     # Evaluation settings
-    eval_frequency: int = 10000  # Evaluate every N timesteps
+    eval_frequency: int = 5000  # Evaluate every N timesteps (default: 5,000 for more frequent checks)
     eval_episodes: int = 3  # Episodes per evaluation
     
     # Performance thresholds
@@ -70,15 +71,23 @@ class AdaptiveConfig:
     
     # Risk/reward ratio adjustment (NEW)
     rr_adjustment_enabled: bool = True
-    min_rr_threshold: float = 1.3  # Minimum R:R threshold
-    max_rr_threshold: float = 2.5  # Maximum R:R threshold
+    min_rr_threshold: float = 1.5  # Minimum R:R threshold (floor - adaptive learning won't go below this)
+    max_rr_threshold: float = 2.5  # Maximum R:R threshold (ceiling - adaptive learning won't go above this)
     rr_adjustment_rate: float = 0.1  # How much to adjust per step
+    min_rr_floor: float = 0.7  # Absolute minimum R:R to allow trades (enforcement floor - separate from adaptive floor)
     
     # Quality filter adjustment (NEW)
     quality_filter_adjustment_enabled: bool = True
     min_action_confidence_range: Tuple[float, float] = (0.1, 0.2)  # (min, max)
     min_quality_score_range: Tuple[float, float] = (0.3, 0.5)  # (min, max)
     quality_adjustment_rate: float = 0.01  # How much to adjust per step
+    
+    # Stop loss adjustment (NEW - adaptive based on volatility and performance)
+    stop_loss_adjustment_enabled: bool = True
+    min_stop_loss_pct: float = 0.01  # Hard minimum 1.0% (safety floor)
+    max_stop_loss_pct: float = 0.03  # Maximum 3.0% (for high volatility)
+    stop_loss_adjustment_rate: float = 0.002  # How much to adjust per step (0.2%)
+    base_stop_loss_pct: float = 0.015  # Base/starting stop loss (1.5%)
 
 
 class AdaptiveTrainer:
@@ -108,6 +117,13 @@ class AdaptiveTrainer:
         self.current_min_action_confidence = quality_filters_config.get("min_action_confidence", 0.15)
         self.current_min_quality_score = quality_filters_config.get("min_quality_score", 0.4)
         
+        # Current adaptive stop loss (NEW - volatility and performance based)
+        self.current_stop_loss_pct = self.config["environment"]["reward"].get("stop_loss_pct", self.adaptive_config.base_stop_loss_pct)
+        
+        # Stop loss tracking for performance-based adjustments
+        self.stop_loss_hit_count = 0  # Track how many times stop loss was hit
+        self.stop_loss_hit_history = []  # Track recent stop loss hits
+        
         # Evaluation
         self.evaluator = ModelEvaluator(self.config)
         
@@ -123,6 +139,7 @@ class AdaptiveTrainer:
         # NEW: Win rate tracking for aggressive adjustments
         self.consecutive_low_win_rate = 0
         self.consecutive_good_performance = 0
+        self.consecutive_negative_episodes = 0  # Track recent episode trend
         self.training_paused = False
         self.pause_reason = None
         
@@ -139,6 +156,7 @@ class AdaptiveTrainer:
         self.consecutive_no_trade_episodes = 0  # Episodes with no trades
         self.last_adjustment_timestep = 0
         self.min_adjustment_interval = 1000  # Minimum time between adjustments (allow more frequent adjustments)
+        self._last_adjustment_episode = 0  # Track last adjustment episode (for when timestep is stuck)
         
         # Logging
         self.log_dir = Path("logs/adaptive_training")
@@ -149,8 +167,181 @@ class AdaptiveTrainer:
         # Initialize adaptive config file with current values
         self._update_reward_config()
     
+    def quick_adjust_for_negative_trend(
+        self,
+        recent_mean_pnl: float,
+        recent_win_rate: float,
+        agent,
+        recent_trades_data: Optional[List[Dict]] = None,  # NEW: Optional recent trades from journal
+        recent_total_trades: int = 0  # NEW: Total trades in recent episodes
+    ) -> Optional[Dict]:
+        """
+        Quick adjustment for negative trend (called every episode, not just during evaluation).
+        
+        This provides faster response to negative trends without waiting for full evaluation.
+        ENHANCED: Now more aggressive for losing streaks and uses trade journal data.
+        CRITICAL FIX: Don't tighten filters when there are no trades - this creates a feedback loop!
+        
+        Args:
+            recent_mean_pnl: Mean PnL of last 10 episodes
+            recent_win_rate: Mean win rate of last 10 episodes
+            agent: PPOAgent instance
+            recent_trades_data: Optional list of recent trades from journal (for better analysis)
+            recent_total_trades: Total number of trades in recent episodes (to detect no-trade condition)
+            
+        Returns:
+            Dict with adjustments made, or None if no adjustments
+        """
+        adjustments = {}
+        
+        # CRITICAL FIX: If there are no trades, DON'T tighten filters - this makes the problem worse!
+        # Instead, we should relax filters to allow trades to happen
+        if recent_total_trades == 0:
+            # No trades detected - relax quality filters to encourage trading
+            old_confidence = self.current_min_action_confidence
+            old_quality = self.current_min_quality_score
+            
+            # Relax filters (decrease thresholds)
+            confidence_relaxation = 0.01  # Reduce by 1%
+            quality_relaxation = 0.02  # Reduce by 2%
+            
+            # Apply relaxation (with floors to prevent going too low)
+            min_confidence_floor = 0.05  # Don't go below 5%
+            min_quality_floor = 0.1  # Don't go below 10%
+            
+            self.current_min_action_confidence = max(
+                min_confidence_floor,
+                self.current_min_action_confidence - confidence_relaxation
+            )
+            self.current_min_quality_score = max(
+                min_quality_floor,
+                self.current_min_quality_score - quality_relaxation
+            )
+            
+            # Only make adjustment if values actually changed
+            if (self.current_min_action_confidence != old_confidence or 
+                self.current_min_quality_score != old_quality):
+                adjustments["quality_filters"] = {
+                    "min_action_confidence": {
+                        "old": old_confidence,
+                        "new": self.current_min_action_confidence,
+                        "reason": f"RELAXED: No trades detected - encouraging trading (was {old_confidence:.3f})"
+                    },
+                    "min_quality_score": {
+                        "old": old_quality,
+                        "new": self.current_min_quality_score,
+                        "reason": f"RELAXED: No trades detected - encouraging trading (was {old_quality:.3f})"
+                    }
+                }
+                
+                # Log adjustment details
+                print(f"\n[ADAPT] RELAXING Quality Filters (No Trades Detected):")
+                print(f"   Total Trades: {recent_total_trades}")
+                print(f"   Confidence: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (-{confidence_relaxation:.3f})")
+                print(f"   Quality: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (-{quality_relaxation:.3f})")
+                
+                # Update reward config to apply changes
+                self._update_reward_config()
+                return adjustments
+        
+        # Only adjust if negative trend is significant AND we have trades
+        if recent_mean_pnl < 0 and recent_total_trades > 0:
+            # Calculate severity of losing streak
+            # More negative PnL = more aggressive adjustment
+            pnl_severity = abs(recent_mean_pnl) / 100.0  # Normalize (e.g., -$100 = 1.0 severity)
+            pnl_severity = min(5.0, pnl_severity)  # Cap at 5.0 (for -$500+ losses)
+            
+            # Analyze recent trades if available
+            avg_loss = None
+            avg_win = None
+            if recent_trades_data and len(recent_trades_data) >= 5:
+                losing_trades = [t for t in recent_trades_data if t.get("pnl", 0) < 0]
+                winning_trades = [t for t in recent_trades_data if t.get("pnl", 0) > 0]
+                
+                if losing_trades:
+                    avg_loss = abs(sum(t.get("pnl", 0) for t in losing_trades) / len(losing_trades))
+                if winning_trades:
+                    avg_win = sum(t.get("pnl", 0) for t in winning_trades) / len(winning_trades)
+            
+            # Determine adjustment aggressiveness
+            # Base adjustment rate
+            base_confidence_adj = 0.005
+            base_quality_adj = 0.01
+            
+            # Increase aggressiveness based on:
+            # 1. PnL severity (how negative)
+            # 2. Win rate (lower = more aggressive)
+            # 3. Average loss size (larger = more aggressive)
+            
+            confidence_multiplier = 1.0 + (pnl_severity * 0.5)  # Up to 3.5x for severe losses
+            quality_multiplier = 1.0 + (pnl_severity * 0.5)  # Up to 3.5x for severe losses
+            
+            # If win rate is low, be more aggressive
+            if recent_win_rate < 0.40:
+                confidence_multiplier *= 1.5
+                quality_multiplier *= 1.5
+            
+            # If average loss is large, be more aggressive
+            if avg_loss and avg_loss > 100:  # Average loss > $100
+                loss_severity = min(2.0, avg_loss / 100.0)  # Up to 2x for $200+ avg loss
+                confidence_multiplier *= (1.0 + loss_severity * 0.3)
+                quality_multiplier *= (1.0 + loss_severity * 0.3)
+            
+            # Calculate adjustments
+            old_confidence = self.current_min_action_confidence
+            old_quality = self.current_min_quality_score
+            
+            confidence_adjustment = base_confidence_adj * confidence_multiplier
+            quality_adjustment = base_quality_adj * quality_multiplier
+            
+            # Apply adjustments (with caps)
+            self.current_min_action_confidence = min(0.30, self.current_min_action_confidence + confidence_adjustment)
+            self.current_min_quality_score = min(0.70, self.current_min_quality_score + quality_adjustment)
+            
+            # Only make adjustment if values actually changed
+            if (self.current_min_action_confidence != old_confidence or 
+                self.current_min_quality_score != old_quality):
+                adjustments["quality_filters"] = {
+                    "min_action_confidence": {
+                        "old": old_confidence,
+                        "new": self.current_min_action_confidence,
+                        "reason": f"Quick adjustment: negative trend (mean_pnl=${recent_mean_pnl:.2f}, win_rate={recent_win_rate:.1%}, severity={pnl_severity:.2f})"
+                    },
+                    "min_quality_score": {
+                        "old": old_quality,
+                        "new": self.current_min_quality_score,
+                        "reason": f"Quick adjustment: negative trend (mean_pnl=${recent_mean_pnl:.2f}, win_rate={recent_win_rate:.1%}, severity={pnl_severity:.2f})"
+                    }
+                }
+                
+                # Log adjustment details
+                print(f"\n[ADAPT] Quick Quality Filter Tightening (Losing Streak):")
+                print(f"   Mean PnL: ${recent_mean_pnl:.2f}")
+                print(f"   Win Rate: {recent_win_rate:.1%}")
+                if avg_loss:
+                    print(f"   Avg Loss: ${avg_loss:.2f}")
+                if avg_win:
+                    print(f"   Avg Win: ${avg_win:.2f}")
+                print(f"   Severity: {pnl_severity:.2f}")
+                print(f"   Confidence: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (+{confidence_adjustment:.3f})")
+                print(f"   Quality: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (+{quality_adjustment:.3f})")
+                
+                # Update reward config to apply changes
+                self._update_reward_config()
+        
+        return adjustments if adjustments else None
+    
     def should_evaluate(self, timestep: int) -> bool:
         """Check if we should run an evaluation"""
+        # CRITICAL FIX: If timestep is stuck at 0, use episode-based evaluation instead
+        # This handles cases where timestep counter isn't working
+        if timestep == 0:
+            # Use episode-based evaluation: every 10 episodes (approximately equivalent to 5k timesteps)
+            episode_frequency = 10
+            return (self.consecutive_no_trade_episodes % episode_frequency == 0 and 
+                    self.consecutive_no_trade_episodes > 0) or \
+                   (hasattr(self, '_last_eval_episode') and 
+                    (self.consecutive_no_trade_episodes - getattr(self, '_last_eval_episode', 0)) >= episode_frequency)
         return (timestep - self.last_eval_timestep) >= self.adaptive_config.eval_frequency
     
     def check_trading_activity(
@@ -167,15 +358,35 @@ class AdaptiveTrainer:
         
         Returns adjustments dict if adjustments are needed, None otherwise.
         """
-        # Only check periodically to avoid overhead
-        if (timestep - self.last_trade_check_timestep) < self.trade_check_frequency:
-            return None
+        # CRITICAL FIX: Bypass timestep checks for persistent no-trade conditions
+        # If we have many consecutive no-trade episodes, we need to adjust immediately
+        persistent_no_trade_condition = self.consecutive_no_trade_episodes >= 3
+        
+        # CRITICAL FIX: Use episode-based checks when timesteps are very low (< 1000)
+        # This handles cases where timesteps are incrementing but still too low to meet thresholds
+        timestep_stuck = timestep == 0
+        timestep_too_low = timestep < 1000  # Use episode-based logic when timesteps are very low
+        
+        # Only check periodically to avoid overhead (unless persistent no-trade condition or timestep issues)
+        if not persistent_no_trade_condition and not timestep_stuck and not timestep_too_low:
+            if (timestep - self.last_trade_check_timestep) < self.trade_check_frequency:
+                return None
         
         self.last_trade_check_timestep = timestep
         
-        # Check if we've had enough time since last adjustment
-        if (timestep - self.last_adjustment_timestep) < self.min_adjustment_interval:
-            return None
+        # Check if we've had enough time since last adjustment (unless persistent no-trade condition or timestep issues)
+        if not persistent_no_trade_condition and not timestep_stuck and not timestep_too_low:
+            if (timestep - self.last_adjustment_timestep) < self.min_adjustment_interval:
+                return None
+        
+        # CRITICAL FIX: If timestep is stuck or too low, use episode-based interval instead
+        # When timesteps are < 1000, allow adjustments every episode (no timestep-based throttling)
+        # This is safe because episodes are the only reliable metric we have when timesteps are low
+        if timestep_stuck or timestep_too_low:
+            # Only prevent if we just made an adjustment in this same episode
+            if hasattr(self, '_last_adjustment_episode') and episode == self._last_adjustment_episode:
+                return None
+            # Otherwise, allow adjustment (episode-based throttling handled by consecutive_no_trade_episodes logic)
         
         adjustments = {}
         # Estimate episode progress (use a reasonable default if we don't know max_steps)
@@ -189,21 +400,63 @@ class AdaptiveTrainer:
         no_trades_detected = current_episode_trades == 0
         
         # Early detection: if episode is progressing but no trades
-        early_no_trades = no_trades_detected and episode_progress > 0.1  # 10% of episode
+        # CRITICAL FIX: Lower threshold for very short episodes (1 step = 0.0001 progress)
+        # If episode is very short (< 100 steps), check immediately
+        early_no_trades = no_trades_detected and (episode_progress > 0.1 or current_episode_length < 100)
         
         # Persistent no trades: multiple episodes with no trades
+        # CRITICAL FIX: Lower threshold to trigger immediately when we have any consecutive no-trade episodes
         persistent_no_trades = self.consecutive_no_trade_episodes >= 1
         
         if early_no_trades or persistent_no_trades:
             # Only increment counter when we first detect no trades in an episode
             # (counter is incremented when episode completes, not during episode)
-            print(f"\n[ADAPTIVE] [WARN] NO TRADES DETECTED")
+            print(warn(f"\n[ADAPTIVE] [WARN] NO TRADES DETECTED"))
             print(f"   Episode: {episode}, Progress: {episode_progress*100:.0f}%, Trades: {current_episode_trades}")
             print(f"   Consecutive no-trade episodes: {self.consecutive_no_trade_episodes}")
             print(f"   Early detection: {early_no_trades}, Persistent: {persistent_no_trades}")
             
             # Intelligent adjustment based on how long we've had no trades
             adjustment_severity = min(self.consecutive_no_trade_episodes, 5)  # Cap at 5x
+            
+            # CRITICAL FIX: RELAX quality filters when no trades detected (don't tighten them!)
+            # This prevents a feedback loop where no trades -> tighten filters -> even fewer trades
+            old_confidence = self.current_min_action_confidence
+            old_quality = self.current_min_quality_score
+            
+            # Relax filters more aggressively based on how long we've had no trades
+            confidence_relaxation = 0.01 * adjustment_severity  # 1% per episode, up to 5%
+            quality_relaxation = 0.02 * adjustment_severity  # 2% per episode, up to 10%
+            
+            # Apply relaxation (with floors to prevent going too low)
+            min_confidence_floor = 0.05  # Don't go below 5%
+            min_quality_floor = 0.1  # Don't go below 10%
+            
+            self.current_min_action_confidence = max(
+                min_confidence_floor,
+                self.current_min_action_confidence - confidence_relaxation
+            )
+            self.current_min_quality_score = max(
+                min_quality_floor,
+                self.current_min_quality_score - quality_relaxation
+            )
+            
+            if (self.current_min_action_confidence != old_confidence or 
+                self.current_min_quality_score != old_quality):
+                adjustments["quality_filters"] = {
+                    "min_action_confidence": {
+                        "old": old_confidence,
+                        "new": self.current_min_action_confidence,
+                        "reason": f"RELAXED: No trades for {self.consecutive_no_trade_episodes} episodes - encouraging trading"
+                    },
+                    "min_quality_score": {
+                        "old": old_quality,
+                        "new": self.current_min_quality_score,
+                        "reason": f"RELAXED: No trades for {self.consecutive_no_trade_episodes} episodes - encouraging trading"
+                    }
+                }
+                self._update_reward_config()
+                print(f"   [ADAPT] RELAXED quality filters: confidence {old_confidence:.3f} -> {self.current_min_action_confidence:.3f}, quality {old_quality:.3f} -> {self.current_min_quality_score:.3f}")
             
             # Increase exploration more aggressively
             old_entropy = self.current_entropy_coef
@@ -267,8 +520,10 @@ class AdaptiveTrainer:
         # Save adjustments if any were made
         if adjustments:
             self.last_adjustment_timestep = timestep
-            self._save_adjustment(timestep=timestep, adjustments=adjustments)
-            print(f"   [OK] Adjustments saved to log")
+            # CRITICAL FIX: Always track episode for adjustments (needed when timestep is stuck)
+            self._last_adjustment_episode = episode
+            self._save_adjustment(timestep=timestep, episode=episode, adjustments=adjustments)
+            print(f"   [OK] Adjustments saved to log (timestep={timestep}, episode={episode})")
         
         return adjustments if adjustments else None
     
@@ -278,7 +533,8 @@ class AdaptiveTrainer:
         timestep: int,
         episode: int,
         mean_reward: float,
-        agent  # PPOAgent instance
+        agent,  # PPOAgent instance
+        policy_loss: Optional[float] = None  # NEW: Policy loss for convergence detection
     ) -> Dict:
         """
         Evaluate model performance and adapt parameters if needed.
@@ -298,7 +554,7 @@ class AdaptiveTrainer:
                 deterministic=False  # Use stochastic for evaluation
             )
         except Exception as e:
-            print(f"[ERROR] Evaluation failed: {e}")
+            print(error(f"[ERROR] Evaluation failed: {e}"))
             return {"error": str(e)}
         
         # Create snapshot
@@ -339,7 +595,7 @@ class AdaptiveTrainer:
                     }
         
         # Analyze performance and make adjustments
-        adjustments = self._analyze_and_adjust(snapshot, agent)
+        adjustments = self._analyze_and_adjust(snapshot, agent, metrics=metrics, policy_loss=policy_loss)
         
         # Print results
         print(f"\n[PERF] Performance Metrics:")
@@ -440,17 +696,23 @@ class AdaptiveTrainer:
     def _analyze_and_adjust(
         self,
         snapshot: PerformanceSnapshot,
-        agent
+        agent,
+        metrics: Optional[Any] = None,  # ModelMetrics from evaluation
+        policy_loss: Optional[float] = None  # NEW: Policy loss for convergence detection
     ) -> Dict:
         """Analyze performance and make adaptive adjustments"""
         adjustments = {}
+        
+        # Initialize consecutive negative episodes counter if not exists
+        if not hasattr(self, 'consecutive_negative_episodes'):
+            self.consecutive_negative_episodes = 0
         
         # Check for no trades
         trades_per_episode = snapshot.total_trades / max(1, self.adaptive_config.eval_episodes)
         
         if trades_per_episode < self.adaptive_config.min_trades_per_episode:
             self.consecutive_no_trade_evals += 1
-            print(f"[WARN] LOW TRADE ACTIVITY: {trades_per_episode:.2f} trades/episode")
+            print(warn(f"[WARN] LOW TRADE ACTIVITY: {trades_per_episode:.2f} trades/episode"))
             
             # Increase exploration
             old_entropy = self.current_entropy_coef
@@ -485,6 +747,76 @@ class AdaptiveTrainer:
         else:
             self.consecutive_no_trade_evals = 0
         
+        # NEW: Policy Convergence Detection
+        # Check if policy has converged (low policy loss) and recent performance is declining
+        if policy_loss is not None and policy_loss < 0.001:
+            # Policy is converged - check if recent performance is declining
+            recent_snapshots = self.performance_history[-10:] if len(self.performance_history) >= 10 else self.performance_history
+            if len(recent_snapshots) >= 5:
+                recent_returns = [s.total_return for s in recent_snapshots]
+                recent_mean_return = sum(recent_returns) / len(recent_returns)
+                
+                # If policy converged AND recent trend is negative, increase exploration
+                if recent_mean_return < 0:
+                    old_entropy = self.current_entropy_coef
+                    # Increase entropy more aggressively (3x normal rate) when policy converged
+                    self.current_entropy_coef = min(
+                        self.adaptive_config.max_entropy_coef,
+                        self.current_entropy_coef + (self.adaptive_config.entropy_adjustment_rate * 3)
+                    )
+                    if self.current_entropy_coef != old_entropy:
+                        agent.entropy_coef = self.current_entropy_coef
+                        adjustments["entropy_coef"] = {
+                            "old": old_entropy,
+                            "new": self.current_entropy_coef,
+                            "reason": f"Policy converged (loss={policy_loss:.4f}) + negative trend (mean={recent_mean_return:.2%}) - increasing exploration"
+                        }
+                        print(f"[ADAPT] Policy converged + negative trend: entropy {old_entropy:.4f} -> {self.current_entropy_coef:.4f} (policy_loss={policy_loss:.4f}, recent_mean={recent_mean_return:.2%})")
+        
+        # NEW: Recent Episode Trend Tracking
+        # Check recent episode trend (last 10-20 episodes)
+        recent_snapshots = self.performance_history[-10:] if len(self.performance_history) >= 10 else self.performance_history
+        if len(recent_snapshots) >= 10:
+            recent_returns = [s.total_return for s in recent_snapshots]
+            recent_mean_return = sum(recent_returns) / len(recent_returns)
+            
+            # If recent trend is negative for 10+ episodes
+            if recent_mean_return < 0:
+                self.consecutive_negative_episodes = getattr(self, 'consecutive_negative_episodes', 0) + 1
+                
+                if self.consecutive_negative_episodes >= 10:
+                    # Negative trend for 10+ episodes - take action
+                    print(warn(f"\n[WARN] Negative trend detected: {self.consecutive_negative_episodes} consecutive negative episodes"))
+                    print(f"   Recent mean return: {recent_mean_return:.2%}")
+                    print(f"   Recent mean PnL: ${recent_mean_return * 100000:.2f} (estimated)")
+                    
+                    # Tighten quality filters
+                    old_confidence = self.current_min_action_confidence
+                    old_quality = self.current_min_quality_score
+                    self.current_min_action_confidence = min(0.25, self.current_min_action_confidence + 0.02)
+                    self.current_min_quality_score = min(0.60, self.current_min_quality_score + 0.05)
+                    
+                    if "quality_filters" not in adjustments:
+                        adjustments["quality_filters"] = {}
+                    
+                    adjustments["quality_filters"]["min_action_confidence"] = {
+                        "old": old_confidence,
+                        "new": self.current_min_action_confidence,
+                        "reason": f"Negative trend for {self.consecutive_negative_episodes} episodes (mean={recent_mean_return:.2%})"
+                    }
+                    adjustments["quality_filters"]["min_quality_score"] = {
+                        "old": old_quality,
+                        "new": self.current_min_quality_score,
+                        "reason": f"Negative trend for {self.consecutive_negative_episodes} episodes (mean={recent_mean_return:.2%})"
+                    }
+                    print(f"[ADAPT] Tightening filters due to negative trend: confidence {old_confidence:.3f}->{self.current_min_action_confidence:.3f}, "
+                          f"quality {old_quality:.3f}->{self.current_min_quality_score:.3f}")
+            else:
+                # Reset counter if trend is positive
+                if self.consecutive_negative_episodes > 0:
+                    print(f"[OK] Negative trend reversed! Resetting counter (was {self.consecutive_negative_episodes}, recent_mean={recent_mean_return:.2%})")
+                self.consecutive_negative_episodes = 0
+        
         # Check win rate profitability (NEW)
         profitability_check = self.check_win_rate_profitability(
             total_trades=snapshot.total_trades,
@@ -494,18 +826,95 @@ class AdaptiveTrainer:
             commission_rate=0.0003  # 0.03%
         )
         
+        # IMPROVED: Check profitability first, then win rate
+        # Calculate profit factor and R:R ratio
+        avg_win = profitability_check.get("avg_win", 0)
+        avg_loss = profitability_check.get("avg_loss", 0)
+        profit_factor = avg_win / avg_loss if avg_loss > 0 else 0.0
+        current_rr_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
+        
+        # Check if profitable (profit factor > 1.0 or expected value > 0)
+        is_profitable = profitability_check["is_profitable"]
+        win_rate_low = snapshot.win_rate < profitability_check["breakeven_win_rate"]
+        
         # AGGRESSIVE profitability detection and response
-        if not profitability_check["is_profitable"]:
+        # Only tighten aggressively if unprofitable
+        if not is_profitable:
             self.consecutive_low_win_rate += 1
             
             print(f"\n[CRITICAL] UNPROFITABLE DETECTED:")
             print(f"   Current win rate: {profitability_check['current_win_rate']:.1%}")
             print(f"   Breakeven win rate: {profitability_check['breakeven_win_rate']:.1%}")
             print(f"   Expected value: ${profitability_check['expected_value']:.2f}")
+            print(f"   Profit factor: {profit_factor:.2f}")
+            print(f"   R:R ratio: {current_rr_ratio:.2f}:1")
             print(f"   Consecutive unprofitable evaluations: {self.consecutive_low_win_rate}")
             
-            # AGGRESSIVE tightening when unprofitable (5x normal rate)
-            if self.consecutive_low_win_rate >= 2:
+            # CRITICAL FIX: 0% win rate requires EXPLORATION, not tightening
+            # If win rate is 0% or extremely low (but we have trades), model is stuck
+            # Need to INCREASE exploration to break out of local minimum
+            if snapshot.win_rate == 0.0 and snapshot.total_trades >= 10:
+                print(f"\n[CRITICAL] 0% WIN RATE DETECTED! Model is stuck - increasing exploration...")
+                old_confidence = self.current_min_action_confidence
+                old_quality = self.current_min_quality_score
+                old_rr = self.current_min_risk_reward_ratio
+                old_entropy = self.current_entropy_coef
+                old_penalty = self.current_inaction_penalty
+                
+                # INCREASE entropy to encourage exploration (opposite of tightening)
+                self.current_entropy_coef = min(
+                    self.adaptive_config.max_entropy_coef,
+                    self.current_entropy_coef * 1.5  # Increase by 50% to break out of local minimum
+                )
+                agent.entropy_coef = self.current_entropy_coef
+                
+                # INCREASE inaction penalty to encourage more trading activity
+                self.current_inaction_penalty = min(
+                    self.adaptive_config.inaction_penalty_max,
+                    self.current_inaction_penalty * 2.0  # Double it to encourage trading
+                )
+                
+                # SLIGHTLY relax filters (don't tighten more - we need diversity)
+                self.current_min_action_confidence = max(0.15,
+                    self.current_min_action_confidence * 0.95)  # Relax by 5%
+                self.current_min_quality_score = max(0.35,
+                    self.current_min_quality_score * 0.95)  # Relax by 5%
+                
+                # Keep R:R reasonable but don't increase it more
+                # (already high enough, increasing would make problem worse)
+                
+                adjustments["entropy_coef"] = {
+                    "old": old_entropy,
+                    "new": self.current_entropy_coef,
+                    "reason": f"CRITICAL: 0% win rate - increasing exploration to break out of local minimum"
+                }
+                adjustments["inaction_penalty"] = {
+                    "old": old_penalty,
+                    "new": self.current_inaction_penalty,
+                    "reason": f"CRITICAL: 0% win rate - encouraging more trading activity"
+                }
+                adjustments["quality_filters"] = {
+                    "min_action_confidence": {
+                        "old": old_confidence,
+                        "new": self.current_min_action_confidence,
+                        "reason": f"CRITICAL: 0% win rate - slightly relaxing to allow more diverse trades"
+                    },
+                    "min_quality_score": {
+                        "old": old_quality,
+                        "new": self.current_min_quality_score,
+                        "reason": f"CRITICAL: 0% win rate - slightly relaxing to allow more diverse trades"
+                    }
+                }
+                
+                self._update_reward_config()
+                print(f"[ADAPT] CRITICAL 0% WIN RATE RESPONSE:")
+                print(f"   Entropy: {old_entropy:.4f} -> {self.current_entropy_coef:.4f} (+{(self.current_entropy_coef/old_entropy - 1)*100:.0f}%)")
+                print(f"   Inaction Penalty: {old_penalty:.6f} -> {self.current_inaction_penalty:.6f} (+{(self.current_inaction_penalty/old_penalty - 1)*100:.0f}%)")
+                print(f"   Confidence: {old_confidence:.3f} -> {self.current_min_action_confidence:.3f} (relaxed)")
+                print(f"   Quality: {old_quality:.3f} -> {self.current_min_quality_score:.3f} (relaxed)")
+            
+            # AGGRESSIVE tightening when unprofitable (but NOT 0% win rate)
+            elif self.consecutive_low_win_rate >= 2 and snapshot.win_rate > 0.0:
                 old_confidence = self.current_min_action_confidence
                 old_quality = self.current_min_quality_score
                 old_rr = self.current_min_risk_reward_ratio
@@ -517,8 +926,8 @@ class AdaptiveTrainer:
                 self.current_min_quality_score = min(0.60,
                     self.current_min_quality_score + 0.10)
                 self.current_min_risk_reward_ratio = min(3.0,
-                    self.current_min_risk_reward_ratio + 0.5)
-                # Reduce exploration to be more selective
+                    max(1.5, self.current_min_risk_reward_ratio + 0.5))  # Ensure minimum 1.5
+                # Reduce exploration to be more selective (ONLY if not 0% win rate)
                 self.current_entropy_coef = max(0.01, self.current_entropy_coef * 0.9)
                 agent.entropy_coef = self.current_entropy_coef
                 
@@ -564,10 +973,38 @@ class AdaptiveTrainer:
                 print(f"\n[ACTION REQUIRED] Review performance and adjust parameters before resuming")
                 print(f"Checkpoint saved. Resume with: --checkpoint models/checkpoint_{snapshot.timestep}.pt")
                 print(f"{'='*70}\n")
+        elif win_rate_low and current_rr_ratio < 1.5:
+            # Profitable but win rate low AND R:R not compensating - tighten slightly
+            print(warn(f"\n[WARN] Profitable but low win rate ({snapshot.win_rate:.1%}) with poor R:R ({current_rr_ratio:.2f}:1)"))
+            print(f"   Profit factor: {profit_factor:.2f} (profitable)")
+            print(f"   Tightening filters slightly to improve win rate")
+            
+            old_confidence = self.current_min_action_confidence
+            old_quality = self.current_min_quality_score
+            self.current_min_action_confidence = min(0.25, self.current_min_action_confidence + 0.01)
+            self.current_min_quality_score = min(0.60, self.current_min_quality_score + 0.02)
+            
+            if "quality_filters" not in adjustments:
+                adjustments["quality_filters"] = {}
+            
+            adjustments["quality_filters"]["min_action_confidence"] = {
+                "old": old_confidence,
+                "new": self.current_min_action_confidence,
+                "reason": f"Profitable but low win rate ({snapshot.win_rate:.1%}) with poor R:R ({current_rr_ratio:.2f}:1)"
+            }
+            adjustments["quality_filters"]["min_quality_score"] = {
+                "old": old_quality,
+                "new": self.current_min_quality_score,
+                "reason": f"Profitable but low win rate ({snapshot.win_rate:.1%}) with poor R:R ({current_rr_ratio:.2f}:1)"
+            }
+            print(f"[ADAPT] Slight tightening: confidence {old_confidence:.3f}->{self.current_min_action_confidence:.3f}, "
+                  f"quality {old_quality:.3f}->{self.current_min_quality_score:.3f}")
         else:
             # Reset counter when profitable
             if self.consecutive_low_win_rate > 0:
                 print(f"[OK] Profitability restored! Resetting consecutive low win rate counter (was {self.consecutive_low_win_rate})")
+                if current_rr_ratio >= 1.5:
+                    print(f"   R:R ratio ({current_rr_ratio:.2f}:1) is compensating for low win rate - maintaining filters")
             self.consecutive_low_win_rate = 0
         
         # REWARD good performance (win rate > 50%)
@@ -608,11 +1045,12 @@ class AdaptiveTrainer:
             current_rr_ratio = profitability_check["avg_win"] / profitability_check["avg_loss"]
             
             # If losing money (R:R < 1.5), tighten threshold
+            # FIX: Ensure minimum is 1.5 (user requirement) - don't go below 1.5
             if current_rr_ratio < 1.5:
                 old_rr_threshold = self.current_min_risk_reward_ratio
                 self.current_min_risk_reward_ratio = min(
                     self.adaptive_config.max_rr_threshold,
-                    self.current_min_risk_reward_ratio + self.adaptive_config.rr_adjustment_rate
+                    max(1.5, self.current_min_risk_reward_ratio + self.adaptive_config.rr_adjustment_rate)  # Ensure min 1.5
                 )
                 if self.current_min_risk_reward_ratio != old_rr_threshold:
                     adjustments["min_risk_reward_ratio"] = {
@@ -623,11 +1061,14 @@ class AdaptiveTrainer:
                     print(f"[ADAPT] Tightened R:R threshold: {old_rr_threshold:.2f} -> {self.current_min_risk_reward_ratio:.2f} (current R:R: {current_rr_ratio:.2f}:1)")
             
             # If very profitable (R:R >= 2.0), can relax slightly
+            # FIX: Ensure minimum is 1.5 (user requirement)
             elif current_rr_ratio >= 2.0:
                 old_rr_threshold = self.current_min_risk_reward_ratio
+                new_rr = self.current_min_risk_reward_ratio - (self.adaptive_config.rr_adjustment_rate * 0.5)  # Relax slower
                 self.current_min_risk_reward_ratio = max(
+                    1.5,  # Hard minimum of 1.5 (user requirement)
                     self.adaptive_config.min_rr_threshold,
-                    self.current_min_risk_reward_ratio - (self.adaptive_config.rr_adjustment_rate * 0.5)  # Relax slower
+                    new_rr
                 )
                 if self.current_min_risk_reward_ratio != old_rr_threshold:
                     adjustments["min_risk_reward_ratio"] = {
@@ -725,6 +1166,130 @@ class AdaptiveTrainer:
         else:
             self.consecutive_low_performance = 0
         
+        # NEW: Adaptive Stop Loss Adjustment (volatility and performance based)
+        if self.adaptive_config.stop_loss_adjustment_enabled and metrics:
+            try:
+                # Get volatility data if available from evaluator's test data
+                volatility_multiplier = 1.0
+                volatility_percentile = 50.0  # Default to median
+                
+                try:
+                    from src.volatility_predictor import VolatilityPredictor
+                    
+                    # Try to get price data from evaluator's test data
+                    if hasattr(self.evaluator, 'test_data') and self.evaluator.test_data:
+                        instrument = self.config["environment"]["instrument"]
+                        timeframes = self.config["environment"]["timeframes"]
+                        primary_tf = min(timeframes)
+                        
+                        if primary_tf in self.evaluator.test_data and len(self.evaluator.test_data[primary_tf]) > 20:
+                            price_data = self.evaluator.test_data[primary_tf]
+                            volatility_predictor = VolatilityPredictor(lookback_periods=252)
+                            volatility_forecast = volatility_predictor.predict_volatility(price_data, method="adaptive")
+                            volatility_multiplier = volatility_predictor.get_adaptive_stop_loss_multiplier(
+                                self.current_stop_loss_pct, volatility_forecast
+                            )
+                            volatility_percentile = volatility_forecast.volatility_percentile
+                except Exception as e:
+                    # If volatility prediction fails, use default
+                    print(warn(f"[WARN] Volatility prediction failed for stop loss adjustment: {e}"))
+                
+                # Performance-based adjustments
+                # If avg_loss is close to stop_loss_pct * capital, we're hitting stops too frequently
+                initial_capital = self.config.get("risk_management", {}).get("initial_capital", 100000.0)
+                estimated_stop_loss_amount = initial_capital * self.current_stop_loss_pct
+                
+                # Check if we have trade statistics
+                avg_loss = getattr(metrics, 'average_loss', 0.0)
+                avg_win = getattr(metrics, 'average_win', 0.0)
+                total_trades = snapshot.total_trades
+                
+                # Calculate performance-based adjustment
+                performance_adjustment = 0.0
+                adjustment_reason = ""
+                
+                # FIX: Add drawdown-based stop loss adjustment
+                # If drawdown is high, tighten stop loss to limit further losses
+                max_dd = 0.0
+                if metrics and hasattr(metrics, 'max_drawdown'):
+                    max_dd = getattr(metrics, 'max_drawdown', 0.0)
+                elif hasattr(snapshot, 'max_drawdown'):
+                    max_dd = getattr(snapshot, 'max_drawdown', 0.0)
+                
+                if max_dd > 0.10:  # Drawdown > 10%
+                    # Aggressively tighten stop loss
+                    performance_adjustment -= 0.005  # Reduce by 0.5%
+                    adjustment_reason = f"High drawdown ({max_dd*100:.1f}%) - tightening stop loss to limit losses"
+                    print(warn(f"[ADAPT] High drawdown detected ({max_dd*100:.1f}%) - tightening stop loss"))
+                elif max_dd > 0.08:  # Drawdown > 8%
+                    # Moderately tighten stop loss
+                    performance_adjustment -= 0.003  # Reduce by 0.3%
+                    adjustment_reason = f"Elevated drawdown ({max_dd*100:.1f}%) - tightening stop loss"
+                    print(warn(f"[ADAPT] Elevated drawdown ({max_dd*100:.1f}%) - tightening stop loss"))
+                elif max_dd > 0.05:  # Drawdown > 5%
+                    # Slightly tighten stop loss
+                    performance_adjustment -= 0.001  # Reduce by 0.1%
+                    adjustment_reason = f"Moderate drawdown ({max_dd*100:.1f}%) - slight stop loss tightening"
+                
+                # If avg_loss is consistently at stop loss threshold, stop may be too tight
+                if avg_loss > 0 and total_trades >= 10:
+                    loss_ratio = avg_loss / estimated_stop_loss_amount if estimated_stop_loss_amount > 0 else 1.0
+                    
+                    # If losses are consistently at stop loss level (90-110%), we may be hitting stop too often
+                    if 0.90 <= loss_ratio <= 1.10:
+                        # Likely hitting stop loss frequently - may need wider stops in high vol, or tighter if low vol
+                        if volatility_percentile > 70:
+                            # High volatility - widen stops
+                            performance_adjustment = 0.003  # Increase by 0.3%
+                            adjustment_reason = f"High volatility ({volatility_percentile:.0f}th percentile) and frequent stop hits - widening stops"
+                        elif volatility_percentile < 30:
+                            # Low volatility - stops may be too tight, but don't widen much
+                            performance_adjustment = 0.001  # Small increase
+                            adjustment_reason = f"Low volatility ({volatility_percentile:.0f}th percentile) but frequent stop hits - slight widening"
+                    # If avg_loss is significantly less than stop loss, stops may be too wide
+                    elif loss_ratio < 0.7 and volatility_percentile < 40:
+                        # Low volatility and losses are small - can tighten stops
+                        performance_adjustment = -0.002  # Decrease by 0.2%
+                        adjustment_reason = f"Low volatility ({volatility_percentile:.0f}th percentile) and small losses - tightening stops"
+                
+                # Combine volatility and performance adjustments
+                # Start with current stop loss, apply volatility multiplier, then performance adjustment
+                vol_based_stop = self.current_stop_loss_pct * volatility_multiplier
+                
+                # Apply performance adjustment
+                new_stop_loss = vol_based_stop + performance_adjustment
+                
+                # Enforce hard minimum and maximum
+                new_stop_loss = max(
+                    self.adaptive_config.min_stop_loss_pct,
+                    min(self.adaptive_config.max_stop_loss_pct, new_stop_loss)
+                )
+                
+                # Only adjust if change is significant (at least 0.001 = 0.1%)
+                if abs(new_stop_loss - self.current_stop_loss_pct) >= 0.001:
+                    old_stop_loss = self.current_stop_loss_pct
+                    self.current_stop_loss_pct = new_stop_loss
+                    
+                    adjustments["stop_loss_pct"] = {
+                        "old": old_stop_loss,
+                        "new": self.current_stop_loss_pct,
+                        "volatility_multiplier": volatility_multiplier,
+                        "volatility_percentile": volatility_percentile,
+                        "performance_adjustment": performance_adjustment,
+                        "reason": adjustment_reason or f"Volatility-based adjustment (volatility: {volatility_percentile:.0f}th percentile, multiplier: {volatility_multiplier:.2f}x)"
+                    }
+                    print(f"[ADAPT] Adjusted stop loss: {old_stop_loss:.3f} ({old_stop_loss*100:.1f}%) -> {self.current_stop_loss_pct:.3f} ({self.current_stop_loss_pct*100:.1f}%)")
+                    print(f"        Volatility: {volatility_percentile:.0f}th percentile, Multiplier: {volatility_multiplier:.2f}x")
+                    if adjustment_reason:
+                        print(f"        Reason: {adjustment_reason}")
+                    
+                    # Update reward config with new stop loss
+                    self._update_reward_config()
+            except Exception as e:
+                print(warn(f"[WARN] Stop loss adjustment failed: {e}"))
+                import traceback
+                traceback.print_exc()
+        
         # Save adjustment history
         if adjustments:
             self._save_adjustment(timestep=snapshot.timestep, adjustments=adjustments)
@@ -745,7 +1310,11 @@ class AdaptiveTrainer:
                 "quality_filters": {
                     "min_action_confidence": self.current_min_action_confidence,
                     "min_quality_score": self.current_min_quality_score
-                }
+                },
+                # NEW: Adaptive stop loss
+                "stop_loss_pct": self.current_stop_loss_pct,
+                # NEW: Enforcement floor (absolute minimum R:R to allow trades)
+                "min_rr_floor": self.adaptive_config.min_rr_floor
             }, f, indent=2)
     
     def _is_better(self, new: PerformanceSnapshot, old: PerformanceSnapshot) -> bool:
@@ -799,13 +1368,16 @@ class AdaptiveTrainer:
         with open(self.snapshot_file, 'a') as f:
             f.write(json.dumps(asdict(snapshot)) + '\n')
     
-    def _save_adjustment(self, timestep: int, adjustments: Dict):
+    def _save_adjustment(self, timestep: int, adjustments: Dict, episode: Optional[int] = None):
         """Save configuration adjustments"""
         record = {
             "timestep": timestep,
             "timestamp": datetime.now().isoformat(),
             "adjustments": adjustments
         }
+        if episode is not None:
+            record["episode"] = episode
+        # Always include episode if available (critical for filtering when timestep is stuck at 0)
         with open(self.config_history_file, 'a') as f:
             f.write(json.dumps(record) + '\n')
     

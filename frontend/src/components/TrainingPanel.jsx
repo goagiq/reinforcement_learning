@@ -128,13 +128,25 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   // Debug: Log whenever trainingMetrics state changes (to verify React detects it)
   useEffect(() => {
     if (trainingMetrics) {
+      // DEBUG: Log timestep diagnostic information to browser console (F12)
+      if (trainingMetrics.debug) {
+        console.log('[TIMESTEP DEBUG]', {
+          timestep: trainingMetrics.timestep,
+          episode: trainingMetrics.episode,
+          debug: trainingMetrics.debug,
+          warning: trainingMetrics.debug.warning
+        })
+        if (trainingMetrics.debug.warning) {
+          console.warn('[TIMESTEP ISSUE]', trainingMetrics.debug.warning)
+        }
+      }
       console.log(`[TrainingPanel] trainingMetrics state changed - Timestep: ${trainingMetrics.timestep}, Reward: ${trainingMetrics.latest_reward?.toFixed(2)}, Episode: ${trainingMetrics.episode}`)
     }
   }, [trainingMetrics])
   const [device, setDevice] = useState('cpu')
   const [cudaAvailable, setCudaAvailable] = useState(false)
   const [gpuInfo, setGpuInfo] = useState(null)
-  const [totalTimesteps, setTotalTimesteps] = useState(1000000)
+  const [totalTimesteps, setTotalTimesteps] = useState(20000000)
   const [reasoningModel, setReasoningModel] = useState('')
   const [configPath, setConfigPathState] = useState('')
   const [availableConfigs, setAvailableConfigs] = useState([])
@@ -142,6 +154,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [bestModel, setBestModel] = useState(null)
   const [selectedCheckpoint, setSelectedCheckpoint] = useState('latest') // 'latest', 'none', or checkpoint path
   const [latestCheckpoint, setLatestCheckpoint] = useState(null)
+  const [flushOldData, setFlushOldData] = useState(false) // Clear old training data for fresh start
   const [messages, setMessages] = useState([])
   const [ws, setWs] = useState(null)
   const [trainingMode, setTrainingMode] = useState('quiet') // 'quiet', 'performance', or 'turbo'
@@ -710,7 +723,10 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           // Only update if metrics actually contain data (not empty object during initialization)
           // Debug: Log metrics received
           if (pollCount % 10 === 0 || pollCount <= 3) {
-            console.log(`[TrainingPanel] Status check #${pollCount}: status=${status}, metrics keys=${response.data.metrics ? Object.keys(response.data.metrics).length : 0}`, response.data.metrics)
+            const metrics = response.data.metrics || {}
+            console.log(`[TrainingPanel] Status check #${pollCount}: status=${status}, metrics keys=${Object.keys(metrics).length}`)
+            console.log(`[TrainingPanel] Trade counts - total=${metrics.total_trades || 0}, winning=${metrics.total_winning_trades || 0}, losing=${metrics.total_losing_trades || 0}, current_episode=${metrics.current_episode_trades || 0}`)
+            console.log(`[TrainingPanel] Full metrics:`, response.data.metrics)
           }
           
           if (response.data.metrics && Object.keys(response.data.metrics).length > 0) {
@@ -718,12 +734,24 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
             const newMetrics = JSON.parse(JSON.stringify(response.data.metrics))
             
             // Check if values actually changed to avoid unnecessary re-renders
+            // IMPORTANT: Check ALL current episode metrics to ensure real-time updates
             const prevMetrics = prevMetricsRef.current
             const valuesChanged = !prevMetrics || 
                 prevMetrics.timestep !== newMetrics.timestep ||
                 Math.abs((prevMetrics.latest_reward || 0) - (newMetrics.latest_reward || 0)) > 0.001 ||
                 prevMetrics.episode !== newMetrics.episode ||
-                prevMetrics.current_episode_length !== newMetrics.current_episode_length
+                prevMetrics.current_episode_length !== newMetrics.current_episode_length ||
+                // Check current episode trading metrics for changes
+                prevMetrics.current_episode_trades !== newMetrics.current_episode_trades ||
+                Math.abs((prevMetrics.current_episode_pnl || 0) - (newMetrics.current_episode_pnl || 0)) > 0.01 ||
+                Math.abs((prevMetrics.current_episode_equity || 0) - (newMetrics.current_episode_equity || 0)) > 0.01 ||
+                Math.abs((prevMetrics.current_episode_win_rate || 0) - (newMetrics.current_episode_win_rate || 0)) > 0.1 ||
+                Math.abs((prevMetrics.current_episode_max_drawdown || 0) - (newMetrics.current_episode_max_drawdown || 0)) > 0.1 ||
+                // Check aggregate trading metrics for changes (total trades, winning, losing)
+                (prevMetrics.total_trades || 0) !== (newMetrics.total_trades || 0) ||
+                (prevMetrics.total_winning_trades || 0) !== (newMetrics.total_winning_trades || 0) ||
+                (prevMetrics.total_losing_trades || 0) !== (newMetrics.total_losing_trades || 0) ||
+                Math.abs((prevMetrics.overall_win_rate || 0) - (newMetrics.overall_win_rate || 0)) > 0.1
             
             // Only update state if values changed OR force update every 10 polls to show activity
             if (valuesChanged || pollCount % 10 === 0) {
@@ -925,6 +953,12 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
         console.log('📂 Sending checkpoint_path (specific):', selectedCheckpoint)
       } else {
         console.log('📂 No checkpoint selected - starting fresh training')
+      }
+      
+      // Include flush_old_data if starting fresh (no checkpoint)
+      if (selectedCheckpoint === 'none') {
+        requestData.flush_old_data = flushOldData
+        console.log('🗑️ Flush old data:', flushOldData)
       }
       
       // Include transfer_strategy if architecture mismatch detected or explicitly set
@@ -1354,6 +1388,32 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 'Select a checkpoint to resume training from that point, or choose "Start Fresh Training" to begin from scratch'
               )}
             </p>
+            
+            {/* Flush Old Data Option (only shown for fresh training) */}
+            {selectedCheckpoint === 'none' && (
+              <div className="mt-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={flushOldData}
+                    onChange={(e) => setFlushOldData(e.target.checked)}
+                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                  />
+                  <span className="font-semibold text-yellow-800">
+                    🗑️ Clear old training data (database, caches)
+                  </span>
+                </label>
+                <p className="text-sm text-yellow-700 mt-2 ml-6">
+                  When enabled, this will:
+                  <ul className="list-disc list-inside mt-1 space-y-1">
+                    <li>Archive and clear the trading journal database</li>
+                    <li>Clear cache files (known_files_cache.json, etc.)</li>
+                    <li>Ensure metrics show only new training data</li>
+                  </ul>
+                  <span className="font-semibold">Note: Old data will be backed up to logs/trading_journal_archive/ before clearing.</span>
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Transfer Learning Strategy (shown when checkpoint selected) */}
@@ -1570,6 +1630,20 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                       // Force state updates - use function form to ensure we get latest state
                       setTrainingMetrics((prev) => {
                         console.log('[TrainingPanel] Refresh - setTrainingMetrics called, prev:', prev?.timestep, 'new:', newMetrics.timestep)
+                        // DEBUG: Log timestep diagnostic if available
+                        if (newMetrics.debug) {
+                          console.log('[TIMESTEP DEBUG]', {
+                            timestep: newMetrics.timestep,
+                            episode: newMetrics.episode,
+                            episode_lengths_count: newMetrics.debug.episode_lengths_count,
+                            last_episode_length: newMetrics.debug.last_episode_length,
+                            current_episode_length: newMetrics.debug.current_episode_length,
+                            warning: newMetrics.debug.warning
+                          })
+                          if (newMetrics.debug.warning) {
+                            console.warn('[TIMESTEP ISSUE]', newMetrics.debug.warning)
+                          }
+                        }
                         return newMetrics
                       })
                       
@@ -1660,7 +1734,11 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                   key={`timestep-${renderKey}`}
                   className="text-2xl font-bold text-gray-800"
                 >
-                  {(trainingMetrics.timestep / 1000).toFixed(0)}k / {((trainingMetrics.total_timesteps || 0) / 1000).toFixed(0)}k
+                  {trainingMetrics.timestep >= 1000 
+                    ? `${(trainingMetrics.timestep / 1000).toFixed(0)}k` 
+                    : trainingMetrics.timestep.toLocaleString()} / {trainingMetrics.total_timesteps >= 1000 
+                    ? `${(trainingMetrics.total_timesteps / 1000).toFixed(0)}k` 
+                    : trainingMetrics.total_timesteps.toLocaleString()}
                 </div>
               ) : (
                 <div className="text-2xl font-bold text-gray-800">N/A</div>

@@ -8,24 +8,34 @@ model:
   gae_lambda: 0.95
   clip_range: 0.2
   value_loss_coef: 0.5
-  entropy_coef: 0.15  # INCREASED from 0.05 to 0.15 (3x) to prevent action saturation - encourages exploration
+  entropy_coef: 0.025  # Balanced: Encourages exploration without excessive randomness (was 0.15 - too high!)
   max_grad_norm: 0.5
   hidden_dims:
   - 256
   - 256
   - 128
+pretraining:
+  enabled: true  # Enable supervised pre-training before RL
+  lookahead_bars: 20  # Number of bars to look ahead for label generation
+  return_threshold: 0.02  # 2% return threshold for buy/sell signals
+  batch_size: 256  # Batch size for supervised learning
+  epochs: 10  # Number of pre-training epochs
+  learning_rate: 0.001  # Learning rate for pre-training (can be higher than RL)
+  validation_split: 0.2  # 20% of data for validation
+  labeling_strategy: simple_return  # Options: simple_return, sharpe_based, volatility_adjusted
+  save_pretrained_weights: false  # Save pre-trained weights separately (optional, for reference)
 environment:
   instrument: ES
   timeframes:
   - 1
   - 5
   - 15
-  state_features: 900
+  state_features: 903  # Base features (900) + Forecast features (3) = 903 total
   action_space: continuous
   action_range:
   - -1.0
   - 1.0
-  action_threshold: 0.015  # Increased from 0.01 to 0.015 to reduce over-trading (was causing 2.2 trades/episode)
+  action_threshold: 0.01  # TEMPORARILY REDUCED to 0.01 (1%) to debug no trades issue - will restore to 0.02 after debugging
   max_episode_steps: 10000
   lookback_bars: 20
   trading_hours:
@@ -48,71 +58,164 @@ environment:
       end: '16:00'
   reward:
     pnl_weight: 1.0
-    transaction_cost: 0.0003
+    transaction_cost: 0.0001  # Reverted to 0.0001 (0.01%) - lower costs like profitable version
     risk_penalty: 0.05
-    drawdown_penalty: 0.07  # Slightly higher penalty for drawdowns to discourage sequences of losses
+    drawdown_penalty: 0.07
     exploration_bonus_enabled: true
-    exploration_bonus_scale: 5.0e-05  # Increased from 1e-5 to encourage more exploration (prevent saturation)
-    action_diversity_bonus: 0.01  # NEW: Reward diverse actions to prevent saturation (penalize always same action)
-    constant_action_penalty: 0.05  # NEW: Penalize models that always output same action value
-    loss_mitigation: 0.11  # Slightly stronger penalty for losses to push toward profitability
-    overtrading_penalty_enabled: true
-    optimal_trades_per_episode: 1  # Reduced from 50 to 1 to discourage over-trading (current: 2.2 trades/episode is too high)
+    exploration_bonus_scale: 1.0e-05  # Minimal exploration bonus - only encourages trading when very few trades (aligned with repo approach)
+    action_diversity_bonus: 0.0  # Disabled - wasn't in profitable version
+    constant_action_penalty: 0.0  # Disabled - wasn't in profitable version
+    loss_mitigation: 0.0  # Disabled - no loss masking, let agent learn from losses
+    overtrading_penalty_enabled: false  # Disabled - wasn't in profitable version
+    optimal_trades_per_episode: null  # Removed restriction - allow more trades like profitable version
     profit_factor_required: 1.0
-    inaction_penalty: 5.0e-05
-    max_consecutive_losses: 10  # Increased from 5 to 10 for training (investigation showed 3 caused 96% pause rate)
-    resume_confluence_required: 3
-    stop_loss_pct: 0.02
-    min_risk_reward_ratio: 2.5  # Increased from 2.0 to 2.5 - with 36.7% win rate, need 2.5+ R:R for profitability
+    inaction_penalty: 0.0001  # Increased from 5.0e-05 to 0.0001 (2x stronger) - penalizes no trades to encourage trading
+    max_consecutive_losses: 5  # Reduced from 10 to 5 - tighter risk control (matches GitHub repo approach)
+    resume_confluence_required: 3  # For adaptive training pause/resume (not checkpoint resume)
+    stop_loss_pct: 0.025  # Set to 2.5% - reasonable middle ground (1.5% was too tight, 4.0% was too loose)
+    min_risk_reward_ratio: 2.0  # Increased to 2.0:1 to account for commission costs (31% of net win) - need higher R:R to be profitable
+    trailing_stop:
+      enabled: true  # RE-ENABLED - ATR-adaptive trailing stop for profit protection
+      atr_multiplier: 2.0  # Trailing stop distance = ATR * multiplier (adapts to volatility)
+      pct_fallback: 0.02  # Fallback to 2% if ATR unavailable
+      min_distance_pct: 0.005  # Minimum 0.5% distance (safety floor)
+      max_distance_pct: 0.05  # Maximum 5% distance (safety ceiling)
+      activation_pct: 0.01  # Activate trailing stop after 1% favorable move
+    take_profit:
+      enabled: true  # RE-ENABLED - ATR-adaptive soft take profit targets with reward bonuses
+      mode: soft_targets  # Options: soft_targets (reward bonus), partial_exits, hard_targets
+      risk_reward_ratio: 2.0  # Target = Stop × R:R ratio (maintains 2:1 R:R with ATR-based stop)
+      # Alternative: Use direct ATR multiplier (if specified, overrides R:R ratio)
+      # atr_multiplier: 4.0  # Target = ATR × 4.0 (for 2:1 R:R with 2.0x stop)
+      pct_fallback: 0.04  # Fallback to 4% if ATR unavailable (2x stop loss for 2:1 R:R)
+      bonus_multiplier: 1.5  # Reward bonus multiplier when target hit (encourages aiming for targets)
+    include_regime_features: false  # Disabled - using base 900-dim state only
+    include_forecast_features: true  # ENABLED - forecast features active from the start
+    forecast_horizon: 5
+    forecast_cache_steps: 20  # Cache forecasts for N steps (20 = ~20x speedup - maximum performance)
     quality_filters:
-      enabled: true
-      min_action_confidence: 0.20  # Increased from 0.15 - stricter initial filters to learn from better trades
-      min_quality_score: 0.50  # Increased from 0.40 - stricter initial filters to learn from better trades
-      require_positive_expected_value: false
+      enabled: false  # Disabled - wasn't in profitable version, allows more trades through
+      min_action_confidence: 0.15  # Not used when disabled
+      min_quality_score: 0.4  # Not used when disabled
+      require_positive_expected_value: false  # Not used when disabled
+    bid_ask_spread:
+      enabled: true  # CRITICAL: Enable bid-ask spread modeling for realistic execution prices
+      spread_pct: 0.002  # 0.2% spread (conservative for futures) - accounts for ~$2K-6K per 1000 trades
+      # Note: This is applied to execution prices (entry and exit) to model realistic trading costs
+    volatility_position_sizing:
+      enabled: true  # Enable volatility-normalized position sizing for consistent risk per trade
+      risk_per_trade_pct: 0.01  # 1% of capital risk per trade (standard risk management)
+      atr_period: 14  # ATR period for volatility calculation
+      atr_multiplier: 2.0  # Stop loss distance in ATR multiples
+      min_position_size: 0.01  # Minimum position size (1% of normalized)
+      max_position_size: 1.0  # Maximum position size (100% of normalized)
+      # Note: When enabled, position sizes are normalized so each trade risks the same % of capital
+      # Higher volatility = smaller position, lower volatility = larger position (same risk)
+    slippage:
+      enabled: false  # Disabled - wasn't in profitable version, reduces costs
+      base_slippage: 0.00015
+      impact_coefficient: 0.0002
+      vol_multiplier: 0.0001
+      time_multipliers:
+        market_open: 1.5
+        market_close: 1.5
+        normal_hours: 1.0
+        after_hours: 2.0
+    market_impact:
+      enabled: false  # Disabled - wasn't in profitable version, reduces costs
+      impact_coefficient: 0.3
+      vol_multiplier: 1.0
+  portfolio:
+    enabled: false
+    instruments:
+    - ES
+    - NQ
+    - RTY
+    - YM
+    max_portfolio_risk: 0.2
+    correlation_window: 60
+    diversification_target: 0.3
+  order_types:
+    enabled: false
+    default_order_type: market
+    fill_probability_limit: 0.8
+    max_order_age_seconds: 3600
+  transaction_costs:
+    enabled: true
+    commission_rate: 0.0003
+    spread_bps: 0.5
+    use_slippage_model: true
+    use_market_impact: true
+  performance_attribution:
+    enabled: false
+    track_time_of_day: true
+    track_regime: false
+  order_book:
+    enabled: false
+    num_levels: 10
+    base_depth: 100.0
+    depth_volatility: 0.3
+    spread_bps: 0.5
+  partial_fills:
+    enabled: false
+    base_fill_probability: 0.95
+    volume_impact_factor: 0.5
+    time_decay_factor: 0.1
+  latency:
+    enabled: false
+    base_network_latency: 0.001
+    network_latency_std: 0.0005
+    processing_latency: 0.0005
+    exchange_latency: 0.002
+    market_data_latency: 0.001
+  regime_strategies:
+    enabled: false
+    auto_detect_regime: true
+    use_regime_position_sizing: true
+    use_regime_thresholds: true
+  features:
+    include_forecast_features: false
 training:
   total_timesteps: 1000000
   save_freq: 10000
-  use_decision_gate: true
+  use_decision_gate: false  # Disabled for training - use RL-only like profitable version (DecisionGate was blocking all trades)
   eval_freq: 10000
   device: cuda
   num_envs: 1
-  transfer_learning: false  # DISABLED: Retraining from scratch to fix saturation issue
-  transfer_checkpoint: null  # No checkpoint - starting fresh
-  transfer_strategy: copy_and_extend
+  transfer_learning: false  # FRESH START: Training from scratch with all fixes enabled
+  # transfer_checkpoint: null  # No checkpoint - starting fresh
+  # transfer_strategy: null  # Not applicable for fresh start
   adaptive_training:
     enabled: true
-    eval_frequency: 5000  # More frequent evaluation (was 10000)
-    eval_episodes: 10  # More episodes for better statistics (was 3)
+    eval_frequency: 5000
+    eval_episodes: 10
     min_trades_per_episode: 0.3
-    min_win_rate: 0.40  # Increased from 0.35 - more strict
+    min_win_rate: 0.4
     target_sharpe: 0.5
     auto_save_on_improvement: true
     improvement_threshold: 0.05
-    # NEW: More aggressive adjustment rates
-    quality_adjustment_rate: 0.05  # Increased from 0.01 (5x more aggressive)
-    rr_adjustment_rate: 0.2  # Increased from 0.1 (2x more aggressive)
-    # NEW: Pause/resume settings
+    quality_adjustment_rate: 0.05
+    rr_adjustment_rate: 0.2
     pause_on_critical_failure: true
-    critical_win_rate_threshold: 0.30
+    critical_win_rate_threshold: 0.3
     critical_failure_count: 3
-    # NEW: Reward good performance
     reward_good_performance: true
-    good_win_rate_threshold: 0.50
+    good_win_rate_threshold: 0.5
     good_performance_count: 2
   train_split: 0.8
   validation_split: 0.1
-  # Early stopping to prevent overfitting
   early_stopping:
-    enabled: false  # DISABLED: With new PnL-aligned reward function, rewards may be negative initially - need time to learn
-    patience: 50000  # Stop if no improvement for 50k steps (5 evaluations at eval_freq=10000)
-    min_delta: 0.005  # Minimum improvement threshold (0.5% for reward, 0.5% for win rate)
+    enabled: false
+    patience: 50000
+    min_delta: 0.005
 risk_management:
   max_position_size: 1.0
   max_drawdown: 0.2
+  max_daily_loss: 0.05  # 5% daily loss limit - explicit risk control
   stop_loss_atr_multiplier: 2.0
   initial_capital: 100000.0
-  commission: 2.0
-  max_position_fraction_of_balance: 0.02
+  commission: 2.0  # Per contract per side (for risk calculations)
+  max_position_fraction_of_balance: 0.02  # 2% risk per trade
   position_value_per_unit: 5000.0
   break_even:
     enabled: true
@@ -192,7 +295,7 @@ agentic_swarm:
 decision_gate:
   rl_weight: 0.6
   swarm_weight: 0.4
-  min_combined_confidence: 0.7
+  min_combined_confidence: 0.6  # Increased from 0.7, but training uses 0.3 - will override for quality
   conflict_reduction_factor: 0.5
   min_confluence_required: 2
   swarm_enabled: true
@@ -200,8 +303,8 @@ decision_gate:
   fallback_to_rl_only: true
   quality_scorer:
     enabled: true
-    min_quality_score: 0.6
-    min_risk_reward_ratio: 1.5
+    min_quality_score: 0.7  # Increased from 0.6 - require higher quality trades
+    min_risk_reward_ratio: 2.0  # Increased to 2.0:1 to account for commission costs - consistent with reward config
     min_profit_margin: 1.5
     min_volatility: 0.01
     min_volume_ratio: 1.2

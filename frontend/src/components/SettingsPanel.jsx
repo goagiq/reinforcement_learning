@@ -12,6 +12,7 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
   const [saved, setSaved] = useState(false)
   const [aiInsightsEnabled, setAiInsightsEnabled] = useState(false)
   const [aiTooltipsEnabled, setAiTooltipsEnabled] = useState(false)
+  const [forecastFeaturesEnabled, setForecastFeaturesEnabled] = useState(false)  // Default: OFF (disabled by default for testing)
 
   useEffect(() => {
     if (isOpen) {
@@ -57,6 +58,19 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
         .catch(() => {
           // Ignore if endpoint doesn't exist yet
         })
+      
+      // Load forecast features setting from config file
+      fetch('/api/config/read?path=configs/train_config_adaptive.yaml')
+        .then(res => res.json())
+        .then(data => {
+          if (data.config && data.config.environment && data.config.environment.features) {
+            const forecastEnabled = data.config.environment.features.include_forecast_features !== false
+            setForecastFeaturesEnabled(forecastEnabled)
+          }
+        })
+        .catch(() => {
+          // Ignore if endpoint doesn't exist yet
+        })
     }
   }, [isOpen])
 
@@ -66,6 +80,7 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
     localStorage.setItem('nt8DataPath', nt8DataPath)
     localStorage.setItem('aiInsightsEnabled', aiInsightsEnabled ? 'true' : 'false')
     localStorage.setItem('aiTooltipsEnabled', aiTooltipsEnabled ? 'true' : 'false')
+    localStorage.setItem('forecastFeaturesEnabled', forecastFeaturesEnabled ? 'true' : 'false')
     
     // Save settings to backend
     try {
@@ -95,6 +110,27 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
       }
     } catch (error) {
       console.error('Could not save settings to backend:', error)
+    }
+    
+    // Update forecast features in config file (separate call)
+    try {
+      const forecastResponse = await fetch('/api/config/update-forecast-features', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: forecastFeaturesEnabled,
+          config_path: 'configs/train_config_adaptive.yaml'
+        })
+      })
+      
+      const forecastResult = await forecastResponse.json()
+      console.log('[SettingsPanel] Forecast features update response:', forecastResult)
+      
+      if (!forecastResponse.ok) {
+        console.error('[SettingsPanel] Failed to update forecast features:', forecastResult)
+      }
+    } catch (error) {
+      console.error('[SettingsPanel] Error updating forecast features:', error)
     }
     
     // Dispatch custom event to notify other components in the same window
@@ -318,6 +354,34 @@ const SettingsPanel = ({ isOpen, onClose, models = [] }) => {
                 ? "✅ Auto-retrain: Will detect new CSV/TXT files in NT8 export folder and trigger retraining. Won't interrupt ongoing training."
                 : "❌ Auto-retrain: Disabled. No automatic retraining will occur."
               }
+            </p>
+          </div>
+
+          {/* Forecast Features Toggle */}
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              Forecast Features (RL State Enhancement)
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="forecastFeatures"
+                checked={forecastFeaturesEnabled}
+                onChange={(e) => setForecastFeaturesEnabled(e.target.checked)}
+                className="w-5 h-5 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
+              />
+              <label htmlFor="forecastFeatures" className="text-sm text-gray-700 cursor-pointer">
+                Enable forecast features in RL state (adds 3 features: direction, confidence, expected return)
+              </label>
+            </div>
+            <p className="text-sm text-gray-500 mt-2">
+              {forecastFeaturesEnabled
+                ? "✅ Forecast features enabled: RL agent will receive price forecast information (direction, confidence, expected return). State dimension: 908 (900 base + 5 regime + 3 forecast)."
+                : "❌ Forecast features disabled: RL agent will not receive forecast information. State dimension: 905 (900 base + 5 regime)."
+              }
+            </p>
+            <p className="text-xs text-gray-400 mt-1">
+              Note: Changes will update configs/train_config_adaptive.yaml. Use transfer learning if adding forecast features to an existing model.
             </p>
           </div>
 

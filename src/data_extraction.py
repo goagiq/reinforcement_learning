@@ -15,6 +15,7 @@ from datetime import datetime
 import json
 
 from src.trading_hours import TradingHoursManager
+from src.utils.colors import error, warn
 
 @dataclass
 class MarketBar:
@@ -228,7 +229,7 @@ class DataExtractor:
                         print(f"  [OK] Found {instrument} {timeframe}min data: {best_match.name} (from {total_files} files)")
                     return best_match
                 elif total_files > 10:
-                    print(f"  [WARN] No matching file found for {instrument} {timeframe}min in {total_files} files")
+                    print(warn(f"  [WARN] No matching file found for {instrument} {timeframe}min in {total_files} files"))
             
             return None
         
@@ -243,6 +244,7 @@ class DataExtractor:
                 end_date,
                 timeframe,
                 trading_hours=trading_hours,
+                instrument=instrument,
             )
         
         # Priority 2: Mapped NT8 data folder
@@ -269,6 +271,7 @@ class DataExtractor:
                         end_date,
                         timeframe,
                         trading_hours=trading_hours,
+                        instrument=instrument,
                     )
                 except Exception as e:
                     print(f"Warning: Could not copy file, using directly: {e}")
@@ -278,6 +281,7 @@ class DataExtractor:
                         end_date,
                         timeframe,
                         trading_hours=trading_hours,
+                        instrument=instrument,
                     )
         
         # Priority 3: Try common NT8 export locations
@@ -313,16 +317,18 @@ class DataExtractor:
                             end_date,
                             timeframe,
                             trading_hours=trading_hours,
+                            instrument=instrument,
                         )
                     except Exception as e:
                         print(f"Warning: Could not copy file, using directly: {e}")
-                        return self._load_data_file(
-                            nt8_file,
-                            start_date,
-                            end_date,
-                            timeframe,
-                            trading_hours=trading_hours,
-                        )
+                    return self._load_data_file(
+                        nt8_file,
+                        start_date,
+                        end_date,
+                        timeframe,
+                        trading_hours=trading_hours,
+                        instrument=instrument,
+                    )
         
         # Not found anywhere - provide detailed error with file listing
         checked_locations = []
@@ -367,6 +373,7 @@ class DataExtractor:
         end_date: Optional[str] = None,
         timeframe: int = 1,
         trading_hours: Optional[TradingHoursManager] = None,
+        instrument: Optional[str] = None,
     ) -> pd.DataFrame:
         """Load and process data file (CSV or TXT from NT8)"""
         
@@ -470,9 +477,10 @@ class DataExtractor:
                         )
                 else:
                     if is_multi_timeframe_file:
+                        instrument_str = instrument if instrument else "ES"
                         raise ValueError(
                             f"No {timeframe}min data found in file '{filepath.name}'. "
-                            f"This file may contain different timeframes. Please export {timeframe}min data from NT8 with a specific filename like '{instrument}_{timeframe}min.txt'."
+                            f"This file may contain different timeframes. Please export {timeframe}min data from NT8 with a specific filename like '{instrument_str}_{timeframe}min.txt'."
                         )
                     else:
                         raise ValueError("No valid data rows found in semicolon-separated format")
@@ -582,9 +590,50 @@ class DataExtractor:
         return df
     
     def _validate_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate and clean data"""
-        # Remove NaN rows
+        """
+        Validate and clean data.
+        
+        CRITICAL FIX #4: Enhanced price validation to prevent training crashes.
+        Validates:
+        - Zero/negative prices (critical for division operations)
+        - NaN/Inf values in price columns
+        - Extreme price jumps (>50% likely data error)
+        - Price consistency (high >= low, OHLC within bounds)
+        """
+        if df.empty:
+            return df
+        
+        original_len = len(df)
+        
+        # CRITICAL FIX #4: Check for zero or negative prices BEFORE other operations
+        # These cause division by zero errors in PnL calculations
+        price_columns = ["open", "high", "low", "close"]
+        
+        # Remove rows with zero or negative prices
+        for col in price_columns:
+            if col in df.columns:
+                df = df[df[col] > 0]  # Must be strictly positive
+        
+        # CRITICAL FIX #4: Check for NaN/Inf values in price columns (per column, not just rows)
+        for col in price_columns:
+            if col in df.columns:
+                # Remove rows with NaN or Inf values
+                df = df[df[col].notna()]  # Remove NaN
+                df = df[np.isfinite(df[col])]  # Remove Inf
+        
+        # Remove NaN rows (general cleanup)
         df = df.dropna()
+        
+        # CRITICAL FIX #4: Detect and remove extreme price jumps (>50% likely data error)
+        if len(df) > 1 and "close" in df.columns:
+            # Calculate price change percentage between consecutive bars
+            price_changes = df["close"].pct_change().abs()
+            # Remove bars with >50% price change (likely data error)
+            extreme_jumps = price_changes > 0.5
+            if extreme_jumps.any():
+                num_extreme = extreme_jumps.sum()
+                print(warn(f"[WARN] Data validation: Removed {num_extreme} bars with >50% price jumps (likely data errors)"))
+                df = df[~extreme_jumps]
         
         # Ensure high >= low
         df = df[df["high"] >= df["low"]]
@@ -596,9 +645,68 @@ class DataExtractor:
         df.loc[df["close"] < df["low"], "close"] = df["low"]
         
         # Remove zero/negative volume (if any)
-        df = df[df["volume"] > 0]
+        if "volume" in df.columns:
+            df = df[df["volume"] > 0]
+        
+        # Log validation summary
+        removed_count = original_len - len(df)
+        if removed_count > 0:
+            print(f"[INFO] Data validation: Removed {removed_count} invalid rows ({original_len} -> {len(df)} bars)")
         
         return df.reset_index(drop=True)
+    
+    def _resample_timeframe(self, df: pd.DataFrame, target_timeframe: int) -> pd.DataFrame:
+        """
+        Resample a DataFrame to a higher timeframe.
+        
+        Args:
+            df: DataFrame with OHLCV data and timestamp column
+            target_timeframe: Target timeframe in minutes (e.g., 5 for 5-minute bars)
+        
+        Returns:
+            Resampled DataFrame with target timeframe bars
+        """
+        if df.empty:
+            return df
+        
+        # Ensure timestamp column exists and is datetime
+        if 'timestamp' not in df.columns:
+            raise ValueError("DataFrame must have a 'timestamp' column for resampling")
+        
+        # Convert timestamp to datetime if needed
+        df = df.copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        
+        # Remove rows with invalid timestamps
+        df = df.dropna(subset=['timestamp'])
+        
+        if df.empty:
+            return df
+        
+        # Set timestamp as index for resampling
+        df_indexed = df.set_index('timestamp')
+        
+        # Ensure we have OHLCV columns
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        missing_columns = [col for col in required_columns if col not in df_indexed.columns]
+        if missing_columns:
+            raise ValueError(f"DataFrame missing required columns for resampling: {missing_columns}")
+        
+        # Resample to target timeframe
+        # Open: first value of the period
+        # High: maximum high in the period
+        # Low: minimum low in the period
+        # Close: last close in the period
+        # Volume: sum of volumes in the period
+        resampled = df_indexed.resample(f'{target_timeframe}min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna().reset_index()
+        
+        return resampled
     
     def load_multi_timeframe_data(
         self,
@@ -622,6 +730,11 @@ class DataExtractor:
         """
         data = {}
         total_tfs = len(timeframes)
+        # Load 1-minute data first if it's in the requested timeframes
+        # This will be used as a fallback to resample higher timeframes
+        base_timeframe = min(timeframes)
+        base_data = None
+        
         for idx, tf in enumerate(timeframes, 1):
             print(f"  Loading {tf}min data ({idx}/{total_tfs})...")
             import sys
@@ -636,10 +749,44 @@ class DataExtractor:
                 )
                 print(f"  [OK] {tf}min data loaded: {len(data[tf])} bars")
                 sys.stdout.flush()
+                
+                # Store base timeframe data for resampling
+                if tf == base_timeframe:
+                    base_data = data[tf].copy()
             except Exception as e:
-                print(f"  [ERROR] Failed to load {tf}min data: {e}")
-                sys.stdout.flush()
-                raise
+                # Fallback: Try to resample from base timeframe (usually 1-minute)
+                if tf > base_timeframe and base_timeframe in timeframes:
+                    try:
+                        print(f"  [INFO] {tf}min data not found in file, resampling from {base_timeframe}min data...")
+                        sys.stdout.flush()
+                        if base_data is None:
+                            # Load base timeframe data first if not already loaded
+                            print(f"  Loading {base_timeframe}min data for resampling...")
+                            base_data = self.load_historical_data(
+                                instrument,
+                                base_timeframe,
+                                start_date,
+                                end_date,
+                                trading_hours=trading_hours,
+                            )
+                            print(f"  [OK] {base_timeframe}min data loaded: {len(base_data)} bars")
+                        
+                        # Resample base timeframe data to requested timeframe
+                        data[tf] = self._resample_timeframe(base_data, tf)
+                        print(f"  [OK] Resampled {tf}min data: {len(data[tf])} bars (from {len(base_data)} {base_timeframe}min bars)")
+                        sys.stdout.flush()
+                    except Exception as resample_error:
+                        # Only show warning if resampling also fails
+                        print(warn(f"  [WARN] Failed to load {tf}min data directly: {e}"))
+                        print(error(f"  [ERROR] Failed to resample {tf}min data: {resample_error}"))
+                        sys.stdout.flush()
+                        raise ValueError(f"Failed to load {tf}min data: {e}. Resampling also failed: {resample_error}")
+                else:
+                    # Can't resample, show warning and re-raise
+                    print(warn(f"  [WARN] Failed to load {tf}min data directly: {e}"))
+                    print(warn(f"  [WARN] Cannot resample (base timeframe {base_timeframe}min not available)"))
+                    sys.stdout.flush()
+                    raise
         
         return data
     

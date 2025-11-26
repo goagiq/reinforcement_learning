@@ -33,6 +33,7 @@ from src.trading_env import TradingEnvironment
 from src.rl_agent import PPOAgent
 from torch.utils.tensorboard import SummaryWriter
 from src.trading_hours import TradingHoursManager
+from src.utils.colors import error, warn, success, info
 
 
 class Trainer:
@@ -63,7 +64,7 @@ class Trainer:
                     print(f"   Device will be used for: Actor/Critic networks, tensor operations")
                     self.device = "cuda"
                 except Exception as e:
-                    print(f"⚠️  CUDA device error: {e}. Using CPU instead.")
+                    print(error(f"⚠️  CUDA device error: {e}. Using CPU instead."))
                     self.device = "cpu"
                     config["training"]["device"] = "cpu"
         else:
@@ -136,7 +137,7 @@ class Trainer:
         except Exception as e:
             progress_stop.set() if 'progress_stop' in locals() else None
             data_load_elapsed = time.time() - data_load_start
-            print(f"[ERROR] Error loading data after {data_load_elapsed:.1f}s: {e}")
+            print(error(f"[ERROR] Error loading data after {data_load_elapsed:.1f}s: {e}"))
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
@@ -144,9 +145,11 @@ class Trainer:
         
         # Create environment
         print("Creating trading environment...")
+        sys.stdout.flush()  # Force flush before creating environment
         # Get max_episode_steps from config (default 10000 to ensure episodes complete in reasonable time)
         max_episode_steps = config["environment"].get("max_episode_steps", 10000)
         print(f"  Max episode steps: {max_episode_steps} (episodes will terminate at this limit)")
+        sys.stdout.flush()
         
         self.env = TradingEnvironment(
             data=self.multi_tf_data,
@@ -157,6 +160,21 @@ class Trainer:
             max_episode_steps=max_episode_steps,  # Limit episode length for reasonable training
             action_threshold=config["environment"].get("action_threshold", 0.05)  # Configurable action threshold (default 5%)
         )
+        
+        # Setup trading journal integration (non-intrusive)
+        try:
+            from src.journal_integration import get_integration
+            journal_integration = get_integration()
+            journal_integration.start(self)
+            journal_integration.setup_trade_callback(self.env)
+            self.journal_integration = journal_integration
+            print("[OK] Trading Journal integration enabled")
+        except Exception as e:
+            print(warn(f"[WARN] Trading Journal integration failed: {e}"))
+            self.journal_integration = None
+        
+        # Force flush after environment creation to ensure Priority 1 messages appear
+        sys.stdout.flush()
         
         # Create agent
         print("Creating PPO agent...")
@@ -248,6 +266,60 @@ class Trainer:
             hidden_dims=hidden_dims
         )
         
+        # Supervised pre-training (if enabled)
+        pretrain_config = config.get("pretraining", {})
+        self.pretrained = False
+        if pretrain_config.get("enabled", False) and not self.checkpoint_path:
+            # Only pre-train if starting fresh (no checkpoint resume)
+            try:
+                from src.supervised_pretraining import SupervisedPretrainer
+                print(info("\n" + "="*70))
+                print(info("SUPERVISED PRE-TRAINING"))
+                print(info("="*70))
+                print(info("Pre-training actor network on historical data before RL fine-tuning..."))
+                print(info("This helps the agent learn basic market patterns and reduces random exploration."))
+                
+                pretrainer = SupervisedPretrainer(
+                    config=config,
+                    data_extractor=self.data_extractor,
+                    device=self.device
+                )
+                pretrain_metrics = pretrainer.run_pretraining(
+                    actor=self.agent.actor,
+                    env=self.env
+                )
+                if pretrain_metrics:
+                    self.pretrained = True
+                    best_val_loss = pretrain_metrics.get('best_val_loss', 'N/A')
+                    epochs_trained = pretrain_metrics.get('epochs_trained', 'N/A')
+                    print(success(f"\n[PRETRAIN] Pre-training completed successfully!"))
+                    print(info(f"  Best validation loss: {best_val_loss:.6f}"))
+                    print(info(f"  Epochs trained: {epochs_trained}"))
+                    print(info("  Pre-trained weights are now in the actor network."))
+                    print(info("  RL training will fine-tune these weights."))
+                    print(info("="*70 + "\n"))
+                    
+                    # Optionally save pre-trained weights separately for reference
+                    if pretrain_config.get("save_pretrained_weights", False):
+                        pretrained_path = self.model_dir / "pretrained_actor.pt"
+                        torch.save({
+                            "actor_state_dict": self.agent.actor.state_dict(),
+                            "pretrain_metrics": pretrain_metrics,
+                            "config": pretrain_config
+                        }, pretrained_path)
+                        print(success(f"[PRETRAIN] Pre-trained weights saved to: {pretrained_path}"))
+                else:
+                    print(warn("[PRETRAIN] Pre-training returned no metrics (may be disabled in config)"))
+            except Exception as e:
+                print(error(f"[PRETRAIN] Pre-training failed: {e}"))
+                print(warn("[PRETRAIN] Continuing with RL training from random initialization..."))
+                import traceback
+                traceback.print_exc()
+        elif pretrain_config.get("enabled", False) and self.checkpoint_path:
+            print(info("[PRETRAIN] Skipping pre-training (resuming from checkpoint)"))
+        elif not pretrain_config.get("enabled", False):
+            print(info("[PRETRAIN] Pre-training disabled in config (pretraining.enabled: false)"))
+        
         # Mixed precision training (FP16) for 2x speedup on modern GPUs
         self.use_mixed_precision = config["training"].get("use_mixed_precision", False)
         if self.use_mixed_precision and self.device == "cuda":
@@ -323,11 +395,11 @@ class Trainer:
             training_decision_gate_config["min_confluence_required"] = 0  # Always allow RL-only trades during training
             training_decision_gate_config["swarm_enabled"] = False  # Disable swarm during training (not used anyway)
             
-            # Also relax min_combined_confidence for training (default 0.7 is too high)
-            # Further reduced to 0.3 to allow more trades during training
+            # Set min_combined_confidence for quality filtering during training
+            # Increased from 0.3 to 0.5 to filter for quality trades
             if training_decision_gate_config.get("min_combined_confidence", 0.7) >= 0.5:
-                training_decision_gate_config["min_combined_confidence"] = 0.3  # More permissive for training (reduced from 0.5)
-                print("   [DecisionGate] Reduced min_combined_confidence to 0.3 for training")
+                training_decision_gate_config["min_combined_confidence"] = 0.5  # Quality threshold - requires 50% confidence minimum
+                print("   [DecisionGate] Set min_combined_confidence to 0.5 for quality filtering")
             
             print("   [DecisionGate] Training mode: min_confluence_required=0, swarm_enabled=false")
             print("   [DecisionGate] Quality filters (confidence, quality score, EV) still applied")
@@ -342,7 +414,7 @@ class Trainer:
         if config.get("training", {}).get("adaptive_training", {}).get("enabled", False):
             from src.adaptive_trainer import AdaptiveTrainer, AdaptiveConfig
             adaptive_cfg = AdaptiveConfig(
-                eval_frequency=config["training"]["adaptive_training"].get("eval_frequency", 10000),
+                eval_frequency=config["training"]["adaptive_training"].get("eval_frequency", 5000),
                 eval_episodes=config["training"]["adaptive_training"].get("eval_episodes", 3),
                 min_trades_per_episode=config["training"]["adaptive_training"].get("min_trades_per_episode", 0.5),
                 auto_save_on_improvement=config["training"]["adaptive_training"].get("auto_save_on_improvement", True),
@@ -414,20 +486,31 @@ class Trainer:
                     
                     # Use transfer learning
                     transfer_strategy = config.get("training", {}).get("transfer_strategy", "copy_and_extend")
-                    timestep, episode, rewards, lengths = self.agent.load_with_transfer(
+                    result = self.agent.load_with_transfer(
                         str(checkpoint_path),
                         transfer_strategy=transfer_strategy
                     )
+                    # load_with_transfer returns tuple: (timestep, episode, rewards, lengths)
+                    timestep, episode, rewards, lengths = result[:4]
+                    # For transfer learning, initialize metrics as empty (fresh start for new architecture)
+                    # Try to load from checkpoint if available
+                    checkpoint = torch.load(str(checkpoint_path), map_location='cpu', weights_only=False)
+                    pnls = checkpoint.get("episode_pnls", [])
+                    equities = checkpoint.get("episode_equities", [])
+                    win_rates = checkpoint.get("episode_win_rates", [])
                 else:
                     # Architectures match, use normal loading
-                    timestep, episode, rewards, lengths = self.agent.load_with_training_state(str(checkpoint_path))
+                    timestep, episode, rewards, lengths, pnls, equities, win_rates = self.agent.load_with_training_state(str(checkpoint_path))
                 
                 checkpoint_timestep = timestep
                 self.timestep = timestep
                 self.episode = episode
                 self.episode_rewards = rewards
                 self.episode_lengths = lengths
-                print(f"✅ Resume: timestep={timestep}, episode={episode}, rewards={len(rewards)}")
+                self.episode_pnls = pnls  # Initialize from checkpoint
+                self.episode_equities = equities  # Initialize from checkpoint
+                self.episode_win_rates = win_rates  # Initialize from checkpoint
+                print(f"✅ Resume: timestep={timestep}, episode={episode}, rewards={len(rewards)}, pnls={len(pnls)}, equities={len(equities)}, win_rates={len(win_rates)}")
                 
                 # If we've already reached or exceeded total_timesteps, continue training
                 # by adding additional timesteps equal to the original goal
@@ -464,7 +547,7 @@ class Trainer:
                         print(f"[PERF] Performance mode: {perf_mode} (turbo_training_mode: {turbo_enabled})")
                         return perf_mode
             except Exception as e:
-                print(f"[WARN] Error loading performance mode: {e}")
+                print(warn(f"[WARN] Error loading performance mode: {e}"))
                 pass
         print(f"⚠️  settings.json not found, defaulting to quiet mode")
         return "quiet"  # Default: resource-friendly mode
@@ -581,7 +664,7 @@ class Trainer:
                 # Reduce both multipliers to save memory
                 self.turbo_batch_multiplier = max(2.0, self.turbo_batch_multiplier * (1 - 0.1))
                 self.turbo_epoch_multiplier = max(1.5, self.turbo_epoch_multiplier * (1 - 0.1))
-                print(f"   [WARN] VRAM high ({vram_used:.2f}GB > {self.vram_limit_gb * 0.9:.1f}GB), reducing multipliers")
+                print(warn(f"   [WARN] VRAM high ({vram_used:.2f}GB > {self.vram_limit_gb * 0.9:.1f}GB), reducing multipliers"))
             elif vram_used < self.vram_limit_gb * 0.5:  # <50% of limit (<4GB)
                 # Can increase aggressively if GPU utilization allows
                 if gpu_util is None or gpu_util < self.gpu_target_util:
@@ -639,7 +722,7 @@ class Trainer:
                 print(f"  [OK] Archived: {model_file.name}")
                 archived_count += 1
             except Exception as e:
-                print(f"  [WARN] Failed to archive {model_file.name}: {e}")
+                print(warn(f"  [WARN] Failed to archive {model_file.name}: {e}"))
         
         print(f"\nArchived {archived_count} model file(s) to: {archive_subdir}")
         print(f"{'='*70}\n")
@@ -742,7 +825,7 @@ class Trainer:
                         print(f"  [OK] Archived NT8 file: {source_file.name}")
                         archived_count += 1
                     except Exception as e:
-                        print(f"  [WARN] Failed to archive NT8 file {source_file.name}: {e}")
+                        print(warn(f"  [WARN] Failed to archive NT8 file {source_file.name}: {e}"))
         
         # Archive local data files
         local_archive_dir = Path("data/raw/Archive") / f"archive_{timestamp}"
@@ -764,7 +847,7 @@ class Trainer:
                     print(f"  [OK] Archived local file: {local_file.name}")
                     archived_count += 1
                 except Exception as e:
-                    print(f"  [WARN] Failed to archive local file {local_file.name}: {e}")
+                    print(warn(f"  [WARN] Failed to archive local file {local_file.name}: {e}"))
         
         if archived_count > 0:
             print(f"\nArchived {archived_count} data file(s)")
@@ -828,25 +911,39 @@ class Trainer:
     def train(self):
         """Main training loop"""
         print("\n" + "="*60)
-        print("Starting Training")
+        print("Starting RL Training")
         print("="*60)
         print(f"Device: {self.device}")
         print(f"Total timesteps: {self.total_timesteps:,}")
         print(f"Timeframes: {self.config['environment']['timeframes']}")
         print(f"Instrument: {self.config['environment']['instrument']}")
+        if hasattr(self, 'pretrained') and self.pretrained:
+            print(success("  Pre-trained weights: ✅ Loaded (agent starts with learned patterns)"))
+        else:
+            print(info("  Pre-trained weights: ❌ None (starting from random initialization)"))
         print("="*60 + "\n")
         
         # Reset environment
-        state, info = self.env.reset()
+        state, env_info = self.env.reset()  # Rename to avoid conflict with info() function
         
         episode_reward = 0
         episode_length = 0
         self.current_episode_reward = 0.0
         self.current_episode_length = 0
+        
+        # Track initial performance for pre-training comparison
+        initial_performance = {
+            "first_episode_reward": None,
+            "first_10_episodes_avg_reward": [],
+            "first_10_episodes_avg_trades": []
+        }
         best_mean_reward = float('-inf')
         
         # Progress bar
         pbar = tqdm(total=self.total_timesteps, desc="Training")
+        
+        # DEBUG: Log training loop start
+        print(f"[DEBUG] Training loop starting: timestep={self.timestep}, total_timesteps={self.total_timesteps}, episode={self.episode}", flush=True)
         
         while self.timestep < self.total_timesteps:
             # Select action
@@ -880,7 +977,7 @@ class Trainer:
             except (IndexError, KeyError, Exception) as e:
                 # CRITICAL FIX: Catch exceptions during step and terminate episode gracefully
                 import traceback
-                print(f"[ERROR] Exception in env.step() at episode {self.episode}, step {episode_length}: {e}", flush=True)
+                print(error(f"[ERROR] Exception in env.step() at episode {self.episode}, step {episode_length}: {e}"), flush=True)
                 traceback.print_exc()
                 sys.stdout.flush()
                 # Terminate episode on exception
@@ -892,6 +989,7 @@ class Trainer:
                 step_info = {"step": episode_length, "error": str(e)}
             
             # Update current episode trading metrics from step_info
+            # ALWAYS update these values every step to ensure real-time updates
             if step_info:
                 # Use episode_trades if available (episode-specific), otherwise fall back to trades (cumulative)
                 self.current_episode_trades = step_info.get("episode_trades", step_info.get("trades", 0))
@@ -904,6 +1002,21 @@ class Trainer:
                 self.current_avg_win = float(step_info.get("avg_win", 0.0))
                 self.current_avg_loss = float(step_info.get("avg_loss", 0.0))
                 self.current_risk_reward_ratio = float(step_info.get("risk_reward_ratio", 0.0))
+            else:
+                # If step_info is missing, try to get values directly from environment
+                # This ensures values are always updated even if step_info is incomplete
+                if hasattr(self.env, 'episode_trades'):
+                    self.current_episode_trades = self.env.episode_trades
+                if hasattr(self.env, 'state') and self.env.state:
+                    self.current_episode_pnl = float(self.env.state.total_pnl)
+                    # Calculate equity from state
+                    if hasattr(self.env, 'initial_capital'):
+                        self.current_episode_equity = float(self.env.initial_capital + self.env.state.total_pnl)
+                    # Calculate win rate from state
+                    if self.env.state.trades_count > 0:
+                        self.current_episode_win_rate = float(self.env.state.winning_trades / self.env.state.trades_count)
+                if hasattr(self.env, 'max_drawdown'):
+                    self.current_episode_max_drawdown = float(self.env.max_drawdown)
             
             # Real-time adaptive check for trading activity (lightweight, no full evaluation)
             if self.adaptive_trainer:
@@ -925,7 +1038,15 @@ class Trainer:
             episode_length += 1
             self.current_episode_reward = episode_reward
             self.current_episode_length = episode_length
+            
+            # CRITICAL FIX: Increment timestep BEFORE checking done
+            # This ensures timestep always increments even if episode ends immediately
             self.timestep += 1
+            
+            # DEBUG: Log timestep every 100 steps OR if episode ends immediately (to catch stuck timesteps)
+            if self.timestep % 100 == 0 or (done and episode_length <= 1):
+                print(f"[DEBUG] Timestep: {self.timestep:,}, Episode: {self.episode}, Episode Length: {episode_length}, Done: {done}", flush=True)
+            
             pbar.update(1)
             
             # Update agent if buffer is full or episode ended
@@ -991,7 +1112,7 @@ class Trainer:
                     
                     # Log update details before calling agent.update
                     print(f"\n{'='*60}")
-                    print(f"📊 TRAINING UPDATE STARTING")
+                    print(f"📊 TRAINING UPDATE STARTING (Timestep: {self.timestep:,})")
                     print(f"{'='*60}")
                     print(f"   Mode: {self.performance_mode}")
                     if self.performance_mode == "turbo":
@@ -999,6 +1120,7 @@ class Trainer:
                     print(f"   Batch size: {dynamic_batch_size} (base: {base_batch_size}, multiplier: {dynamic_batch_size/base_batch_size:.2f}x)")
                     print(f"   Epochs: {dynamic_n_epochs} (base: {base_n_epochs}, multiplier: {dynamic_n_epochs/base_n_epochs:.2f}x)")
                     print(f"   Buffer size: {len(self.agent.states)} samples")
+                    print(f"   ⏱️  Update may take 1-5 minutes in Turbo mode - timestep will remain at {self.timestep:,} until update completes")
                     print(f"{'='*60}\n")
                     
                     # Update agent (GPU-intensive operation)
@@ -1203,6 +1325,11 @@ class Trainer:
                     if self.writer:
                         for key, value in metrics.items():
                             self.writer.add_scalar(f"train/{key}", value, self.timestep)
+                        
+                        # Log pre-training status (if applicable)
+                        if hasattr(self, 'pretrained') and self.pretrained and self.timestep < 1000:
+                            # Track early performance to compare with/without pre-training
+                            self.writer.add_scalar("pretraining/used", 1.0, self.timestep)
             
             # Handle episode end
             if done:
@@ -1227,12 +1354,105 @@ class Trainer:
                 self.episode_rewards.append(episode_reward)
                 self.episode_lengths.append(episode_length)
                 
+                # Track initial performance for pre-training comparison
+                if self.episode == 1:
+                    initial_performance["first_episode_reward"] = episode_reward
+                if self.episode <= 10:
+                    initial_performance["first_10_episodes_avg_reward"].append(episode_reward)
+                    initial_performance["first_10_episodes_avg_trades"].append(episode_trades)
+                
+                # Log initial performance metrics (first 10 episodes)
+                if self.episode == 10 and hasattr(self, 'pretrained') and self.pretrained and self.writer:
+                    avg_reward = np.mean(initial_performance["first_10_episodes_avg_reward"])
+                    avg_trades = np.mean(initial_performance["first_10_episodes_avg_trades"])
+                    self.writer.add_scalar("pretraining/initial_avg_reward", avg_reward, self.timestep)
+                    self.writer.add_scalar("pretraining/initial_avg_trades", avg_trades, self.timestep)
+                    from src.utils.colors import info as info_color
+                    print(info_color(f"[PRETRAIN] Initial performance (first 10 episodes): Avg reward={avg_reward:.2f}, Avg trades={avg_trades:.1f}"))
+                
                 # Store trading metrics for this episode
                 self.episode_trades.append(episode_trades)
                 self.episode_pnls.append(episode_pnl)
                 self.episode_equities.append(episode_equity)
                 self.episode_win_rates.append(episode_win_rate)
                 self.episode_max_drawdowns.append(episode_max_drawdown)
+                
+                # CRITICAL FIX: Update adaptive trainer's consecutive_no_trade_episodes counter
+                if self.adaptive_trainer:
+                    if episode_trades == 0:
+                        self.adaptive_trainer.consecutive_no_trade_episodes += 1
+                        print(f"[ADAPTIVE] Episode {self.episode} completed with 0 trades. Consecutive no-trade episodes: {self.adaptive_trainer.consecutive_no_trade_episodes}")
+                        
+                        # CRITICAL: Trigger immediate adaptive check when episode completes with no trades
+                        # This bypasses timestep checks for persistent no-trade conditions
+                        adjustments = self.adaptive_trainer.check_trading_activity(
+                            timestep=self.timestep,
+                            episode=self.episode,
+                            current_episode_trades=0,
+                            current_episode_length=episode_length,
+                            agent=self.agent
+                        )
+                        if adjustments:
+                            print(f"[ADAPTIVE] ⚡ IMMEDIATE adjustment triggered after episode {self.episode} with no trades!")
+                            for key, value in adjustments.items():
+                                if isinstance(value, dict):
+                                    for sub_key, sub_value in value.items():
+                                        if isinstance(sub_value, dict):
+                                            print(f"   {key}.{sub_key}: {sub_value.get('old', 'N/A')} -> {sub_value.get('new', 'N/A')}")
+                    else:
+                        if self.adaptive_trainer.consecutive_no_trade_episodes > 0:
+                            print(f"[ADAPTIVE] Episode {self.episode} had {episode_trades} trades. Resetting consecutive no-trade counter (was {self.adaptive_trainer.consecutive_no_trade_episodes})")
+                        self.adaptive_trainer.consecutive_no_trade_episodes = 0
+                
+                # NEW: Quick episode-level check for recent negative trend (every episode)
+                if self.adaptive_trainer and len(self.episode_pnls) >= 10:
+                    recent_pnls = self.episode_pnls[-10:]
+                    recent_mean_pnl = sum(recent_pnls) / len(recent_pnls)
+                    
+                    # If negative trend for 10+ episodes, trigger quick adjustment
+                    if recent_mean_pnl < 0:
+                        # Get recent trades from journal if available (for better analysis)
+                        recent_trades_data = None
+                        if self.journal_integration and hasattr(self.journal_integration, 'journal'):
+                            try:
+                                # Get last 20 trades from journal
+                                recent_trades = self.journal_integration.journal.get_recent_trades(limit=20)
+                                if recent_trades:
+                                    recent_trades_data = [
+                                        {
+                                            "pnl": float(row.get("pnl", 0)),
+                                            "net_pnl": float(row.get("net_pnl", 0)),
+                                            "strategy": row.get("strategy", "RL"),
+                                            "entry_price": float(row.get("entry_price", 0)),
+                                            "exit_price": float(row.get("exit_price", 0)),
+                                            "is_win": bool(row.get("is_win", False))
+                                        }
+                                        for row in recent_trades
+                                    ]
+                            except Exception as e:
+                                # If journal access fails, continue without it
+                                pass
+                        
+                        # Quick adjustment without full evaluation (ENHANCED: now uses journal data)
+                        # Calculate total trades in recent episodes
+                        recent_total_trades = sum(self.episode_trades[-10:]) if len(self.episode_trades) >= 10 else sum(self.episode_trades)
+                        
+                        quick_adjustments = self.adaptive_trainer.quick_adjust_for_negative_trend(
+                            recent_mean_pnl=recent_mean_pnl,
+                            recent_win_rate=sum(self.episode_win_rates[-10:]) / 10 if len(self.episode_win_rates) >= 10 else 0.0,
+                            agent=self.agent,
+                            recent_trades_data=recent_trades_data,  # NEW: Pass journal data
+                            recent_total_trades=recent_total_trades  # NEW: Pass total trades count
+                        )
+                        if quick_adjustments:
+                            print(f"[ADAPT] Quick adjustment triggered: {len(quick_adjustments)} adjustments")
+                            for key, value in quick_adjustments.items():
+                                if isinstance(value, dict):
+                                    for sub_key, sub_value in value.items():
+                                        if isinstance(sub_value, dict):
+                                            print(f"   {key}.{sub_key}: {sub_value.get('old', 'N/A')} -> {sub_value.get('new', 'N/A')} ({sub_value.get('reason', '')})")
+                                else:
+                                    print(f"   {key}: {value}")
                 
                 # Update cumulative totals (estimate wins/losses from win rate)
                 old_total_trades = self.total_trades
@@ -1243,7 +1463,7 @@ class Trainer:
                     self.total_winning_trades += estimated_wins
                     self.total_losing_trades += estimated_losses
                 else:
-                    print(f"[WARN] Episode {self.episode} had 0 trades! current_episode_trades={self.current_episode_trades}", flush=True)
+                    print(warn(f"[WARN] Episode {self.episode} had 0 trades! current_episode_trades={self.current_episode_trades}"), flush=True)
                 sys.stdout.flush()
                 
                 # Log episode metrics
@@ -1273,7 +1493,10 @@ class Trainer:
                         print(f"  🎉 New best mean reward: {best_mean_reward:.2f}")
                 
                 # Reset for next episode
-                state, info = self.env.reset()
+                state, env_info = self.env.reset(options={"episode": self.episode})  # Rename to avoid conflict with info() function
+                # Update episode number in environment for journaling
+                if hasattr(self.env, '_current_episode'):
+                    self.env._current_episode = self.episode
                 episode_reward = 0
                 episode_length = 0
                 self.current_episode_reward = 0.0
@@ -1297,7 +1520,10 @@ class Trainer:
                     self.timestep,
                     self.episode,
                     self.episode_rewards,
-                    self.episode_lengths
+                    self.episode_lengths,
+                    episode_pnls=self.episode_pnls,
+                    episode_equities=self.episode_equities,
+                    episode_win_rates=self.episode_win_rates
                 )
                 
                 # Save best model
@@ -1314,8 +1540,21 @@ class Trainer:
                         )
             
             # Evaluation and adaptive adjustment
-            if self.timestep % self.eval_freq == 0 and self.timestep > 0:
-                if self.adaptive_trainer and self.adaptive_trainer.should_evaluate(self.timestep):
+            # CRITICAL FIX: Also check for evaluation if timestep is stuck at 0
+            # Use episode-based evaluation when timestep is 0
+            # FIX: Check both eval_freq (config) and adaptive_trainer.should_evaluate() to ensure evaluations happen
+            should_eval = False
+            if self.timestep > 0:
+                # Check if timestep matches eval_freq OR if adaptive trainer says we should evaluate
+                should_eval = (self.timestep % self.eval_freq == 0) or \
+                             (self.adaptive_trainer and self.adaptive_trainer.should_evaluate(self.timestep))
+            elif self.timestep == 0 and self.adaptive_trainer:
+                # If timestep is stuck at 0, use episode-based evaluation (every 10 episodes)
+                should_eval = (self.episode > 0 and self.episode % 10 == 0)
+            
+            if should_eval:
+                if self.adaptive_trainer and (self.timestep > 0 and self.adaptive_trainer.should_evaluate(self.timestep)) or \
+                   (self.timestep == 0 and self.adaptive_trainer):
                     # Use adaptive trainer for intelligent evaluation and adjustment
                     checkpoint_path = self.model_dir / f"checkpoint_{self.timestep}.pt"
                     if not checkpoint_path.exists():
@@ -1329,12 +1568,16 @@ class Trainer:
                         )
                     
                     mean_reward = np.mean(self.episode_rewards[-10:]) if len(self.episode_rewards) >= 10 else (np.mean(self.episode_rewards) if self.episode_rewards else 0)
+                    # Get policy loss from agent if available
+                    policy_loss = getattr(self.agent, 'last_policy_loss', None)
+                    
                     result = self.adaptive_trainer.evaluate_and_adapt(
                         model_path=str(checkpoint_path),
                         timestep=self.timestep,
                         episode=self.episode,
                         mean_reward=mean_reward,
-                        agent=self.agent
+                        agent=self.agent,
+                        policy_loss=policy_loss  # Pass policy loss for convergence detection
                     )
                     
                     # Apply adjustments
@@ -1533,12 +1776,12 @@ class Trainer:
             
             while not done:
                 action, _, _ = self.agent.select_action(state, deterministic=True)
-                state, reward, terminated, truncated, info = eval_env.step(action)
+                state, reward, terminated, truncated, eval_info = eval_env.step(action)  # Rename to avoid conflict with info() function
                 done = terminated or truncated
                 episode_reward += reward
             
             eval_rewards.append(episode_reward)
-            eval_pnls.append(info.get("pnl", 0))
+            eval_pnls.append(eval_info.get("pnl", 0))
         
         mean_reward = np.mean(eval_rewards)
         mean_pnl = np.mean(eval_pnls)
@@ -1618,7 +1861,7 @@ def main():
         config["training"]["device"] = "cpu"
     
     # Create trainer (with checkpoint if specified for resume)
-    trainer = Trainer(config, checkpoint_path=args.checkpoint)
+    trainer = Trainer(config, checkpoint_path=args.checkpoint, config_path=args.config)
     
     # Train
     trainer.train()

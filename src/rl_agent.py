@@ -448,6 +448,9 @@ class PPOAgent:
             "entropy": entropy / n_updates,
         }
         
+        # Store last policy loss for adaptive trainer
+        self.last_policy_loss = metrics["policy_loss"]
+        
         # Clear buffer after update
         self.reset_buffer()
         
@@ -473,8 +476,22 @@ class PPOAgent:
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
         print(f"Agent loaded from: {filepath}")
     
-    def save_with_training_state(self, filepath: str, timestep: int, episode: int, episode_rewards: list, episode_lengths: list):
-        """Save agent state with training progress metadata"""
+    def save_with_training_state(
+        self, 
+        filepath: str, 
+        timestep: int, 
+        episode: int, 
+        episode_rewards: list, 
+        episode_lengths: list,
+        episode_pnls: list = None,
+        episode_equities: list = None,
+        episode_win_rates: list = None
+    ):
+        """
+        Save agent state with training progress metadata.
+        
+        Includes episode metrics (pnls, equities, win_rates) for mean metrics calculation.
+        """
         # Extract hidden_dims from actor network architecture
         hidden_dims = []
         for i, layer in enumerate(self.actor.feature_layers):
@@ -496,6 +513,9 @@ class PPOAgent:
             "episode": episode,
             "episode_rewards": episode_rewards,
             "episode_lengths": episode_lengths,
+            "episode_pnls": episode_pnls if episode_pnls is not None else [],  # Save episode PnLs
+            "episode_equities": episode_equities if episode_equities is not None else [],  # Save episode Equities
+            "episode_win_rates": episode_win_rates if episode_win_rates is not None else [],  # Save episode Win Rates
             "hidden_dims": hidden_dims,  # Save architecture for resume
             "state_dim": self.state_dim,  # Save state_dim too
         }, filepath)
@@ -515,6 +535,9 @@ class PPOAgent:
         episode = checkpoint.get("episode", None)
         episode_rewards = checkpoint.get("episode_rewards", None)
         episode_lengths = checkpoint.get("episode_lengths", None)
+        episode_pnls = checkpoint.get("episode_pnls", None)
+        episode_equities = checkpoint.get("episode_equities", None)
+        episode_win_rates = checkpoint.get("episode_win_rates", None)
         
         # If training state not in checkpoint (old format), try to extract from filename
         if timestep is None:
@@ -537,9 +560,16 @@ class PPOAgent:
             episode_rewards = []
         if episode_lengths is None:
             episode_lengths = []
+        # Default values for episode metrics (if not in old checkpoints)
+        if episode_pnls is None:
+            episode_pnls = []
+        if episode_equities is None:
+            episode_equities = []
+        if episode_win_rates is None:
+            episode_win_rates = []
         
         print(f"Agent loaded from: {filepath} (timestep={timestep}, episode={episode})")
-        return timestep, episode, episode_rewards, episode_lengths
+        return timestep, episode, episode_rewards, episode_lengths, episode_pnls, episode_equities, episode_win_rates
     
     def load_with_transfer(self, filepath: str, transfer_strategy: str = "copy_and_extend"):
         """

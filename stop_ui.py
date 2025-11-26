@@ -325,15 +325,27 @@ Examples:
         action='store_true',
         help='Also stop Prometheus and Grafana monitoring services'
     )
+    # Only allow ports 8200 and 3200 for safety
+    # This prevents accidentally killing other node.exe or python.exe processes
+    ALLOWED_PORTS = [8200, 3200]
+    
     parser.add_argument(
         '--ports',
         nargs='+',
         type=int,
-        default=[8200, 3200],
-        help='Ports to check (default: 8200 3200)'
+        default=ALLOWED_PORTS,
+        help=f'Ports to check (default: {ALLOWED_PORTS}, only these ports are allowed)'
     )
     
     args = parser.parse_args()
+    
+    # Validate that only allowed ports are specified
+    invalid_ports = [p for p in args.ports if p not in ALLOWED_PORTS]
+    if invalid_ports:
+        print(f"ERROR: Only ports {ALLOWED_PORTS} are allowed for safety.")
+        print(f"  Invalid ports specified: {invalid_ports}")
+        print(f"  This prevents accidentally killing other node.exe or python.exe processes.")
+        sys.exit(1)
     
     print("=" * 60)
     print("NT8 RL Trading System - Stop UI Servers")
@@ -374,10 +386,14 @@ Examples:
             stop_monitoring()
             print()
     
-    ports = args.ports
+    # Only use allowed ports (safety check)
+    ports = [p for p in args.ports if p in ALLOWED_PORTS]
+    if not ports:
+        ports = ALLOWED_PORTS  # Fallback to default
+    
     all_pids = []
     
-    # Find all processes
+    # Find all processes on specified ports only
     for port in ports:
         print(f"Checking port {port}...")
         pids = find_processes_on_port(port)
