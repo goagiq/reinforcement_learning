@@ -8,34 +8,69 @@ model:
   gae_lambda: 0.95
   clip_range: 0.2
   value_loss_coef: 0.5
-  entropy_coef: 0.025  # Balanced: Encourages exploration without excessive randomness (was 0.15 - too high!)
+  entropy_coef: 0.05
   max_grad_norm: 0.5
+  use_enhanced_architecture: false
+  architecture_variant: standard
   hidden_dims:
   - 256
   - 256
   - 128
+  shared_hidden_dims:
+  - 128
+  - 64
+  walk_forward_validation:
+    enabled: false
+    train_window: 252
+    test_window: 63
+    step_size: 21
+    window_type: rolling
+    run_after_training: false
+unsupervised_pretraining:
+  enabled: true
+  latent_dim: 128
+  use_sequence: true
+  sequence_length: 20
+  strategy_compliant_weight: 3.0
+  strategy_partial_weight: 1.0
+  strategy_non_compliant_weight: 0.5
+  vae_hidden_dims:
+  - 256
+  - 256
+  sequence_hidden_dim: 128
+  sequence_num_layers: 2
+  batch_size: 256
+  epochs: 20
+  learning_rate: 0.001
+  validation_split: 0.2
+  combine_method: concat
+
 pretraining:
-  enabled: true  # Enable supervised pre-training before RL
-  lookahead_bars: 20  # Number of bars to look ahead for label generation
-  return_threshold: 0.02  # 2% return threshold for buy/sell signals
-  batch_size: 256  # Batch size for supervised learning
-  epochs: 10  # Number of pre-training epochs
-  learning_rate: 0.001  # Learning rate for pre-training (can be higher than RL)
-  validation_split: 0.2  # 20% of data for validation
-  labeling_strategy: simple_return  # Options: simple_return, sharpe_based, volatility_adjusted
-  save_pretrained_weights: false  # Save pre-trained weights separately (optional, for reference)
+  enabled: true
+  lookahead_bars: 20
+  return_threshold: 0.02
+  batch_size: 256
+  epochs: 10
+  learning_rate: 0.001
+  validation_split: 0.2
+  labeling_strategy: simple_return
+  save_pretrained_weights: false
+  strategy_aware_labeling: false
+  use_numba: true
+  use_memory_mapping: true
+  memory_map_threshold_mb: 500
 environment:
   instrument: ES
   timeframes:
   - 1
   - 5
   - 15
-  state_features: 903  # Base features (900) + Forecast features (3) = 903 total
+  state_features: 916  # 900 base + 5 regime + 3 forecast + 8 strategy features
   action_space: continuous
   action_range:
   - -1.0
   - 1.0
-  action_threshold: 0.01  # TEMPORARILY REDUCED to 0.01 (1%) to debug no trades issue - will restore to 0.02 after debugging
+  action_threshold: 0.05
   max_episode_steps: 10000
   lookback_bars: 20
   trading_hours:
@@ -58,61 +93,60 @@ environment:
       end: '16:00'
   reward:
     pnl_weight: 1.0
-    transaction_cost: 0.0001  # Reverted to 0.0001 (0.01%) - lower costs like profitable version
+    transaction_cost: 5.0e-05
     risk_penalty: 0.05
     drawdown_penalty: 0.07
+    feature_normalization:
+      enabled: true
+      method: standard
+      strategy_normalization: minmax
     exploration_bonus_enabled: true
-    exploration_bonus_scale: 1.0e-05  # Minimal exploration bonus - only encourages trading when very few trades (aligned with repo approach)
-    action_diversity_bonus: 0.0  # Disabled - wasn't in profitable version
-    constant_action_penalty: 0.0  # Disabled - wasn't in profitable version
-    loss_mitigation: 0.0  # Disabled - no loss masking, let agent learn from losses
-    overtrading_penalty_enabled: false  # Disabled - wasn't in profitable version
-    optimal_trades_per_episode: null  # Removed restriction - allow more trades like profitable version
+    exploration_bonus_scale: 1.0e-05
+    action_diversity_bonus: 0.0
+    constant_action_penalty: 0.0
+    loss_mitigation: 0.0
+    overtrading_penalty_enabled: false
+    optimal_trades_per_episode: null
     profit_factor_required: 1.0
-    inaction_penalty: 0.0001  # Increased from 5.0e-05 to 0.0001 (2x stronger) - penalizes no trades to encourage trading
-    max_consecutive_losses: 5  # Reduced from 10 to 5 - tighter risk control (matches GitHub repo approach)
-    resume_confluence_required: 3  # For adaptive training pause/resume (not checkpoint resume)
-    stop_loss_pct: 0.025  # Set to 2.5% - reasonable middle ground (1.5% was too tight, 4.0% was too loose)
-    min_risk_reward_ratio: 2.0  # Increased to 2.0:1 to account for commission costs (31% of net win) - need higher R:R to be profitable
+    inaction_penalty: 0.0001
+    max_consecutive_losses: 5
+    resume_confluence_required: 3
+    stop_loss_pct: 0.025
+    min_risk_reward_ratio: 2.0
     trailing_stop:
-      enabled: true  # RE-ENABLED - ATR-adaptive trailing stop for profit protection
-      atr_multiplier: 2.0  # Trailing stop distance = ATR * multiplier (adapts to volatility)
-      pct_fallback: 0.02  # Fallback to 2% if ATR unavailable
-      min_distance_pct: 0.005  # Minimum 0.5% distance (safety floor)
-      max_distance_pct: 0.05  # Maximum 5% distance (safety ceiling)
-      activation_pct: 0.01  # Activate trailing stop after 1% favorable move
+      enabled: true
+      atr_multiplier: 2.0
+      pct_fallback: 0.02
+      min_distance_pct: 0.005
+      max_distance_pct: 0.05
+      activation_pct: 0.025
     take_profit:
-      enabled: true  # RE-ENABLED - ATR-adaptive soft take profit targets with reward bonuses
-      mode: soft_targets  # Options: soft_targets (reward bonus), partial_exits, hard_targets
-      risk_reward_ratio: 2.0  # Target = Stop × R:R ratio (maintains 2:1 R:R with ATR-based stop)
-      # Alternative: Use direct ATR multiplier (if specified, overrides R:R ratio)
-      # atr_multiplier: 4.0  # Target = ATR × 4.0 (for 2:1 R:R with 2.0x stop)
-      pct_fallback: 0.04  # Fallback to 4% if ATR unavailable (2x stop loss for 2:1 R:R)
-      bonus_multiplier: 1.5  # Reward bonus multiplier when target hit (encourages aiming for targets)
-    include_regime_features: false  # Disabled - using base 900-dim state only
-    include_forecast_features: true  # ENABLED - forecast features active from the start
+      enabled: true
+      mode: soft_targets
+      risk_reward_ratio: 1.5
+      pct_fallback: 0.05
+      bonus_multiplier: 1.5
+    include_regime_features: true
+    include_forecast_features: true
     forecast_horizon: 5
-    forecast_cache_steps: 20  # Cache forecasts for N steps (20 = ~20x speedup - maximum performance)
+    forecast_cache_steps: 20
     quality_filters:
-      enabled: false  # Disabled - wasn't in profitable version, allows more trades through
-      min_action_confidence: 0.15  # Not used when disabled
-      min_quality_score: 0.4  # Not used when disabled
-      require_positive_expected_value: false  # Not used when disabled
+      enabled: true
+      min_action_confidence: 0.2
+      min_quality_score: 0.4
+      require_positive_expected_value: false
     bid_ask_spread:
-      enabled: true  # CRITICAL: Enable bid-ask spread modeling for realistic execution prices
-      spread_pct: 0.002  # 0.2% spread (conservative for futures) - accounts for ~$2K-6K per 1000 trades
-      # Note: This is applied to execution prices (entry and exit) to model realistic trading costs
+      enabled: true
+      spread_pct: 0.0005
     volatility_position_sizing:
-      enabled: true  # Enable volatility-normalized position sizing for consistent risk per trade
-      risk_per_trade_pct: 0.01  # 1% of capital risk per trade (standard risk management)
-      atr_period: 14  # ATR period for volatility calculation
-      atr_multiplier: 2.0  # Stop loss distance in ATR multiples
-      min_position_size: 0.01  # Minimum position size (1% of normalized)
-      max_position_size: 1.0  # Maximum position size (100% of normalized)
-      # Note: When enabled, position sizes are normalized so each trade risks the same % of capital
-      # Higher volatility = smaller position, lower volatility = larger position (same risk)
+      enabled: true
+      risk_per_trade_pct: 0.01
+      atr_period: 14
+      atr_multiplier: 2.0
+      min_position_size: 0.01
+      max_position_size: 1.0
     slippage:
-      enabled: false  # Disabled - wasn't in profitable version, reduces costs
+      enabled: false
       base_slippage: 0.00015
       impact_coefficient: 0.0002
       vol_multiplier: 0.0001
@@ -122,9 +156,12 @@ environment:
         normal_hours: 1.0
         after_hours: 2.0
     market_impact:
-      enabled: false  # Disabled - wasn't in profitable version, reduces costs
+      enabled: false
       impact_coefficient: 0.3
       vol_multiplier: 1.0
+    strategy_validator:
+      enabled: true
+      enforcement_level: learning
   portfolio:
     enabled: false
     instruments:
@@ -176,15 +213,14 @@ environment:
   features:
     include_forecast_features: false
 training:
-  total_timesteps: 1000000
-  save_freq: 10000
-  use_decision_gate: false  # Disabled for training - use RL-only like profitable version (DecisionGate was blocking all trades)
+  total_timesteps: 20000000
+  save_freq: 10000                   # Save checkpoint frequency (regular checkpoints)
+  quick_save_freq: 1000              # Quick checkpoint every 1k steps (for faster recovery from failures)
+  use_decision_gate: false
   eval_freq: 10000
-  device: cuda
+  device: "cuda"
   num_envs: 1
-  transfer_learning: false  # FRESH START: Training from scratch with all fixes enabled
-  # transfer_checkpoint: null  # No checkpoint - starting fresh
-  # transfer_strategy: null  # Not applicable for fresh start
+  transfer_learning: false
   adaptive_training:
     enabled: true
     eval_frequency: 5000
@@ -202,6 +238,32 @@ training:
     reward_good_performance: true
     good_win_rate_threshold: 0.5
     good_performance_count: 2
+    
+    # Enhanced Adaptive Learning (Phase 1, 2, 3)
+    # Set to true to enable all enhanced features
+    use_enhanced_adaptive_learning: true  # Set to true to enable
+    
+    # Phase 1: Foundation
+    save_effectiveness_to_file: true       # Always saves if enhanced learning enabled
+    trend_analysis_enabled: true          # Early warning for declining performance
+    oscillation_detection_enabled: true   # Prevent rapid parameter changes
+    trend_window_size: 5                   # Snapshots for trend analysis
+    oscillation_threshold: 3               # Direction changes to detect oscillation
+    
+    # Phase 2: Intelligence
+    pattern_recognition_enabled: true     # Learn from similar past situations
+    effectiveness_optimization_enabled: true  # Use optimal adjustment magnitudes
+    correlation_prioritization_enabled: true  # Focus on most impactful adjustments
+    pattern_similarity_threshold: 0.7      # Minimum similarity (0-1) to match patterns
+    min_pattern_samples: 3                 # Minimum patterns to learn from
+    
+    # Phase 3: Meta-Learning
+    meta_learning_enabled: true           # Learn how to learn better
+    strategy_performance_tracking_enabled: true  # Track which strategies work best
+    optimal_timing_learning_enabled: true # Learn optimal timing for adjustments
+    magnitude_optimization_enabled: true  # Enhanced magnitude optimization
+    meta_learning_window: 20               # Adjustments to analyze for meta-learning
+    strategy_compliance_weight: 0.2        # Weight for compliance in meta-learning (20%)
   train_split: 0.8
   validation_split: 0.1
   early_stopping:
@@ -211,11 +273,11 @@ training:
 risk_management:
   max_position_size: 1.0
   max_drawdown: 0.2
-  max_daily_loss: 0.05  # 5% daily loss limit - explicit risk control
+  max_daily_loss: 0.05
   stop_loss_atr_multiplier: 2.0
   initial_capital: 100000.0
-  commission: 2.0  # Per contract per side (for risk calculations)
-  max_position_fraction_of_balance: 0.02  # 2% risk per trade
+  commission: 2.0
+  max_position_fraction_of_balance: 0.02
   position_value_per_unit: 5000.0
   break_even:
     enabled: true
@@ -295,7 +357,7 @@ agentic_swarm:
 decision_gate:
   rl_weight: 0.6
   swarm_weight: 0.4
-  min_combined_confidence: 0.6  # Increased from 0.7, but training uses 0.3 - will override for quality
+  min_combined_confidence: 0.6
   conflict_reduction_factor: 0.5
   min_confluence_required: 2
   swarm_enabled: true
@@ -303,8 +365,8 @@ decision_gate:
   fallback_to_rl_only: true
   quality_scorer:
     enabled: true
-    min_quality_score: 0.7  # Increased from 0.6 - require higher quality trades
-    min_risk_reward_ratio: 2.0  # Increased to 2.0:1 to account for commission costs - consistent with reward config
+    min_quality_score: 0.7
+    min_risk_reward_ratio: 2.0
     min_profit_margin: 1.5
     min_volatility: 0.01
     min_volume_ratio: 1.2

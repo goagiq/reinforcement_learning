@@ -114,6 +114,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const lastPollTimeRef = useRef(Date.now()) // Store last poll time so refresh can update it
   const startupPhaseRef = useRef(true) // Track if we're in startup phase (first 30 seconds)
   const startupStartTimeRef = useRef(Date.now()) // Track when polling started
+  const pollingPausedRef = useRef(false) // Track if polling should be paused during initialization
   
   // Keep ref updated without triggering re-renders
   useEffect(() => {
@@ -147,6 +148,8 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [cudaAvailable, setCudaAvailable] = useState(false)
   const [gpuInfo, setGpuInfo] = useState(null)
   const [totalTimesteps, setTotalTimesteps] = useState(20000000)
+  const [suggestedTimesteps, setSuggestedTimesteps] = useState(null)
+  const [dataStatistics, setDataStatistics] = useState(null)
   const [reasoningModel, setReasoningModel] = useState('')
   const [configPath, setConfigPathState] = useState('')
   const [availableConfigs, setAvailableConfigs] = useState([])
@@ -157,10 +160,14 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
   const [flushOldData, setFlushOldData] = useState(false) // Clear old training data for fresh start
   const [messages, setMessages] = useState([])
   const [ws, setWs] = useState(null)
-  const [trainingMode, setTrainingMode] = useState('quiet') // 'quiet', 'performance', or 'turbo'
+  const [trainingMode, setTrainingMode] = useState('performance') // 'quiet', 'performance', or 'turbo'
   const [turboModeEnabled, setTurboModeEnabled] = useState(false)
   const [manualTriggerLoading, setManualTriggerLoading] = useState(false)
   const [promoteLoading, setPromoteLoading] = useState(false)
+  const [restoreDataLoading, setRestoreDataLoading] = useState(false)
+  const [preprocessDataLoading, setPreprocessDataLoading] = useState(false)
+  const [restoreDataStatus, setRestoreDataStatus] = useState(null)
+  const [preprocessDataStatus, setPreprocessDataStatus] = useState(null)
   const [transferStrategy, setTransferStrategy] = useState('copy_and_extend') // Transfer learning strategy
   const [checkpointInfo, setCheckpointInfo] = useState(null) // Architecture info for selected checkpoint
   const [configArchitecture, setConfigArchitecture] = useState(null) // Architecture from config
@@ -232,35 +239,57 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
       if (!isMounted) return
       
       try {
+        // In development, try direct connection to backend first, then fallback to proxy
+        const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const wsUrl = `${wsProtocol}//${window.location.host}/ws`
+        
+        // Try direct backend connection in development (port 8200), otherwise use proxy
+        const wsUrl = isDev 
+          ? `${wsProtocol}//localhost:8200/ws`
+          : `${wsProtocol}//${window.location.host}/ws`
+        
+        // Suppress browser console warnings for WebSocket BEFORE connection attempt
+        const originalError = console.error
+        const originalWarn = console.warn
+        const errorFilter = (...args) => {
+          const message = args.join(' ')
+          // Suppress StrictMode-related WebSocket warnings and timeout errors
+          if (message.includes('WebSocket is closed before the connection is established') ||
+              (message.includes('WebSocket connection to') && message.includes('failed')) ||
+              (message.includes('WebSocket opening handshake timed out')) ||
+              (message.includes('WebSocket') && (message.includes('closed') || message.includes('failed')))) {
+            // These are benign StrictMode warnings or expected connection failures
+            return // Suppress these specific warnings
+          }
+          originalError.apply(console, args)
+        }
+        const warnFilter = (...args) => {
+          const message = args.join(' ')
+          // Also suppress WebSocket warnings
+          if (message.includes('WebSocket') && (message.includes('closed') || message.includes('failed'))) {
+            return // Suppress these specific warnings
+          }
+          originalWarn.apply(console, args)
+        }
+        console.error = errorFilter
+        console.warn = warnFilter
         
         // Small delay to avoid React StrictMode immediate cleanup issues
         connectionTimeout = setTimeout(() => {
-          if (!isMounted) return
+          if (!isMounted) {
+            console.error = originalError
+            console.warn = originalWarn
+            return
+          }
           
           try {
-            // Suppress browser console warnings for WebSocket during StrictMode
-            const originalError = console.error
-            const errorFilter = (...args) => {
-              const message = args.join(' ')
-              // Suppress StrictMode-related WebSocket warnings in development
-              if (message.includes('WebSocket is closed before the connection is established') ||
-                  (message.includes('WebSocket connection to') && message.includes('failed') && 
-                   message.includes('localhost:3200/ws'))) {
-                // These are benign StrictMode warnings in development
-                return // Suppress these specific warnings
-              }
-              originalError.apply(console, args)
-            }
-            console.error = errorFilter
-            
             websocket = new WebSocket(wsUrl)
             
-            // Restore console.error after connection attempt
+            // Restore console.error and console.warn after connection attempt (with delay to catch all errors)
             setTimeout(() => {
               console.error = originalError
-            }, 200)
+              console.warn = originalWarn
+            }, 1000)
             
             websocket.onopen = () => {
               if (!isMounted) {
@@ -312,12 +341,16 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
             if (isMounted) {
               console.error('Failed to create WebSocket connection:', error)
             }
+            console.error = originalError
+            console.warn = originalWarn
           }
-        }, 50)
+        }, 100) // Small delay to avoid React StrictMode immediate cleanup
       } catch (error) {
         if (isMounted) {
           console.error('Failed to setup WebSocket connection:', error)
         }
+        console.error = originalError
+        console.warn = originalWarn
       }
     }
 
@@ -405,6 +438,34 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     }
   }, [training]) // Re-run when training state changes
   
+  // Load data statistics and calculate suggested timesteps
+  useEffect(() => {
+    const loadDataStatistics = async () => {
+      try {
+        const response = await axios.get('/api/data/statistics')
+        if (response.data.status === 'success' && response.data.statistics) {
+          const stats = response.data.statistics
+          setDataStatistics(stats)
+          
+          if (stats.suggested_timesteps) {
+            setSuggestedTimesteps(stats.suggested_timesteps)
+            // Auto-update totalTimesteps if it's still at default (only on mount)
+            // This preserves user's manual changes if they reload
+            setTotalTimesteps(prev => {
+              // Only auto-update if still at default value
+              return prev === 20000000 ? stats.suggested_timesteps : prev
+            })
+          }
+        }
+      } catch (error) {
+        console.error('Failed to load data statistics:', error)
+      }
+    }
+    
+    loadDataStatistics()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // Only run on mount
+
   // Load available config files on mount
   useEffect(() => {
     const loadConfigs = async () => {
@@ -498,13 +559,19 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
         const response = await axios.get(`/api/config/read?path=${encodeURIComponent(targetPath)}`)
         const config = response.data.config || {}
         const hiddenDims = config.model?.hidden_dims || [256, 256, 128]
-        const configuredStateDim = config.environment?.state_features
-        const timeframes = config.environment?.timeframes
-        const lookbackBars = config.environment?.lookback_bars
-        const derivedStateDim = Array.isArray(timeframes) && timeframes.length > 0 && lookbackBars
-          ? timeframes.length * 15 * lookbackBars
-          : undefined
-        const stateDim = configuredStateDim ?? derivedStateDim ?? 200
+        
+        // Use calculated_state_dim from backend (calculated from config without hardcoding)
+        // Fallback to calculating from config if backend doesn't provide it
+        let stateDim = response.data.calculated_state_dim
+        if (stateDim === null || stateDim === undefined) {
+          const configuredStateDim = config.environment?.state_features
+          const timeframes = config.environment?.timeframes
+          const lookbackBars = config.environment?.lookback_bars
+          const derivedStateDim = Array.isArray(timeframes) && timeframes.length > 0 && lookbackBars
+            ? timeframes.length * 15 * lookbackBars
+            : undefined
+          stateDim = configuredStateDim ?? derivedStateDim ?? 200
+        }
         
         setConfigArchitecture({
           hidden_dims: hiddenDims,
@@ -658,6 +725,12 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           return
         }
         
+        // CRITICAL: Skip polling if paused (during initialization)
+        if (pollingPausedRef.current) {
+          console.debug('[TrainingPanel] Polling paused - skipping check (initialization in progress)')
+          return
+        }
+        
         pollCount++
         const pollId = pollCount
         
@@ -676,7 +749,7 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           while (retries <= maxRetries && isMounted) {
             try {
               response = await axios.get('/api/training/status', { 
-                timeout: 10000, // Increased to 10 seconds to handle slow backend responses during startup
+                timeout: 10000, // 10 seconds - increased to handle database queries during active training
                 validateStatus: (status) => status < 500 // Don't throw on 4xx, only 5xx
               })
               break // Success, exit retry loop
@@ -931,10 +1004,25 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
     setTraining(true)
     setMessages([])
     
+    // CRITICAL: Pause polling during initialization to avoid timeout errors
+    // Feature normalizer fitting blocks the backend, so polling will timeout
+    console.log('[TrainingPanel] Pausing polling during training initialization...')
+    pollingPausedRef.current = true
+    console.log('[TrainingPanel] Polling paused (will resume after initialization)')
+    
     try {
+      // Auto-apply suggested_timesteps if available and user hasn't manually changed from default
+      // This restores the old architecture behavior of auto-calculating timesteps
+      let timestepsToUse = totalTimesteps
+      if (suggestedTimesteps && (totalTimesteps === 20000000 || !totalTimesteps)) {
+        // Use suggested if still at default or if suggested is available
+        timestepsToUse = suggestedTimesteps
+        console.log(`[TrainingPanel] Auto-applying suggested timesteps: ${suggestedTimesteps.toLocaleString()}`)
+      }
+      
       const requestData = {
         device,
-        total_timesteps: totalTimesteps,
+        total_timesteps: timestepsToUse,
         config_path: configPath
       }
       
@@ -970,8 +1058,82 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
       console.log('📤 Training request data:', JSON.stringify(requestData, null, 2))
       console.log('📡 Sending POST request to /api/training/start...')
       
+      try {
+        const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+        const wsUrl = isDev 
+          ? `${wsProtocol}//localhost:8200/ws`
+          : `${wsProtocol}//${window.location.host}/ws`
+        const warmupSocket = new WebSocket(wsUrl)
+        warmupSocket.onopen = () => {
+          console.log('[TrainingPanel] WebSocket pre-connection established before training start')
+          warmupSocket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          warmupSocket.close()
+        }
+        warmupSocket.onerror = (err) => {
+          console.debug('[TrainingPanel] WebSocket pre-connection error (continuing):', err)
+        }
+      } catch (wsError) {
+        console.debug('[TrainingPanel] Unable to warm up WebSocket (continuing):', wsError)
+      }
+      
       const response = await axios.post('/api/training/start', requestData)
       console.log('✅ Training start request successful:', response.data)
+      
+      // CRITICAL: Wait for RL training to actually begin before resuming polling
+      // Feature normalizer fitting and pretraining block the backend, so polling will timeout
+      console.log('[TrainingPanel] Waiting for RL training to begin before resuming polling...')
+      console.log('[TrainingPanel] This allows initialization (feature normalizer, pretraining) to complete without timeout errors')
+      
+      // Poll status periodically until training is actually running (RL training has begun)
+      // This is better than a fixed delay - we wait until training actually starts
+      let attempts = 0
+      const maxAttempts = 60 // 60 attempts * 2 seconds = 2 minutes max wait
+      let trainingStarted = false
+      
+      while (attempts < maxAttempts && !trainingStarted) {
+        await new Promise(resolve => setTimeout(resolve, 2000)) // Check every 2 seconds
+        
+        try {
+          const statusResponse = await axios.get('/api/training/status', { 
+            timeout: 5000, // Short timeout for quick checks
+            validateStatus: (status) => status < 500
+          })
+          
+          const status = statusResponse.data?.status
+          console.log(`[TrainingPanel] Initialization check #${attempts + 1}: status = ${status}`)
+          
+          // Resume polling when training is actually running (RL training has begun)
+          if (status === 'running') {
+            trainingStarted = true
+            console.log('[TrainingPanel] ✅ RL training has begun - resuming polling')
+            pollingPausedRef.current = false
+            break
+          }
+          
+          // Also resume if training completed/errored (edge case)
+          if (status === 'completed' || status === 'error') {
+            trainingStarted = true
+            console.log(`[TrainingPanel] Training ${status} - resuming polling`)
+            pollingPausedRef.current = false
+            break
+          }
+          
+          attempts++
+        } catch (error) {
+          // Ignore errors during initialization checks - backend is likely busy
+          attempts++
+          if (attempts % 10 === 0) {
+            console.log(`[TrainingPanel] Still waiting for training to start... (attempt ${attempts}/${maxAttempts})`)
+          }
+        }
+      }
+      
+      if (!trainingStarted) {
+        // Timeout waiting - resume polling anyway (training may have started)
+        console.log('[TrainingPanel] ⚠️ Timeout waiting for training to start - resuming polling anyway')
+        pollingPausedRef.current = false
+      }
       
     } catch (error) {
       console.error('❌ Failed to start training:', error)
@@ -996,6 +1158,10 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
         status: 'error',
         message: `Failed to start training: ${errorMessage}`
       })
+      
+      // Resume polling even on error (in case training actually started)
+      console.log('[TrainingPanel] Resuming polling after error (training may have started)')
+      pollingPausedRef.current = false
     }
   }
 
@@ -1005,6 +1171,135 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
       setTraining(false)
     } catch (error) {
       console.error('Failed to stop training:', error)
+    }
+  }
+
+  const handleRestoreData = async () => {
+    setRestoreDataLoading(true)
+    setRestoreDataStatus(null)
+    try {
+      const response = await axios.post('/api/data/restore')
+      console.log('Data restore result:', response.data)
+      
+      if (response.data.status === 'success') {
+        const result = response.data.result
+        setRestoreDataStatus({
+          type: 'success',
+          message: result.message || `Restored ${result.files_copied} files (${result.total_size_mb?.toFixed(1)} MB)`,
+          details: result
+        })
+        
+        // Add to messages
+        setMessages(prev => [...prev, {
+          type: 'data',
+          status: 'completed',
+          message: `Data restored: ${result.files_copied} files copied, ${result.files_skipped} skipped`
+        }])
+      } else {
+        setRestoreDataStatus({
+          type: 'error',
+          message: response.data.message || 'Failed to restore data'
+        })
+        setMessages(prev => [...prev, {
+          type: 'data',
+          status: 'error',
+          message: `Data restore failed: ${response.data.message}`
+        }])
+      }
+    } catch (error) {
+      console.error('Failed to restore data:', error)
+      setRestoreDataStatus({
+        type: 'error',
+        message: error.response?.data?.message || error.message || 'Failed to restore data'
+      })
+      setMessages(prev => [...prev, {
+        type: 'data',
+        status: 'error',
+        message: `Data restore failed: ${error.message}`
+      }])
+    } finally {
+      setRestoreDataLoading(false)
+    }
+  }
+
+  const handlePreprocessData = async () => {
+    setPreprocessDataLoading(true)
+    setPreprocessDataStatus(null)
+    try {
+      const response = await axios.post('/api/data/preprocess', {}, {
+        timeout: 300000 // 5 minute timeout for preprocessing
+      })
+      console.log('Data preprocessing result:', response.data)
+      
+      // Handle "started" status - preprocessing is running in background (legacy support)
+      if (response.data.status === 'started') {
+        setPreprocessDataStatus({
+          type: 'success',
+          message: response.data.message || 'Data preprocessing started in background. This may take several minutes.',
+          cacheFiles: []
+        })
+        
+        // Add to messages
+        setMessages(prev => [...prev, {
+          type: 'data',
+          status: 'running',
+          message: response.data.message || 'Data preprocessing started in background. Check status endpoint for progress.'
+        }])
+        
+        // Note: We don't refresh statistics here since preprocessing is still running
+        // The user can manually refresh or we could add polling later
+      } else if (response.data.status === 'success') {
+        setPreprocessDataStatus({
+          type: 'success',
+          message: response.data.message || 'Data preprocessing completed successfully',
+          cacheFiles: response.data.cache_files || []
+        })
+        
+        // Add to messages
+        setMessages(prev => [...prev, {
+          type: 'data',
+          status: 'completed',
+          message: `Data preprocessing completed: ${response.data.cache_files?.length || 0} cache files created`
+        }])
+        
+        // Refresh data statistics after preprocessing
+        try {
+          const statsResponse = await axios.get('/api/data/statistics')
+          if (statsResponse.data.status === 'success' && statsResponse.data.statistics) {
+            const stats = statsResponse.data.statistics
+            setDataStatistics(stats)
+            if (stats.suggested_timesteps) {
+              setSuggestedTimesteps(stats.suggested_timesteps)
+            }
+          }
+        } catch (err) {
+          console.error('Failed to refresh data statistics:', err)
+        }
+      } else {
+        setPreprocessDataStatus({
+          type: 'error',
+          message: response.data.message || 'Failed to preprocess data',
+          stderr: response.data.stderr
+        })
+        setMessages(prev => [...prev, {
+          type: 'data',
+          status: 'error',
+          message: `Data preprocessing failed: ${response.data.message}`
+        }])
+      }
+    } catch (error) {
+      console.error('Failed to preprocess data:', error)
+      setPreprocessDataStatus({
+        type: 'error',
+        message: error.response?.data?.message || error.message || 'Failed to preprocess data'
+      })
+      setMessages(prev => [...prev, {
+        type: 'data',
+        status: 'error',
+        message: `Data preprocessing failed: ${error.message}`
+      }])
+    } finally {
+      setPreprocessDataLoading(false)
     }
   }
 
@@ -1210,18 +1505,45 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           <div>
             <label className="block text-sm font-semibold text-gray-700 mb-2">
               Total Timesteps
+              {suggestedTimesteps && (
+                <span className="ml-2 text-xs text-blue-600 font-normal">
+                  (Suggested: {suggestedTimesteps.toLocaleString()})
+                </span>
+              )}
             </label>
-            <input
-              type="number"
-              value={totalTimesteps}
-              onChange={(e) => setTotalTimesteps(parseInt(e.target.value))}
-              disabled={training}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
-              min="10000"
-              step="10000"
-            />
+            <div className="flex gap-2">
+              <input
+                type="number"
+                value={totalTimesteps}
+                onChange={(e) => setTotalTimesteps(parseInt(e.target.value) || 0)}
+                disabled={training}
+                className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                min="10000"
+                step="10000"
+              />
+              {suggestedTimesteps && suggestedTimesteps !== totalTimesteps && (
+                <button
+                  type="button"
+                  onClick={() => setTotalTimesteps(suggestedTimesteps)}
+                  disabled={training}
+                  className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold"
+                  title="Use suggested timesteps based on available data"
+                >
+                  Use Suggested
+                </button>
+              )}
+            </div>
             <p className="text-sm text-gray-500 mt-1">
-              More timesteps = longer training time but potentially better results
+              {dataStatistics && dataStatistics.total_bars > 0 ? (
+                <>
+                  Based on <strong>{dataStatistics.total_bars.toLocaleString()} bars</strong> of data available.
+                  {dataStatistics.calculation && (
+                    <> {dataStatistics.calculation.reasoning}</>
+                  )}
+                </>
+              ) : (
+                <>More timesteps = longer training time but potentially better results</>
+              )}
             </p>
           </div>
 
@@ -1290,13 +1612,36 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 </option>
               )}
               {checkpoints.length > 0 && (
-                <optgroup label="Select Specific Checkpoint:">
-                  {checkpoints.map((checkpoint, idx) => (
-                    <option key={idx} value={checkpoint.path}>
-                      checkpoint_{checkpoint.timestep?.toLocaleString() || 'N/A'}.pt ({checkpoint.timestep ? `${(checkpoint.timestep / 1000).toFixed(0)}k timesteps` : 'Unknown'})
-                    </option>
-                  ))}
-                </optgroup>
+                <>
+                  {/* RL Training Checkpoints */}
+                  {checkpoints.filter(c => !c.type || c.type === 'trained').length > 0 && (
+                    <optgroup label="RL Training Checkpoints:">
+                      {checkpoints
+                        .filter(c => !c.type || c.type === 'trained')
+                        .map((checkpoint, idx) => (
+                          <option key={idx} value={checkpoint.path}>
+                            {checkpoint.name || `checkpoint_${checkpoint.timestep?.toLocaleString() || 'N/A'}.pt`} ({checkpoint.timestep ? `${(checkpoint.timestep / 1000).toFixed(0)}k timesteps` : 'Unknown'})
+                          </option>
+                        ))}
+                    </optgroup>
+                  )}
+                  {/* Pretraining Checkpoints */}
+                  {checkpoints.filter(c => c.type === 'pretraining').length > 0 && (
+                    <optgroup label="Pretraining Checkpoints:">
+                      {checkpoints
+                        .filter(c => c.type === 'pretraining')
+                        .map((checkpoint, idx) => {
+                          const pretrainingLabel = checkpoint.pretraining_type === 'unsupervised' ? 'Unsupervised' : 'Supervised'
+                          const epochLabel = checkpoint.epoch ? `Epoch ${checkpoint.epoch}` : checkpoint.name || 'Unknown'
+                          return (
+                            <option key={idx} value={checkpoint.path}>
+                              {checkpoint.name || `checkpoint_epoch_${checkpoint.epoch || 'N/A'}.pt`} ({pretrainingLabel} Pretraining, {epochLabel})
+                            </option>
+                          )
+                        })}
+                    </optgroup>
+                  )}
+                </>
               )}
             </select>
             
@@ -1403,15 +1748,16 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                     🗑️ Clear old training data (database, caches)
                   </span>
                 </label>
-                <p className="text-sm text-yellow-700 mt-2 ml-6">
-                  When enabled, this will:
+                <div className="text-sm text-yellow-700 mt-2 ml-6">
+                  <p>When enabled, this will:</p>
                   <ul className="list-disc list-inside mt-1 space-y-1">
+                    <li>Archive and remove all checkpoints (RL checkpoints, pretraining checkpoints, best_model.pt, etc.)</li>
                     <li>Archive and clear the trading journal database</li>
                     <li>Clear cache files (known_files_cache.json, etc.)</li>
                     <li>Ensure metrics show only new training data</li>
                   </ul>
-                  <span className="font-semibold">Note: Old data will be backed up to logs/trading_journal_archive/ before clearing.</span>
-                </p>
+                  <p className="font-semibold mt-2">Note: All checkpoints will be archived to models/Archive/checkpoints_[timestamp]/ and old data will be backed up to logs/trading_journal_archive/ before clearing.</p>
+                </div>
               </div>
             )}
           </div>
@@ -1459,15 +1805,45 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
           {/* Status */}
           {trainingStatus && (
             <div className={`
-              p-4 rounded-lg flex items-center gap-3
+              p-4 rounded-lg
               ${trainingStatus.status === 'running' ? 'bg-blue-50 text-blue-700' : ''}
+              ${trainingStatus.status === 'starting' ? 'bg-purple-50 text-purple-700' : ''}
               ${trainingStatus.status === 'completed' ? 'bg-green-50 text-green-700' : ''}
               ${trainingStatus.status === 'error' ? 'bg-red-50 text-red-700' : ''}
             `}>
-              {trainingStatus.status === 'running' && <Loader className="w-5 h-5 animate-spin" />}
-              {trainingStatus.status === 'completed' && <CheckCircle className="w-5 h-5" />}
-              {trainingStatus.status === 'error' && <AlertCircle className="w-5 h-5" />}
-              <span>{trainingStatus.message}</span>
+              <div className="flex items-center gap-3">
+                {trainingStatus.status === 'running' && <Loader className="w-5 h-5 animate-spin" />}
+                {trainingStatus.status === 'starting' && <Loader className="w-5 h-5 animate-spin" />}
+                {trainingStatus.status === 'completed' && <CheckCircle className="w-5 h-5" />}
+                {trainingStatus.status === 'error' && <AlertCircle className="w-5 h-5" />}
+                <span className="flex-1">{trainingStatus.message}</span>
+              </div>
+              
+              {/* Pretraining Progress Bar */}
+              {trainingStatus.pretraining && trainingStatus.pretraining_progress !== undefined && (
+                <div className="mt-3">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-sm font-medium">
+                      {trainingStatus.pretraining_phase === 'preparing_data' && '📊 Preparing Data'}
+                      {trainingStatus.pretraining_phase === 'training' && '🎯 Training Actor Network'}
+                      {trainingStatus.pretraining_phase === 'initializing' && '⚙️ Initializing'}
+                      {!trainingStatus.pretraining_phase && 'Pretraining'}
+                    </span>
+                    <span className="text-sm text-gray-600">
+                      {Math.round(trainingStatus.pretraining_progress * 100)}%
+                    </span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2.5">
+                    <div
+                      className="bg-purple-600 h-2.5 rounded-full transition-all duration-300"
+                      style={{ width: `${trainingStatus.pretraining_progress * 100}%` }}
+                    ></div>
+                  </div>
+                  {trainingStatus.pretraining_message && (
+                    <p className="text-xs text-gray-600 mt-1">{trainingStatus.pretraining_message}</p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -1514,7 +1890,112 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
                 </>
               )}
             </button>
+            
+            {/* Restore Data Files Button */}
+            <button
+              onClick={handleRestoreData}
+              disabled={restoreDataLoading || training}
+              className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2"
+              title="Restore NT8 data files from archive directory to data/raw folder"
+            >
+              {restoreDataLoading ? (
+                <>
+                  <Loader className="w-5 h-5 animate-spin" />
+                  <span>Restoring...</span>
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-5 h-5" />
+                  <span>Restore Data Files</span>
+                </>
+              )}
+            </button>
+            
+            {/* Preprocess Data Button */}
+            <button
+              onClick={handlePreprocessData}
+              disabled={preprocessDataLoading || training}
+              className="px-6 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2"
+              title="Pre-process all data files and create cache files for fast training initialization"
+            >
+              {preprocessDataLoading ? (
+                <>
+                  <Loader className="w-5 h-5 animate-spin" />
+                  <span>Preprocessing...</span>
+                </>
+              ) : (
+                <>
+                  <Cpu className="w-5 h-5" />
+                  <span>Preprocess All Data</span>
+                </>
+              )}
+            </button>
           </div>
+          
+          {/* Status Messages for Data Operations */}
+          {restoreDataStatus && (
+            <div className={`mt-4 p-4 rounded-lg ${
+              restoreDataStatus.type === 'success' ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'
+            }`}>
+              <div className="flex items-center gap-2">
+                {restoreDataStatus.type === 'success' ? (
+                  <CheckCircle className="w-5 h-5 text-green-600" />
+                ) : (
+                  <AlertCircle className="w-5 h-5 text-red-600" />
+                )}
+                <span className={`font-semibold ${
+                  restoreDataStatus.type === 'success' ? 'text-green-800' : 'text-red-800'
+                }`}>
+                  {restoreDataStatus.message}
+                </span>
+              </div>
+              {restoreDataStatus.details && (
+                <div className="mt-2 text-sm text-gray-600">
+                  <p>Files found: {restoreDataStatus.details.files_found}</p>
+                  <p>Files copied: {restoreDataStatus.details.files_copied}</p>
+                  <p>Files skipped: {restoreDataStatus.details.files_skipped}</p>
+                  {restoreDataStatus.details.files_failed > 0 && (
+                    <p className="text-red-600">Files failed: {restoreDataStatus.details.files_failed}</p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          
+          {preprocessDataStatus && (
+            <div className={`mt-4 p-4 rounded-lg ${
+              preprocessDataStatus.type === 'success' ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'
+            }`}>
+              <div className="flex items-center gap-2">
+                {preprocessDataStatus.type === 'success' ? (
+                  <CheckCircle className="w-5 h-5 text-green-600" />
+                ) : (
+                  <AlertCircle className="w-5 h-5 text-red-600" />
+                )}
+                <span className={`font-semibold ${
+                  preprocessDataStatus.type === 'success' ? 'text-green-800' : 'text-red-800'
+                }`}>
+                  {preprocessDataStatus.message}
+                </span>
+              </div>
+              {preprocessDataStatus.cacheFiles && preprocessDataStatus.cacheFiles.length > 0 && (
+                <div className="mt-2 text-sm text-gray-600">
+                  <p className="font-semibold">Cache files created:</p>
+                  <ul className="list-disc list-inside ml-2">
+                    {preprocessDataStatus.cacheFiles.map((file, idx) => (
+                      <li key={idx}>{file}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {preprocessDataStatus.stderr && (
+                <div className="mt-2 text-sm text-red-600 font-mono">
+                  <p className="font-semibold">Error output:</p>
+                  <pre className="whitespace-pre-wrap text-xs">{preprocessDataStatus.stderr}</pre>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -2043,6 +2524,538 @@ const TrainingPanel = ({ models = [], onModelsChange }) => {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Trading Performance Diagnostic Analysis */}
+      <TradingPerformanceDiagnostic />
+    </div>
+  )
+}
+
+// Trading Performance Diagnostic Component
+const TradingPerformanceDiagnostic = () => {
+  const [analysisData, setAnalysisData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+  const [expandedSections, setExpandedSections] = useState({
+    overall: true,
+    exitReasons: true,
+    directions: true,
+    compliance: false,
+    recentTrades: false,
+    commission: false,
+    priceMovements: true
+  })
+
+  const runAnalysis = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await axios.get('/api/training/analyze-performance')
+      if (response.data.status === 'success') {
+        setAnalysisData(response.data.data)
+      } else {
+        setError(response.data.message || 'Analysis failed')
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || err.message || 'Failed to run analysis')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggleSection = (section) => {
+    setExpandedSections(prev => ({
+      ...prev,
+      [section]: !prev[section]
+    }))
+  }
+
+  // Generate critical findings summary
+  const generateCriticalFindings = () => {
+    if (!analysisData) return null
+
+    const findings = []
+    const warnings = []
+    const recommendations = []
+
+    // Check overall statistics
+    if (analysisData.overall) {
+      const overall = analysisData.overall
+      
+      // Win rate check
+      if (overall.win_rate < 30) {
+        findings.push({
+          severity: 'critical',
+          title: 'Very Low Win Rate',
+          message: `Win rate is ${overall.win_rate.toFixed(1)}% (${overall.wins} wins / ${overall.total_trades} trades). Target: 40%+`,
+          icon: '🔴'
+        })
+      } else if (overall.win_rate < 40) {
+        findings.push({
+          severity: 'warning',
+          title: 'Low Win Rate',
+          message: `Win rate is ${overall.win_rate.toFixed(1)}% (${overall.wins} wins / ${overall.total_trades} trades). Target: 40%+`,
+          icon: '⚠️'
+        })
+      }
+
+      // Risk/Reward check
+      if (overall.risk_reward_ratio < 1.0) {
+        findings.push({
+          severity: 'critical',
+          title: 'Poor Risk/Reward Ratio',
+          message: `Risk/Reward is ${overall.risk_reward_ratio.toFixed(2)}:1 (losses ${(1/overall.risk_reward_ratio).toFixed(1)}x larger than wins). Target: 1.5:1+`,
+          icon: '🔴'
+        })
+      } else if (overall.risk_reward_ratio < 1.5) {
+        findings.push({
+          severity: 'warning',
+          title: 'Suboptimal Risk/Reward',
+          message: `Risk/Reward is ${overall.risk_reward_ratio.toFixed(2)}:1. Target: 1.5:1+`,
+          icon: '⚠️'
+        })
+      }
+
+      // Total PnL check
+      if (overall.total_pnl < -1000) {
+        findings.push({
+          severity: 'critical',
+          title: 'Significant Losses',
+          message: `Total PnL is -$${Math.abs(overall.total_pnl).toFixed(2)}. Immediate action required.`,
+          icon: '🔴'
+        })
+      } else if (overall.total_pnl < 0) {
+        findings.push({
+          severity: 'warning',
+          title: 'Negative PnL',
+          message: `Total PnL is -$${Math.abs(overall.total_pnl).toFixed(2)}. Review trading strategy.`,
+          icon: '⚠️'
+        })
+      }
+    }
+
+    // Check for sign reversal (CRITICAL)
+    if (analysisData.price_movements) {
+      analysisData.price_movements.forEach(pm => {
+        if (pm.warnings && pm.warnings.length > 0) {
+          findings.push({
+            severity: 'critical',
+            title: 'Sign Reversal Detected',
+            message: `${pm.direction} trades: ${pm.warnings[0]}. Model may be trading in opposite direction.`,
+            icon: '🔴'
+          })
+          warnings.push('Sign reversal bug detected - model trading against price movement')
+        }
+      })
+    }
+
+    // Check exit reasons for high reversal rate
+    if (analysisData.exit_reasons) {
+      const reversalExit = analysisData.exit_reasons.find(er => 
+        er.exit_reason && er.exit_reason.toUpperCase().includes('REVERSAL')
+      )
+      if (reversalExit && reversalExit.percentage > 50) {
+        findings.push({
+          severity: 'warning',
+          title: 'High Reversal Rate',
+          message: `${reversalExit.percentage.toFixed(1)}% of exits are reversals. Consider increasing action threshold.`,
+          icon: '⚠️'
+        })
+      }
+    }
+
+    // Check strategy compliance
+    if (analysisData.strategy_compliance && analysisData.strategy_compliance.length > 0) {
+      const compliant = analysisData.strategy_compliance.find(c => c.compliance === 'Compliant')
+      const nonCompliant = analysisData.strategy_compliance.find(c => c.compliance === 'Non-Compliant')
+      
+      if (compliant && nonCompliant) {
+        const compliantWinRate = compliant.win_rate
+        const nonCompliantWinRate = nonCompliant.win_rate
+        
+        if (compliantWinRate > nonCompliantWinRate + 10) {
+          findings.push({
+            severity: 'info',
+            title: 'Strategy Compliance Helps',
+            message: `Compliant trades: ${compliantWinRate.toFixed(1)}% win rate vs ${nonCompliantWinRate.toFixed(1)}% for non-compliant.`,
+            icon: '✅'
+          })
+        } else if (nonCompliantWinRate > compliantWinRate + 10) {
+          findings.push({
+            severity: 'warning',
+            title: 'Strategy Compliance Not Helping',
+            message: `Non-compliant trades: ${nonCompliantWinRate.toFixed(1)}% win rate vs ${compliantWinRate.toFixed(1)}% for compliant. Review strategy rules.`,
+            icon: '⚠️'
+          })
+        }
+      }
+    }
+
+    // Check commission impact
+    if (analysisData.commission && analysisData.overall) {
+      const avgWin = analysisData.overall.avg_win
+      const avgCommission = analysisData.commission.avg_commission
+      if (avgWin > 0 && avgCommission > 0 && avgCommission / avgWin > 0.3) {
+        findings.push({
+          severity: 'warning',
+          title: 'High Commission Impact',
+          message: `Commission ($${avgCommission.toFixed(2)}) is ${((avgCommission/avgWin)*100).toFixed(0)}% of average win ($${avgWin.toFixed(2)}). Consider reducing costs.`,
+          icon: '⚠️'
+        })
+      }
+    }
+
+    // Generate recommendations based on findings
+    if (findings.some(f => f.severity === 'critical' && f.title.includes('Sign Reversal'))) {
+      recommendations.push('CRITICAL: Investigate sign reversal - check reward function and pretraining labels')
+    }
+    if (findings.some(f => f.severity === 'critical' && f.title.includes('Win Rate'))) {
+      recommendations.push('Review model training - win rate below 30% indicates fundamental issues')
+    }
+    if (findings.some(f => f.title.includes('Risk/Reward'))) {
+      recommendations.push('Adjust stop loss and take profit targets to improve risk/reward ratio')
+    }
+    if (findings.some(f => f.title.includes('Reversal'))) {
+      recommendations.push('Increase action threshold to reduce frequent position reversals')
+    }
+
+    return { findings, recommendations }
+  }
+
+  const criticalFindings = generateCriticalFindings()
+
+  return (
+    <div className="bg-white rounded-lg shadow p-6">
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-800">Trading Performance Diagnostic</h2>
+          <p className="text-sm text-gray-600 mt-1">
+            Analyze trading journal to identify issues with win rate, direction, strategy compliance, and more
+          </p>
+        </div>
+        <button
+          onClick={runAnalysis}
+          disabled={loading}
+          className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+        >
+          {loading ? (
+            <>
+              <Loader className="w-4 h-4 animate-spin" />
+              Analyzing...
+            </>
+          ) : (
+            <>
+              <RefreshCw className="w-4 h-4" />
+              Run Analysis
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Critical Findings Summary */}
+      {criticalFindings && criticalFindings.findings && criticalFindings.findings.length > 0 && (
+        <div className="mb-6 border-l-4 border-yellow-500 bg-yellow-50 rounded-lg p-4">
+          <h3 className="text-lg font-bold text-gray-800 mb-3 flex items-center gap-2">
+            <AlertCircle className="w-5 h-5 text-yellow-600" />
+            Critical Findings Summary
+          </h3>
+          <div className="space-y-3">
+            {criticalFindings.findings.map((finding, idx) => (
+              <div
+                key={idx}
+                className={`p-3 rounded-lg ${
+                  finding.severity === 'critical' ? 'bg-red-50 border border-red-200' :
+                  finding.severity === 'warning' ? 'bg-yellow-50 border border-yellow-200' :
+                  'bg-blue-50 border border-blue-200'
+                }`}
+              >
+                <div className="flex items-start gap-2">
+                  <span className="text-lg">{finding.icon}</span>
+                  <div className="flex-1">
+                    <div className={`font-semibold ${
+                      finding.severity === 'critical' ? 'text-red-800' :
+                      finding.severity === 'warning' ? 'text-yellow-800' :
+                      'text-blue-800'
+                    }`}>
+                      {finding.title}
+                    </div>
+                    <div className={`text-sm mt-1 ${
+                      finding.severity === 'critical' ? 'text-red-700' :
+                      finding.severity === 'warning' ? 'text-yellow-700' :
+                      'text-blue-700'
+                    }`}>
+                      {finding.message}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {criticalFindings.recommendations && criticalFindings.recommendations.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-yellow-300">
+              <div className="font-semibold text-gray-800 mb-2">Recommendations:</div>
+              <ul className="list-disc list-inside space-y-1 text-sm text-gray-700">
+                {criticalFindings.recommendations.map((rec, idx) => (
+                  <li key={idx}>{rec}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          {error}
+        </div>
+      )}
+
+      {analysisData && (
+        <div className="space-y-4">
+          {/* Overall Statistics */}
+          {analysisData.overall && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('overall')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[1] Overall Statistics</span>
+                <span>{expandedSections.overall ? '−' : '+'}</span>
+              </button>
+              {expandedSections.overall && (
+                <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="bg-blue-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Total Trades</div>
+                    <div className="text-xl font-bold text-blue-700">{analysisData.overall.total_trades}</div>
+                  </div>
+                  <div className="bg-green-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Winning Trades</div>
+                    <div className="text-xl font-bold text-green-700">{analysisData.overall.wins}</div>
+                  </div>
+                  <div className="bg-red-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Losing Trades</div>
+                    <div className="text-xl font-bold text-red-700">{analysisData.overall.losses}</div>
+                  </div>
+                  <div className="bg-purple-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Win Rate</div>
+                    <div className="text-xl font-bold text-purple-700">{analysisData.overall.win_rate.toFixed(2)}%</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Avg PnL</div>
+                    <div className={`text-xl font-bold ${analysisData.overall.avg_pnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                      ${analysisData.overall.avg_pnl.toFixed(2)}
+                    </div>
+                  </div>
+                  <div className="bg-green-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Avg Win</div>
+                    <div className="text-xl font-bold text-green-700">${analysisData.overall.avg_win.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-red-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Avg Loss</div>
+                    <div className="text-xl font-bold text-red-700">${analysisData.overall.avg_loss.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-yellow-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Risk/Reward</div>
+                    <div className="text-xl font-bold text-yellow-700">{analysisData.overall.risk_reward_ratio.toFixed(2)}:1</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-3 col-span-2 md:col-span-4">
+                    <div className="text-xs text-gray-600 mb-1">Total PnL</div>
+                    <div className={`text-2xl font-bold ${analysisData.overall.total_pnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                      ${analysisData.overall.total_pnl.toFixed(2)}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Exit Reason Breakdown */}
+          {analysisData.exit_reasons && analysisData.exit_reasons.length > 0 && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('exitReasons')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[2] Exit Reason Breakdown</span>
+                <span>{expandedSections.exitReasons ? '−' : '+'}</span>
+              </button>
+              {expandedSections.exitReasons && (
+                <div className="mt-4 space-y-2">
+                  {analysisData.exit_reasons.map((reason, idx) => (
+                    <div key={idx} className="bg-gray-50 rounded-lg p-3">
+                      <div className="font-semibold text-gray-800">{reason.exit_reason}</div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-sm">
+                        <div>Count: {reason.count} ({reason.percentage.toFixed(1)}%)</div>
+                        <div>Win Rate: {reason.win_rate.toFixed(1)}%</div>
+                        <div>Avg PnL: ${reason.avg_pnl.toFixed(2)}</div>
+                        <div>Total PnL: ${reason.total_pnl.toFixed(2)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Direction Breakdown */}
+          {analysisData.directions && analysisData.directions.length > 0 && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('directions')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[3] Direction Breakdown (LONG vs SHORT)</span>
+                <span>{expandedSections.directions ? '−' : '+'}</span>
+              </button>
+              {expandedSections.directions && (
+                <div className="mt-4 space-y-2">
+                  {analysisData.directions.map((dir, idx) => (
+                    <div key={idx} className="bg-gray-50 rounded-lg p-3">
+                      <div className="font-semibold text-gray-800">{dir.direction}</div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-sm">
+                        <div>Total: {dir.total}</div>
+                        <div>Wins: {dir.wins}</div>
+                        <div>Win Rate: {dir.win_rate.toFixed(1)}%</div>
+                        <div>Avg Win: ${dir.avg_win.toFixed(2)}</div>
+                        <div>Avg Loss: ${dir.avg_loss.toFixed(2)}</div>
+                        <div className={`col-span-2 md:col-span-4 ${dir.total_pnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                          Total PnL: ${dir.total_pnl.toFixed(2)}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Strategy Compliance */}
+          {analysisData.strategy_compliance && analysisData.strategy_compliance.length > 0 && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('compliance')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[4] Strategy Compliance Breakdown</span>
+                <span>{expandedSections.compliance ? '−' : '+'}</span>
+              </button>
+              {expandedSections.compliance && (
+                <div className="mt-4 space-y-2">
+                  {analysisData.strategy_compliance.map((comp, idx) => (
+                    <div key={idx} className="bg-gray-50 rounded-lg p-3">
+                      <div className="font-semibold text-gray-800">{comp.compliance}</div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-sm">
+                        <div>Total: {comp.total}</div>
+                        <div>Wins: {comp.wins}</div>
+                        <div>Win Rate: {comp.win_rate.toFixed(1)}%</div>
+                        <div>Avg PnL: ${comp.avg_pnl.toFixed(2)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Recent Trades */}
+          {analysisData.recent_trades && analysisData.recent_trades.length > 0 && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('recentTrades')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[5] Recent Trades (Last 20)</span>
+                <span>{expandedSections.recentTrades ? '−' : '+'}</span>
+              </button>
+              {expandedSections.recentTrades && (
+                <div className="mt-4 space-y-1 max-h-96 overflow-y-auto">
+                  {analysisData.recent_trades.map((trade, idx) => (
+                    <div key={idx} className={`p-2 rounded text-sm ${trade.is_win ? 'bg-green-50' : 'bg-red-50'}`}>
+                      <span className="font-semibold">Trade #{trade.trade_id}:</span> {trade.direction} {trade.is_win ? 'WIN' : 'LOSS'} ${trade.net_pnl.toFixed(2)} 
+                      (Ep {trade.episode}, {trade.exit_reason}, Compliant: {trade.strategy_compliant === true ? '✓' : trade.strategy_compliant === false ? '✗' : '?'})
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Commission Impact */}
+          {analysisData.commission && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('commission')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[6] Commission Impact Analysis</span>
+                <span>{expandedSections.commission ? '−' : '+'}</span>
+              </button>
+              {expandedSections.commission && (
+                <div className="mt-4 grid grid-cols-2 md:grid-cols-5 gap-4">
+                  <div className="bg-gray-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Avg Commission</div>
+                    <div className="text-lg font-bold text-gray-800">${analysisData.commission.avg_commission.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-green-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Avg (Wins)</div>
+                    <div className="text-lg font-bold text-green-700">${analysisData.commission.avg_commission_win.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-red-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Avg (Losses)</div>
+                    <div className="text-lg font-bold text-red-700">${analysisData.commission.avg_commission_loss.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-yellow-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Total Commission</div>
+                    <div className="text-lg font-bold text-yellow-700">${analysisData.commission.total_commission.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-blue-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-600 mb-1">Per Trade</div>
+                    <div className="text-lg font-bold text-blue-700">${analysisData.commission.commission_per_trade.toFixed(2)}</div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Price Movement Analysis */}
+          {analysisData.price_movements && analysisData.price_movements.length > 0 && (
+            <div className="border rounded-lg p-4">
+              <button
+                onClick={() => toggleSection('priceMovements')}
+                className="w-full flex items-center justify-between text-left font-semibold text-gray-800 mb-2"
+              >
+                <span>[7] Price Movement Analysis</span>
+                <span>{expandedSections.priceMovements ? '−' : '+'}</span>
+              </button>
+              {expandedSections.priceMovements && (
+                <div className="mt-4 space-y-2">
+                  {analysisData.price_movements.map((pm, idx) => (
+                    <div key={idx} className="bg-gray-50 rounded-lg p-3">
+                      <div className="font-semibold text-gray-800">{pm.direction}</div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-sm">
+                        <div>Avg Price Move: {pm.avg_price_move_pct.toFixed(3)}%</div>
+                        <div>Avg Win Move: {pm.avg_win_move_pct.toFixed(3)}%</div>
+                        <div>Avg Loss Move: {pm.avg_loss_move_pct.toFixed(3)}%</div>
+                      </div>
+                      {pm.warnings && pm.warnings.length > 0 && (
+                        <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-yellow-800 text-sm">
+                          ⚠️ {pm.warnings.join(', ')}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!analysisData && !loading && !error && (
+        <div className="text-center py-8 text-gray-500">
+          <p>Click "Run Analysis" to analyze trading performance from the journal database</p>
         </div>
       )}
     </div>

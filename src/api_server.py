@@ -50,6 +50,16 @@ from src.ai_analysis_service import generate_analysis, record_feedback
 from src.capability_registry import list_capabilities_by_tab, get_capability
 from src.utils.colors import error, warn
 
+# Deep Research System
+try:
+    from src.deep_research.deep_research_system import DeepResearchSystem
+    from src.deep_research.preferences.feedback_tracker import FeedbackType
+    DEEP_RESEARCH_AVAILABLE = True
+except ImportError:
+    DEEP_RESEARCH_AVAILABLE = False
+    DeepResearchSystem = None
+    FeedbackType = None
+
 # Monte Carlo risk assessment
 try:
     from src.monte_carlo_risk import (
@@ -117,6 +127,22 @@ websocket_connections: List[WebSocket] = []
 main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 auto_retrain_monitor: Optional[AutoRetrainMonitor] = None
 
+# Deep Research System (lazy initialization)
+deep_research_system: Optional[DeepResearchSystem] = None
+
+def get_deep_research_system() -> Optional[DeepResearchSystem]:
+    """Get or initialize Deep Research System"""
+    global deep_research_system
+    if not DEEP_RESEARCH_AVAILABLE:
+        return None
+    if deep_research_system is None:
+        try:
+            deep_research_system = DeepResearchSystem()
+        except Exception as e:
+            print(f"Warning: Failed to initialize Deep Research System: {e}")
+            return None
+    return deep_research_system
+
 
 # Pydantic models
 class SetupCheckResponse(BaseModel):
@@ -144,6 +170,27 @@ class BacktestRequest(BaseModel):
     model_path: str
     episodes: int = 20
     config_path: str = "configs/train_config_full.yaml"
+
+
+class ResearchSearchRequest(BaseModel):
+    query: str
+    sources: Optional[List[str]] = None
+    max_results: int = 20
+
+
+class ResearchFetchRequest(BaseModel):
+    source_type: str
+    source_id: str
+    store: bool = True
+    generate_plan: bool = False
+    generate_doc: bool = False
+
+
+class ResearchFeedbackRequest(BaseModel):
+    item_id: str
+    feedback_type: str
+    metadata: Optional[Dict[str, Any]] = None
+    notes: Optional[str] = None
 
 
 class LiveTradingRequest(BaseModel):
@@ -706,8 +753,9 @@ async def get_data_statistics():
             "cache_available": False
         }
         
-        # Check for cached files
+        # Check for cached files first
         total_bars = 0
+        cache_found = False
         
         for timeframe in timeframes:
             cache_file_parquet = processed_dir / f"{instrument}_{timeframe}min_processed.parquet"
@@ -720,10 +768,12 @@ async def get_data_statistics():
                 cache_file = cache_file_parquet
                 cache_format = "parquet"
                 statistics["cache_available"] = True
+                cache_found = True
             elif cache_file_pkl.exists():
                 cache_file = cache_file_pkl
                 cache_format = "pickle"
                 statistics["cache_available"] = True
+                cache_found = True
             
             if cache_file:
                 try:
@@ -764,6 +814,39 @@ async def get_data_statistics():
                     "cache_file": None,
                     "cache_available": False
                 }
+        
+        # If no cached files, estimate from raw files (like old architecture)
+        if not cache_found and total_bars == 0:
+            raw_dir = Path("data/raw")
+            if raw_dir.exists():
+                # Count .Last.txt files (these contain 1-minute bars)
+                last_files = list(raw_dir.glob(f"{instrument}*.Last.txt"))
+                statistics["raw_files_count"] = len(last_files)
+                
+                if last_files:
+                    # Estimate bars: Each .Last.txt file typically contains ~390 bars per trading day
+                    # For 61 files, estimate based on file count
+                    # Conservative estimate: ~200,000 bars per file (varies by file size)
+                    estimated_bars_per_file = 200_000  # Conservative estimate
+                    total_bars = len(last_files) * estimated_bars_per_file
+                    
+                    # More accurate: Try to count lines in a sample file
+                    try:
+                        sample_file = last_files[0]
+                        with open(sample_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            # Count non-empty, non-comment lines
+                            line_count = sum(1 for line in f if line.strip() and not line.strip().startswith('#'))
+                            if line_count > 0:
+                                # Use average from sample, but cap at reasonable max
+                                avg_bars_per_file = min(line_count, 500_000)  # Cap at 500k per file
+                                total_bars = len(last_files) * avg_bars_per_file
+                                statistics["calculation_method"] = "estimated_from_raw_files"
+                                statistics["sample_file"] = sample_file.name
+                                statistics["sample_file_bars"] = line_count
+                    except Exception as e:
+                        # Fallback to conservative estimate
+                        statistics["calculation_method"] = "estimated_from_file_count"
+                        statistics["estimation_note"] = f"Could not read sample file: {e}"
         
         # Calculate suggested total_timesteps based on available data
         # Formula: For large datasets, suggest 10-20M timesteps to allow multiple passes through data
@@ -849,7 +932,7 @@ async def list_configs():
 
 @app.get("/api/config/read")
 async def read_config(path: str):
-    """Read a config file and return its contents"""
+    """Read a config file and return its contents with calculated state_dim"""
     try:
         from pathlib import Path
         import yaml
@@ -871,10 +954,41 @@ async def read_config(path: str):
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
         
+        # Calculate actual state_dim from config (matching trading_env.py logic)
+        calculated_state_dim = None
+        if config and "environment" in config:
+            env_config = config["environment"]
+            reward_config = env_config.get("reward", {}) if isinstance(env_config.get("reward"), dict) else {}
+            
+            # Get base state_dim from state_features or calculate from timeframes/lookback
+            base_state_dim = env_config.get("state_features")
+            if base_state_dim is None:
+                # Calculate from timeframes and lookback_bars (15 features per timeframe)
+                timeframes = env_config.get("timeframes", [1, 5, 15])
+                lookback_bars = env_config.get("lookback_bars", 20)
+                features_per_tf = 15  # OHLCV (5) + volume_ratio (1) + returns (1) + indicators (8)
+                if isinstance(timeframes, list) and lookback_bars:
+                    base_state_dim = features_per_tf * len(timeframes) * lookback_bars
+                else:
+                    base_state_dim = 900  # Default fallback
+                
+                # If state_features was not explicitly set, add additional features based on reward config
+                regime_features_dim = 5 if reward_config.get("include_regime_features", False) else 0
+                forecast_features_dim = 3 if reward_config.get("include_forecast_features", False) else 0
+                strategy_validator_config = reward_config.get("strategy_validator", {})
+                strategy_enabled = strategy_validator_config.get("enabled", False) if isinstance(strategy_validator_config, dict) else False
+                strategy_features_dim = 8 if strategy_enabled else 0
+                
+                calculated_state_dim = base_state_dim + regime_features_dim + forecast_features_dim + strategy_features_dim
+            else:
+                # state_features is explicitly set - use it as-is (it already includes all features)
+                calculated_state_dim = base_state_dim
+        
         return {
             "path": str(config_file),
             "exists": True,
-            "config": config
+            "config": config,
+            "calculated_state_dim": calculated_state_dim
         }
     except Exception as e:
         import traceback
@@ -1134,6 +1248,16 @@ async def shutdown_event():
 @app.post("/api/training/start")
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
     """Start model training"""
+    # CRITICAL: Log immediately when endpoint is called (before any processing)
+    import sys
+    sys.stdout.flush()  # Force immediate output
+    print(f"\n{'='*80}")
+    print(f"[API] /api/training/start ENDPOINT CALLED")
+    print(f"[API] Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[API] Checkpoint path from request: {request.checkpoint_path}")
+    print(f"{'='*80}\n")
+    sys.stdout.flush()  # Force immediate output
+    
     if "training" in active_systems:
         system = active_systems["training"]
         thread_alive = system.get("thread") and system["thread"].is_alive()
@@ -1165,14 +1289,22 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             clear_result = clear_all_training_data(
                 archive_db=True,  # Archive old database before clearing
                 clear_caches_flag=True,  # Clear cache files
-                clear_processed=False  # Keep processed data (can be regenerated)
+                clear_processed=False,  # Keep processed data (can be regenerated)
+                archive_checkpoints_flag=True  # Archive and remove all checkpoints
             )
             if clear_result.get("success"):
                 print(f"[OK] Old training data flushed successfully")
-                print(f"   Journal: {clear_result['journal'].get('message', 'N/A')}")
-                print(f"   Caches: {clear_result['caches'].get('message', 'N/A')}")
-                if clear_result.get("journal", {}).get("backup_path"):
-                    print(f"   Backup: {clear_result['journal']['backup_path']}")
+                if clear_result.get("checkpoints"):
+                    checkpoint_info = clear_result['checkpoints']
+                    print(f"   Checkpoints: {checkpoint_info.get('message', 'N/A')}")
+                    if checkpoint_info.get("backup_path"):
+                        print(f"   Checkpoint Archive: {checkpoint_info['backup_path']}")
+                if clear_result.get("journal"):
+                    print(f"   Journal: {clear_result['journal'].get('message', 'N/A')}")
+                    if clear_result['journal'].get("backup_path"):
+                        print(f"   Journal Backup: {clear_result['journal']['backup_path']}")
+                if clear_result.get("caches"):
+                    print(f"   Caches: {clear_result['caches'].get('message', 'N/A')}")
             else:
                 print(warn(f"[WARN] Some data clearing operations failed: {clear_result.get('message', 'Unknown error')}"))
         except Exception as e:
@@ -1278,10 +1410,14 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             if request.checkpoint_path:
                 print(f"ðŸ” Attempting to resume from checkpoint: {request.checkpoint_path}")
                 from pathlib import Path
-                checkpoint_test = Path(str(request.checkpoint_path).replace('\\', '/'))
+                normalized_str = str(request.checkpoint_path).replace('\\', '/')
+                checkpoint_test = Path(normalized_str)
+                print(f"[CHECKPOINT DEBUG] Original: {repr(request.checkpoint_path)}")
+                print(f"[CHECKPOINT DEBUG] Normalized: {normalized_str}")
                 print(f"   Normalized path: {checkpoint_test}")
                 print(f"   Path exists: {checkpoint_test.exists()}")
                 if checkpoint_test.exists():
+                    print(f"[CHECKPOINT DEBUG] Absolute: {checkpoint_test.resolve()}")
                     checkpoint_path_to_use = str(checkpoint_test.resolve())
                     print(f"   [OK] Using checkpoint: {checkpoint_path_to_use}")
                 else:
@@ -1296,14 +1432,22 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                         print(warn(f"   [WARN]  WARNING: Checkpoint not found! Will start fresh training."))
                         print(f"      Tried: {checkpoint_test}")
                         print(f"      Tried: {relative_checkpoint}")
+                        print(warn(f"   [WARN]  NOTE: Since checkpoint not found, supervised pretraining WILL run if enabled in config"))
                         await broadcast_message({
                             "type": "training",
                             "status": "warning",
-                            "message": f"Checkpoint not found: {request.checkpoint_path}. Starting fresh training."
+                            "message": f"Checkpoint not found: {request.checkpoint_path}. Starting fresh training (pretraining may run)."
                         })
+                        # CRITICAL: Set to None explicitly to ensure pretraining logic works correctly
+                        checkpoint_path_to_use = None
             
             # Create trainer and train (with optional checkpoint for resume)
-            print(f"[_train] ðŸš€ Creating Trainer with checkpoint: {checkpoint_path_to_use if checkpoint_path_to_use else 'None (fresh start)'}")
+            checkpoint_status = checkpoint_path_to_use if checkpoint_path_to_use else 'None (fresh start)'
+            print(f"[_train] 🚀 Creating Trainer with checkpoint: {checkpoint_status}")
+            if checkpoint_path_to_use:
+                print(f"[_train]   ✅ Resuming from checkpoint - supervised pretraining will be SKIPPED")
+            else:
+                print(f"[_train]   ⚠️  Fresh start - supervised pretraining WILL run if enabled in config")
             print(f"[_train]   This may take a moment (loading data, creating environment...)")
             print(f"[_train]   Step 1/4: Starting Trainer initialization...")
             
@@ -1318,6 +1462,19 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                     "message": "Loading data files...",
                     "progress": {"step": "loading_data", "elapsed": 0}
                 })
+                
+                # CRITICAL DEBUG: Log checkpoint path before creating Trainer
+                print(f"\n{'='*70}")
+                print(f"[API] About to create Trainer with checkpoint_path: {checkpoint_path_to_use}")
+                print(f"[API] checkpoint_path_to_use type: {type(checkpoint_path_to_use)}")
+                print(f"[API] checkpoint_path_to_use is None: {checkpoint_path_to_use is None}")
+                if checkpoint_path_to_use:
+                    from pathlib import Path
+                    checkpoint_file = Path(checkpoint_path_to_use)
+                    print(f"[API] Checkpoint file exists: {checkpoint_file.exists()}")
+                    if checkpoint_file.exists():
+                        print(f"[API] Checkpoint file absolute path: {checkpoint_file.resolve()}")
+                print(f"{'='*70}\n")
                 
                 trainer = Trainer(config, checkpoint_path=checkpoint_path_to_use, config_path=request.config_path)
                 init_elapsed = time.time() - init_start_time
@@ -1465,7 +1622,8 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
                 "completed": False,
                 "training_start_episode": training_start_episode,
                 "status": "running",  # Update status to running
-                "checkpoint_resume_timestamp": checkpoint_resume_timestamp
+                "checkpoint_resume_timestamp": checkpoint_resume_timestamp,
+                "total_timesteps": config.get("training", {}).get("total_timesteps", 20000000)  # Cache total_timesteps
             }
             print(f"[OK] Training thread started, trainer created successfully")
             print(f"   Thread ID: {thread.ident}")
@@ -1596,67 +1754,221 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
 
 @app.get("/api/training/status")
 async def training_status():
-    """Get training status with detailed metrics"""
-    if "training" not in active_systems:
-        return {"status": "idle", "message": "No training in progress"}
+    """Get training status with detailed metrics - optimized for fast idle returns"""
+    # CRITICAL: Try to access active_systems with timeout protection
+    # If even dictionary access is blocking, return immediately
+    import time
+    start_time = time.time()
+    MAX_ENDPOINT_TIME = 0.3  # Ultra-aggressive: 300ms max
     
-    # Check if thread is still alive and if training completed
-    system = active_systems["training"]
+    # ULTRA-FAST PATH: Try to get status with minimal blocking
+    # Use try-except to catch any blocking operations
+    try:
+        # Check if training entry exists (this should be instant)
+        # Use 'in' check which is O(1) and should never block
+        has_training = "training" in active_systems
+        if not has_training:
+            return {"status": "idle", "message": "No training in progress"}
+        
+        # Get system entry (should be instant - just a dict lookup)
+        system = active_systems.get("training")
+        if system is None:
+            return {"status": "idle", "message": "No training in progress"}
+        
+        # Get status (should be instant - just a dict.get())
+        status = system.get("status", "idle")
+        
+        # CRITICAL: For ANY status except "idle", return immediately
+        # This is the fastest possible path - no trainer access, no database queries
+        if status != "idle":
+            # Return immediately without any checks - use cached values only
+            # All these operations are O(1) dict lookups - should never block
+            last_timestep = system.get("last_timestep", 0)
+            last_episode = system.get("last_episode", 0)
+            
+            # Return minimal response immediately for active training (no trainer access)
+            # Include all cached metrics that might be available
+            metrics = {
+                "timestep": last_timestep,
+                "episode": last_episode
+            }
+            
+            # Include total_timesteps if cached (stored when training starts)
+            total_timesteps = system.get("total_timesteps")
+            if total_timesteps is not None:
+                metrics["total_timesteps"] = total_timesteps
+            
+            # Include latest reward if cached
+            last_reward = system.get("last_reward")
+            if last_reward is not None:
+                metrics["latest_reward"] = last_reward
+            
+            # Include mean_reward_10 if cached
+            last_mean_reward_10 = system.get("last_mean_reward_10")
+            if last_mean_reward_10 is not None:
+                metrics["mean_reward_10"] = last_mean_reward_10
+            
+            # For "starting" status, add pretraining info if available
+            if status == "starting":
+                # Calculate elapsed time (should be instant)
+                start_time_val = system.get("start_time", 0)
+                elapsed = time.time() - start_time_val if start_time_val > 0 else 0
+                metrics["pretraining"] = True
+                metrics["elapsed_seconds"] = int(elapsed)
+                message = f"Supervised pretraining in progress... ({elapsed:.0f}s) - This may take 5-10 minutes"
+            else:
+                message = "Training in progress" if status == "running" else f"Training {status}"
+            
+            # Return immediately - this should take <1ms
+            return {
+                "status": status,
+                "message": message,
+                "metrics": metrics
+            }
+    except Exception as e:
+        # If even dictionary access fails, return a safe default
+        # This should never happen, but protects against deadlocks
+        import traceback
+        print(f"[WARN] Training status endpoint error (returning safe default): {e}")
+        print(f"[WARN] Traceback: {traceback.format_exc()}")
+        return {
+            "status": "starting",
+            "message": "Training initializing... (endpoint protection active)",
+            "metrics": {"pretraining": True}
+        }
     
-    # Check if training is still initializing (trainer not created yet)
-    # BUT: If trainer exists, we should show metrics even if status is "starting"
+    # If we reach here, status is "idle" - handle idle case
+    # For idle status, we can do minimal checks
     trainer = system.get("trainer")
     thread = system.get("thread")
     
+    # Quick check for stale entries (no trainer, no thread, old status)
+    if trainer is None and (thread is None or (hasattr(thread, 'is_alive') and not thread.is_alive())):
+        import time
+        start_time = system.get("start_time", 0)
+        elapsed = time.time() - start_time if start_time > 0 else 0
+        
+        # If it's been more than 5 minutes with no trainer/thread, it's definitely stale
+        if elapsed > 300:
+            print(f"[INFO] Cleaning up stale training entry (no trainer/thread, {elapsed:.0f}s old)")
+            active_systems.pop("training", None)
+            return {"status": "idle", "message": "No training in progress"}
+        
+        # If status is "idle" or "completed" and no trainer/thread, clean up immediately
+        if system.get("status") in ["idle", "completed", "error"]:
+            active_systems.pop("training", None)
+            return {"status": "idle", "message": "No training in progress"}
+        
+        # If elapsed is less than 5 minutes but no trainer/thread, still return idle quickly
+        # Don't wait around - just return idle
+        if elapsed > 10:  # Give it 10 seconds, then return idle
+            active_systems.pop("training", None)
+            return {"status": "idle", "message": "No training in progress"}
+    
+    # Check if training is still initializing (trainer not created yet)
+    # BUT: If trainer exists, we should show metrics even if status is "starting"
     
     # Check if trainer is actively training (timestep is increasing)
     # This is more reliable than checking thread.is_alive() which can be False even if training is active
     # We'll calculate this later after we have the trainer object
     trainer_active = False
     
-    if system.get("status") == "starting" and trainer is None:
+    # CRITICAL: Never access trainer attributes if status is "starting" - trainer is locked during pretraining
+    # We should have already returned above for "starting" status, but add safety check here
+    if system.get("status") == "starting":
+        # This should never be reached (we return above), but if it is, return immediately
+        import time
+        start_time = system.get("start_time", 0)
+        elapsed = time.time() - start_time if start_time > 0 else 0
+        return {
+            "status": "starting",
+            "message": f"Supervised pretraining in progress... ({elapsed:.0f}s) - This may take 5-10 minutes",
+            "metrics": {
+                "pretraining": True,
+                "elapsed_seconds": int(elapsed)
+            },
+            "pretraining": True,
+            "info": "Pretraining teaches the agent basic market patterns before RL training starts."
+        }
+    
+    # Check if pretraining is in progress (trainer exists but timestep is 0)
+    is_pretraining = False
+    if trainer is not None:
+        try:
+            trainer_timestep = getattr(trainer, 'timestep', 0)
+            is_pretrained = getattr(trainer, 'pretrained', False)
+            # If timestep is 0 and pretrained is False, likely still in pretraining
+            if trainer_timestep == 0 and not is_pretrained:
+                is_pretraining = True
+        except:
+            pass
+    
+    # CRITICAL: For "starting" status, return immediately without accessing trainer
+    # During pretraining, trainer might be locked/busy, so never access it
+    if system.get("status") == "starting":
         import time
         start_time = system.get("start_time", 0)
         elapsed = time.time() - start_time if start_time > 0 else 0
         
-        # If initialization takes more than 60 seconds, something is wrong
+        # Return immediately with pretraining info - no trainer access
+        metrics = {
+            "pretraining": True,
+            "elapsed_seconds": int(elapsed)
+        }
+        
+        # If initialization takes more than 60 seconds, likely doing supervised pretraining
         if elapsed > 60:
-            print(f"[WARN]  WARNING: Training initialization taking too long ({elapsed:.1f}s)")
-            print(f"   This may indicate an error during trainer creation")
-            print(f"   Check backend logs for errors")
-            
-            # After 5 minutes, suggest stopping and checking logs
-            if elapsed > 300:
+            if elapsed < 600:  # Less than 10 minutes - likely pretraining
                 return {
-                    "status": "error",
-                    "message": f"Training initialization timeout ({elapsed:.0f}s). Likely stuck during data loading. Please stop and check backend console logs.",
-                    "metrics": {},
-                    "error": "Initialization timeout - check backend logs",
-                    "suggestion": "Stop training and check backend console for data loading errors. Large number of files may be causing issues."
+                    "status": "starting",
+                    "message": f"Supervised pretraining in progress... ({elapsed:.0f}s) - This may take 5-10 minutes",
+                    "metrics": metrics,
+                    "pretraining": True,
+                    "info": "Pretraining teaches the agent basic market patterns before RL training starts."
                 }
             
-            return {
-                "status": "starting",
-                "message": f"Initializing training... (taking longer than expected: {elapsed:.0f}s)",
-                "metrics": {},
-                "warning": "Initialization taking longer than expected. Check backend console for errors."
-            }
+            # After 10 minutes, something might be wrong
+            if elapsed > 600:
+                return {
+                    "status": "starting",
+                    "message": f"Initializing training... (taking longer than expected: {elapsed:.0f}s) - May be doing supervised pretraining",
+                    "metrics": metrics,
+                    "warning": "Initialization taking longer than expected. Check backend console for errors."
+                }
+            
+            # After 15 minutes, suggest stopping and checking logs
+            if elapsed > 900:
+                return {
+                    "status": "error",
+                    "message": f"Training initialization timeout ({elapsed:.0f}s). Likely stuck during data loading or pretraining. Please stop and check backend console logs.",
+                    "metrics": metrics,
+                    "error": "Initialization timeout - check backend logs",
+                    "suggestion": "Stop training and check backend console for errors. Large number of files or pretraining issues may be causing problems."
+                }
         
         return {
             "status": "starting",
             "message": "Initializing training...",
-            "metrics": {}
+            "metrics": metrics
         }
     
-    # If trainer exists but status is still "starting", update status to "running"
-    # This happens when trainer is created but status wasn't updated yet
-    if trainer is not None and system.get("status") == "starting":
-        # Trainer is ready, update status to running
-        system["status"] = "running"
-        print(f"[INFO] Training status updated from 'starting' to 'running' (trainer ready, type={type(trainer).__name__})")
-        # Continue to return metrics below (don't return early)
-        # BUT: We should return metrics immediately here instead of continuing
-        # Let's jump to the metrics section
+    # CRITICAL: If status is "starting", return immediately without accessing trainer
+    # During pretraining, trainer is busy and accessing it will block
+    # We already handled "starting" status above, but if we reach here, return immediately
+    if system.get("status") == "starting":
+        import time
+        start_time = system.get("start_time", 0)
+        elapsed = time.time() - start_time if start_time > 0 else 0
+        return {
+            "status": "starting",
+            "message": f"Supervised pretraining in progress... ({elapsed:.0f}s) - This may take 5-10 minutes",
+            "metrics": {
+                "pretraining": True,
+                "elapsed_seconds": int(elapsed)
+            },
+            "pretraining": True,
+            "info": "Pretraining teaches the agent basic market patterns before RL training starts."
+        }
     
     # If trainer exists and is active, we should show training as running
     # even if thread check fails (thread might have died but trainer is still processing)
@@ -1788,236 +2100,433 @@ async def training_status():
     # Debug: Log if trainer is None when we expect it
     if trainer is None and system.get("status") != "starting":
         print(f"[WARN] Training status is '{system.get('status')}' but trainer is None")
+        # If trainer is None and status is not starting, it's likely stale - clean up
+        if system.get("status") in ["running", "idle"]:
+            active_systems.pop("training", None)
+            return {"status": "idle", "message": "No training in progress"}
+    
+    # CRITICAL: Final safety check - if status is "starting", return immediately
+    # This prevents any trainer access during pretraining (trainer is locked)
+    if system.get("status") == "starting":
+        import time
+        start_time = system.get("start_time", 0)
+        elapsed = time.time() - start_time if start_time > 0 else 0
+        return {
+            "status": "starting",
+            "message": f"Supervised pretraining in progress... ({elapsed:.0f}s) - This may take 5-10 minutes",
+            "metrics": {
+                "pretraining": True,
+                "elapsed_seconds": int(elapsed)
+            },
+            "pretraining": True,
+            "info": "Pretraining teaches the agent basic market patterns before RL training starts."
+        }
     
     metrics = {}
     if trainer:
-        # Calculate recent metrics without numpy
-        recent_rewards = trainer.episode_rewards[-10:] if len(trainer.episode_rewards) >= 10 else trainer.episode_rewards
-        mean_reward_10 = float(sum(recent_rewards) / len(recent_rewards)) if recent_rewards else 0.0
-        
-        # Get completed episode metrics
-        latest_reward = float(trainer.episode_rewards[-1]) if trainer.episode_rewards else 0.0
-        latest_length = int(trainer.episode_lengths[-1]) if trainer.episode_lengths else 0
-        
-        # Get current in-progress episode metrics (even if not completed)
-        current_episode_reward = float(getattr(trainer, 'current_episode_reward', 0.0))
-        current_episode_length = int(getattr(trainer, 'current_episode_length', 0))
-        
-        # Detect if episode is stuck at max_steps (likely hit episode limit)
-        # If length is very high (near max_steps) and no episodes completed, episode may be stuck
-        max_steps_estimate = 10000  # Common max_steps value
-        is_stuck = (current_episode_length >= max_steps_estimate - 100 and 
-                   trainer.episode == 0 and 
-                   len(trainer.episode_rewards) == 0)
-        
-        # Check if training is active
-        training_is_active = trainer.timestep > 0  # Training has started (timestep is advancing)
-        
-        # Use current episode metrics if we have an active episode (length > 0 and not stuck)
-        has_active_episode = current_episode_length > 0 and not is_stuck
-        display_reward = current_episode_reward if has_active_episode else latest_reward
-        display_length = current_episode_length if has_active_episode else latest_length
-        
-        # Calculate mean episode length without numpy
-        mean_episode_length = float(sum(trainer.episode_lengths) / len(trainer.episode_lengths)) if trainer.episode_lengths else 0.0
-        
-        # Current episode number (completed episodes + 1 if there's an active episode)
-        # If stuck, still show episode 1 to indicate training is happening
-        current_episode_number = trainer.episode + (1 if (has_active_episode or is_stuck) else 0)
-        
-        # Calculate trading metrics - ALWAYS read from trainer first (updated every step)
-        # Priority 1: Trainer's current episode tracking (updated from step_info)
-        display_trades = getattr(trainer, 'current_episode_trades', 0)
-        display_pnl = getattr(trainer, 'current_episode_pnl', 0.0)
-        display_equity = getattr(trainer, 'current_episode_equity', 0.0)
-        display_win_rate = getattr(trainer, 'current_episode_win_rate', 0.0)
-        display_max_drawdown = getattr(trainer, 'current_episode_max_drawdown', 0.0)
-        
-        # Priority 2: If values are 0 but training is active, get directly from environment
-        if training_is_active and (display_trades == 0 and display_pnl == 0.0):
-            if hasattr(trainer, 'env') and trainer.env:
-                if hasattr(trainer.env, 'episode_trades'):
-                    display_trades = trainer.env.episode_trades
-                if hasattr(trainer.env, 'state') and trainer.env.state:
-                    # CRITICAL FIX: Use database for current session PnL to match Performance Monitoring
-                    # Environment state resets each episode, database accumulates across episodes
-                    current_episode_pnl = float(trainer.env.state.total_pnl)  # Current episode only
-                    display_pnl = current_episode_pnl  # Will be replaced with session total if available
-                    
-                    # Get current session PnL from database (matches Performance Monitoring)
-                    training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
-                    if training_start_ts:
-                        try:
-                            import sqlite3
-                            db_path = project_root / "logs/trading_journal.db"
-                            if db_path.exists():
-                                conn = sqlite3.connect(str(db_path))
-                                cursor = conn.cursor()
-                                cursor.execute("""
-                                    SELECT SUM(net_pnl) as session_pnl
-                                    FROM trades
-                                    WHERE timestamp >= ?
-                                """, (training_start_ts,))
-                                result = cursor.fetchone()
-                                if result and result[0] is not None:
-                                    display_pnl = float(result[0])  # Use session total instead of episode
-                                conn.close()
-                        except Exception as e:
-                            print(f"[WARN] Failed to get session PnL from database: {e}")
-                            # Fallback to episode PnL
-                            
-                    if hasattr(trainer.env, 'initial_capital'):
-                        display_equity = float(trainer.env.initial_capital + display_pnl)
-                    if trainer.env.state.trades_count > 0:
-                        display_win_rate = float(trainer.env.state.winning_trades / trainer.env.state.trades_count)
-                if hasattr(trainer.env, 'max_drawdown'):
-                    display_max_drawdown = float(trainer.env.max_drawdown)
-        
-        # Priority 3: If still no values, check for latest completed episode
-        if display_trades == 0 and display_pnl == 0.0 and hasattr(trainer, 'episode_trades') and trainer.episode_trades and len(trainer.episode_trades) > 0:
-            display_trades = trainer.episode_trades[-1]
-            display_pnl = trainer.episode_pnls[-1] if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls else 0.0
-            display_equity = trainer.episode_equities[-1] if hasattr(trainer, 'episode_equities') and trainer.episode_equities else 0.0
-            display_win_rate = trainer.episode_win_rates[-1] if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates else 0.0
-            display_max_drawdown = trainer.episode_max_drawdowns[-1] if hasattr(trainer, 'episode_max_drawdowns') and trainer.episode_max_drawdowns else 0.0
-        
-        # Aggregate trading metrics across all episodes
-        # Priority 1: Get cumulative counts from trainer (accumulates across all episodes)
-        session_trades = getattr(trainer, 'total_trades', 0)
-        session_winning = getattr(trainer, 'total_winning_trades', 0)
-        session_losing = getattr(trainer, 'total_losing_trades', 0)
-        
-        # Priority 2: Also get current episode trade counts from environment state
-        # NOTE: Environment state resets each episode, so this is only for current episode
-        env_trades = 0
-        env_winning = 0
-        env_losing = 0
-        if hasattr(trainer, 'env') and trainer.env:
-            if hasattr(trainer.env, 'state') and trainer.env.state:
-                env_trades = getattr(trainer.env.state, 'trades_count', 0)
-                env_winning = getattr(trainer.env.state, 'winning_trades', 0)
-                env_losing = getattr(trainer.env.state, 'losing_trades', 0)
-        
-        # CRITICAL FIX: If trainer's cumulative counts are 0 but we have episode trades,
-        # calculate cumulative from episode_trades list (sum all completed episodes)
-        if session_trades == 0 and hasattr(trainer, 'episode_trades') and trainer.episode_trades:
-            # Sum all completed episodes' trades
-            session_trades = sum(trainer.episode_trades)
-            # Estimate winning/losing from episode win rates if available
-            if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates:
-                for i, episode_trades in enumerate(trainer.episode_trades):
-                    if i < len(trainer.episode_win_rates):
-                        win_rate = trainer.episode_win_rates[i]
-                        estimated_wins = int(episode_trades * win_rate / 100.0) if episode_trades > 0 else 0
-                        estimated_losses = episode_trades - estimated_wins
-                        session_winning += estimated_wins
-                        session_losing += estimated_losses
-            
-            # Debug log when calculating from episode list
-            if session_trades > 0:
-                print(f"[DEBUG] Calculated cumulative trades from episode list: {session_trades} trades across {len(trainer.episode_trades)} episodes")
-        
-        # Debug log trade count sources
-        if not hasattr(trainer, '_last_logged_trade_counts') or trainer._last_logged_trade_counts != (session_trades, env_trades):
-            print(f"[DEBUG] Trade count sources - Trainer cumulative: {session_trades}, Environment current: {env_trades}, Episode list length: {len(getattr(trainer, 'episode_trades', []))}")
-            trainer._last_logged_trade_counts = (session_trades, env_trades)
-        
-        # Initialize db_total_trades for debug logging
-        db_total_trades = None
-        db_winning_trades = None
-        db_losing_trades = None
-        
-        # Get trade counts from trading journal
-        # For fresh training, filter by training_start_timestamp to show only current session
-        # For resumed training, show all-time totals
+        # CRITICAL: Check for pretraining FIRST with minimal trainer access to avoid blocking
+        # Use getattr with safe defaults and wrap in try-except
         try:
-            import sqlite3
-            from src.trading_journal import TradingJournal
-            # Ensure database is initialized
-            journal = TradingJournal()
-            db_path = project_root / "logs/trading_journal.db"
-            if db_path.exists():
-                conn = sqlite3.connect(str(db_path))
-                cursor = conn.cursor()
+            # Try to get pretraining status with timeout protection
+            # Use getattr which is non-blocking
+            trainer_timestep = getattr(trainer, 'timestep', None)
+            is_pretrained = getattr(trainer, 'pretrained', None)
+            
+            # If timestep is 0 or None and not pretrained, likely in pretraining
+            # BUT: Only return early if we're actually in pretraining (check pretraining_progress first)
+            # If pretraining is done but timestep is still 0, training might have just started
+            pretraining_progress = getattr(trainer, 'pretraining_progress', {})
+            is_in_pretraining = False
+            if isinstance(pretraining_progress, dict):
+                phase = pretraining_progress.get("phase", "")
+                progress = pretraining_progress.get("progress", 0.0)
+                # Only consider it pretraining if phase indicates it's active
+                is_in_pretraining = phase in ["preparing", "training"] or (progress < 1.0 and phase != "complete")
+            
+            # Return early only if actually in pretraining (not just timestep == 0)
+            # CRITICAL: If timestep > 0, training has started - don't return early, continue to full metrics
+            if is_in_pretraining and (trainer_timestep is None or trainer_timestep == 0) and (is_pretrained is None or not is_pretrained):
+                # Try to get progress info (non-blocking getattr)
+                # Note: pretraining_progress was already retrieved above
+                if not isinstance(pretraining_progress, dict):
+                    pretraining_progress = {}
                 
-                # Get training start timestamp from current system object (already loaded above)
-                # Use system variable from line 1446, don't re-fetch
-                training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
+                import time
+                start_time = system.get("start_time", 0)
+                elapsed = time.time() - start_time if start_time > 0 else 0
                 
-                # Filter by training start timestamp if available (fresh training)
-                if training_start_ts:
-                    # Fresh training - only show trades from current session
-                    cursor.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ?", (training_start_ts,))
-                    db_total_trades = cursor.fetchone()[0] or 0
-                    
-                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1 AND timestamp >= ?", (training_start_ts,))
-                    db_winning_trades = cursor.fetchone()[0] or 0
-                    
-                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 0 AND timestamp >= ?", (training_start_ts,))
-                    db_losing_trades = cursor.fetchone()[0] or 0
-                else:
-                    # No timestamp filter - show all-time totals (fallback)
-                    cursor.execute("SELECT COUNT(*) FROM trades")
-                    db_total_trades = cursor.fetchone()[0] or 0
-                    
-                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1")
-                    db_winning_trades = cursor.fetchone()[0] or 0
-                    
-                    cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 0")
-                    db_losing_trades = cursor.fetchone()[0] or 0
+                # Get progress from trainer if available (safe access)
+                phase = pretraining_progress.get("phase", "initializing") if isinstance(pretraining_progress, dict) else "initializing"
+                progress = pretraining_progress.get("progress", 0.0) if isinstance(pretraining_progress, dict) else 0.0
+                progress_message = pretraining_progress.get("message", "Initializing pretraining...") if isinstance(pretraining_progress, dict) else "Initializing pretraining..."
                 
-                conn.close()
-                
-                # Use database counts (filtered by session if fresh training)
-                # Priority: Database > Trainer cumulative > Environment (current episode only)
-                if db_total_trades > 0:
-                    # Database has trades - use it (most reliable)
-                    total_trades = db_total_trades
-                    total_winning_trades = db_winning_trades
-                    total_losing_trades = db_losing_trades
-                elif session_trades > 0:
-                    # Database empty but trainer has cumulative counts - use trainer
-                    total_trades = session_trades
-                    total_winning_trades = session_winning
-                    total_losing_trades = session_losing
-                elif env_trades > 0:
-                    # Fallback: Only environment has trades (current episode only)
-                    # This is less ideal but better than showing 0
-                    total_trades = env_trades
-                    total_winning_trades = env_winning
-                    total_losing_trades = env_losing
-                else:
-                    # All sources are 0
-                    total_trades = 0
-                    total_winning_trades = 0
-                    total_losing_trades = 0
-            else:
-                # No database - prioritize trainer cumulative counts over environment
-                if session_trades > 0:
-                    # Trainer has cumulative counts - use it
-                    total_trades = session_trades
-                    total_winning_trades = session_winning
-                    total_losing_trades = session_losing
-                elif env_trades > 0:
-                    # Fallback: Only environment has trades (current episode only)
-                    total_trades = env_trades
-                    total_winning_trades = env_winning
-                    total_losing_trades = env_losing
-                else:
-                    # All sources are 0
-                    total_trades = 0
-                    total_winning_trades = 0
-                    total_losing_trades = 0
+                # Return immediately - don't access any other trainer attributes
+                return {
+                    "status": "starting",
+                    "message": progress_message or f"Supervised pretraining in progress... ({elapsed:.0f}s)",
+                    "metrics": {
+                        "pretraining": True,
+                        "elapsed_seconds": int(elapsed),
+                        "pretraining_phase": phase,
+                        "pretraining_progress": progress,
+                        "pretraining_message": progress_message
+                    },
+                    "pretraining": True,
+                    "pretraining_phase": phase,
+                    "pretraining_progress": progress,
+                    "pretraining_message": progress_message,
+                    "info": "Pretraining teaches the agent basic market patterns before RL training starts."
+                }
+            # If timestep > 0, training has started - continue to full metrics below (don't return early)
         except Exception as e:
-            # If database read fails, prioritize trainer cumulative counts
-            print(f"[WARN] Failed to read trading journal for training status: {e}")
-            if session_trades > 0:
-                # Trainer has cumulative counts - use it
+            # If accessing trainer attributes fails, return minimal response immediately
+            # Don't try to continue - just return a safe response
+            import time
+            start_time = system.get("start_time", 0)
+            elapsed = time.time() - start_time if start_time > 0 else 0
+            return {
+                "status": "starting",
+                "message": f"Training initializing... ({elapsed:.0f}s) - Pretraining may be in progress",
+                "metrics": {
+                    "pretraining": True,
+                    "elapsed_seconds": int(elapsed)
+                },
+                "pretraining": True,
+                "pretraining_phase": "initializing",
+                "pretraining_progress": 0.0,
+                "pretraining_message": "Initializing pretraining..."
+            }
+    
+    # If we get here and trainer exists, check if we should skip blocking operations
+    # During pretraining, trainer might be locked, so avoid accessing attributes
+    if trainer:
+        # Double-check: if we're still in pretraining phase, return immediately
+        # This prevents falling through to blocking code below
+        # BUT: Only return early if actually in pretraining (not just timestep == 0)
+        try:
+            trainer_timestep = getattr(trainer, 'timestep', None)
+            is_pretrained = getattr(trainer, 'pretrained', None)
+            pretraining_progress = getattr(trainer, 'pretraining_progress', {})
+            if not isinstance(pretraining_progress, dict):
+                pretraining_progress = {}
+            
+            # Check if actually in pretraining (not just timestep == 0)
+            phase = pretraining_progress.get("phase", "")
+            progress = pretraining_progress.get("progress", 0.0)
+            is_in_pretraining = phase in ["preparing", "training"] or (progress < 1.0 and phase != "complete")
+            
+            # Only return early if actually in pretraining
+            if is_in_pretraining and (trainer_timestep is None or trainer_timestep == 0) and (is_pretrained is None or not is_pretrained):
+                # Still in pretraining - return immediately without accessing other attributes
+                import time
+                start_time = system.get("start_time", 0)
+                elapsed = time.time() - start_time if start_time > 0 else 0
+                progress_message = pretraining_progress.get("message", "Initializing pretraining...")
+                return {
+                    "status": "starting",
+                    "message": progress_message or f"Supervised pretraining in progress... ({elapsed:.0f}s)",
+                    "metrics": {
+                        "pretraining": True,
+                        "elapsed_seconds": int(elapsed),
+                        "pretraining_phase": phase,
+                        "pretraining_progress": progress,
+                        "pretraining_message": progress_message
+                    },
+                    "pretraining": True,
+                    "pretraining_phase": phase,
+                    "pretraining_progress": progress,
+                    "pretraining_message": progress_message
+                }
+        except:
+            # If check fails, assume pretraining and return safe response
+            import time
+            start_time = system.get("start_time", 0)
+            elapsed = time.time() - start_time if start_time > 0 else 0
+            return {
+                "status": "starting",
+                "message": f"Training initializing... ({elapsed:.0f}s)",
+                "metrics": {"pretraining": True, "elapsed_seconds": int(elapsed)},
+                "pretraining": True,
+                "pretraining_phase": "initializing",
+                "pretraining_progress": 0.0
+            }
+    
+    # Only access trainer attributes if we're past pretraining
+    if trainer:
+        # Wrap all remaining trainer access in the main try block
+        try:
+            # CRITICAL: Check timeout BEFORE accessing trainer at all
+            # If we're already taking too long, return immediately with cached values
+            elapsed = time.time() - start_time
+            if elapsed > 0.5:  # If we're past 0.5 seconds, return immediately (very aggressive)
+                print(f"[WARN] Training status endpoint taking too long ({elapsed:.2f}s) - returning cached values")
+                return {
+                    "status": system.get("status", "running"),
+                    "message": "Training in progress",
+                    "metrics": {
+                        "timestep": system.get("last_timestep", 0),
+                        "episode": system.get("last_episode", 0)
+                    }
+                }
+            
+            # Check timeout before expensive operations
+            timeout_response = check_timeout()
+            if timeout_response:
+                return timeout_response
+            
+            # Check timeout before accessing trainer attributes
+            timeout_response = check_timeout()
+            if timeout_response:
+                return timeout_response
+            
+            # Calculate recent metrics without numpy
+            # Use getattr with safe defaults to avoid blocking
+            episode_rewards = getattr(trainer, 'episode_rewards', [])
+            recent_rewards = episode_rewards[-10:] if len(episode_rewards) >= 10 else episode_rewards
+            mean_reward_10 = float(sum(recent_rewards) / len(recent_rewards)) if recent_rewards else 0.0
+            
+            # Check timeout again before more operations
+            timeout_response = check_timeout()
+            if timeout_response:
+                return timeout_response
+            
+            # Get completed episode metrics
+            latest_reward = float(trainer.episode_rewards[-1]) if trainer.episode_rewards else 0.0
+            latest_length = int(trainer.episode_lengths[-1]) if trainer.episode_lengths else 0
+            
+            # Get current in-progress episode metrics (even if not completed)
+            current_episode_reward = float(getattr(trainer, 'current_episode_reward', 0.0))
+            current_episode_length = int(getattr(trainer, 'current_episode_length', 0))
+            
+            # Detect if episode is stuck at max_steps (likely hit episode limit)
+            # If length is very high (near max_steps) and no episodes completed, episode may be stuck
+            max_steps_estimate = 10000  # Common max_steps value
+            is_stuck = (current_episode_length >= max_steps_estimate - 100 and 
+                       trainer.episode == 0 and 
+                       len(trainer.episode_rewards) == 0)
+            
+            # Check timeout before accessing trainer.timestep
+            timeout_response = check_timeout()
+            if timeout_response:
+                return timeout_response
+            
+            # Check if training is active
+            training_is_active = trainer.timestep > 0  # Training has started (timestep is advancing)
+            
+            # Use current episode metrics if we have an active episode (length > 0 and not stuck)
+            has_active_episode = current_episode_length > 0 and not is_stuck
+            display_reward = current_episode_reward if has_active_episode else latest_reward
+            display_length = current_episode_length if has_active_episode else latest_length
+            
+            # Check timeout before calculating mean
+            timeout_response = check_timeout()
+            if timeout_response:
+                return timeout_response
+            
+            # Calculate mean episode length without numpy
+            mean_episode_length = float(sum(trainer.episode_lengths) / len(trainer.episode_lengths)) if trainer.episode_lengths else 0.0
+            
+            # Current episode number (completed episodes + 1 if there's an active episode)
+            # If stuck, still show episode 1 to indicate training is happening
+            current_episode_number = trainer.episode + (1 if (has_active_episode or is_stuck) else 0)
+            
+            # Calculate trading metrics - ALWAYS read from trainer first (updated every step)
+            # Priority 1: Trainer's current episode tracking (updated from step_info)
+            display_trades = getattr(trainer, 'current_episode_trades', 0)
+            display_pnl = getattr(trainer, 'current_episode_pnl', 0.0)
+            display_equity = getattr(trainer, 'current_episode_equity', 0.0)
+            display_win_rate = getattr(trainer, 'current_episode_win_rate', 0.0)
+            display_max_drawdown = getattr(trainer, 'current_episode_max_drawdown', 0.0)
+            
+            # Check timeout before accessing environment
+            timeout_response = check_timeout()
+            if timeout_response:
+                return timeout_response
+            
+            # Priority 2: If values are 0 but training is active, get directly from environment
+            if training_is_active and (display_trades == 0 and display_pnl == 0.0):
+                if hasattr(trainer, 'env') and trainer.env:
+                    if hasattr(trainer.env, 'episode_trades'):
+                        display_trades = trainer.env.episode_trades
+                    if hasattr(trainer.env, 'state') and trainer.env.state:
+                        # CRITICAL FIX: Use database for current session PnL to match Performance Monitoring
+                        # Environment state resets each episode, database accumulates across episodes
+                        current_episode_pnl = float(trainer.env.state.total_pnl)  # Current episode only
+                        display_pnl = current_episode_pnl  # Will be replaced with session total if available
+                        
+                        # Get current session PnL from database (matches Performance Monitoring)
+                        # Use timeout to avoid blocking during pretraining
+                        training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
+                        if training_start_ts:
+                            try:
+                                import sqlite3
+                                import signal
+                                db_path = project_root / "logs/trading_journal.db"
+                                if db_path.exists():
+                                    # Use timeout for database connection to avoid blocking
+                                    conn = sqlite3.connect(str(db_path), timeout=2.0)  # 2 second timeout
+                                    cursor = conn.cursor()
+                                    cursor.execute("PRAGMA journal_mode=WAL")  # Ensure WAL mode for faster reads
+                                    cursor.execute("""
+                                        SELECT SUM(net_pnl) as session_pnl
+                                        FROM trades
+                                        WHERE timestamp >= ?
+                                    """, (training_start_ts,))
+                                    result = cursor.fetchone()
+                                    if result and result[0] is not None:
+                                        display_pnl = float(result[0])  # Use session total instead of episode
+                                    conn.close()
+                            except sqlite3.OperationalError as e:
+                                # Database locked or timeout - skip and use episode PnL
+                                pass
+                            except Exception as e:
+                                # Other errors - skip and use episode PnL
+                                pass
+                                
+                        if hasattr(trainer.env, 'initial_capital'):
+                            display_equity = float(trainer.env.initial_capital + display_pnl)
+                        if trainer.env.state.trades_count > 0:
+                            display_win_rate = float(trainer.env.state.winning_trades / trainer.env.state.trades_count)
+                    if hasattr(trainer.env, 'max_drawdown'):
+                        display_max_drawdown = float(trainer.env.max_drawdown)
+            
+            # Priority 3: If still no values, check for latest completed episode
+            if display_trades == 0 and display_pnl == 0.0 and hasattr(trainer, 'episode_trades') and trainer.episode_trades and len(trainer.episode_trades) > 0:
+                display_trades = trainer.episode_trades[-1]
+                display_pnl = trainer.episode_pnls[-1] if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls else 0.0
+                display_equity = trainer.episode_equities[-1] if hasattr(trainer, 'episode_equities') and trainer.episode_equities else 0.0
+                display_win_rate = trainer.episode_win_rates[-1] if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates else 0.0
+                display_max_drawdown = trainer.episode_max_drawdowns[-1] if hasattr(trainer, 'episode_max_drawdowns') and trainer.episode_max_drawdowns else 0.0
+            
+            # Aggregate trading metrics across all episodes
+            # Priority 1: Get cumulative counts from trainer (accumulates across all episodes)
+            session_trades = getattr(trainer, 'total_trades', 0)
+            session_winning = getattr(trainer, 'total_winning_trades', 0)
+            session_losing = getattr(trainer, 'total_losing_trades', 0)
+            
+            # Priority 2: Also get current episode trade counts from environment state
+            # NOTE: Environment state resets each episode, so this is only for current episode
+            env_trades = 0
+            env_winning = 0
+            env_losing = 0
+            if hasattr(trainer, 'env') and trainer.env:
+                if hasattr(trainer.env, 'state') and trainer.env.state:
+                    env_trades = getattr(trainer.env.state, 'trades_count', 0)
+                    env_winning = getattr(trainer.env.state, 'winning_trades', 0)
+                    env_losing = getattr(trainer.env.state, 'losing_trades', 0)
+            
+            # CRITICAL FIX: If trainer's cumulative counts are 0 but we have episode trades,
+            # calculate cumulative from episode_trades list (sum all completed episodes)
+            if session_trades == 0 and hasattr(trainer, 'episode_trades') and trainer.episode_trades:
+                # Sum all completed episodes' trades
+                session_trades = sum(trainer.episode_trades)
+                # Estimate winning/losing from episode win rates if available
+                if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates:
+                    for i, episode_trades in enumerate(trainer.episode_trades):
+                        if i < len(trainer.episode_win_rates):
+                            win_rate = trainer.episode_win_rates[i]
+                            estimated_wins = int(episode_trades * win_rate / 100.0) if episode_trades > 0 else 0
+                            estimated_losses = episode_trades - estimated_wins
+                            session_winning += estimated_wins
+                            session_losing += estimated_losses
+                
+                # Debug log when calculating from episode list
+                if session_trades > 0:
+                    print(f"[DEBUG] Calculated cumulative trades from episode list: {session_trades} trades across {len(trainer.episode_trades)} episodes")
+            
+            # Debug log trade count sources
+            if not hasattr(trainer, '_last_logged_trade_counts') or trainer._last_logged_trade_counts != (session_trades, env_trades):
+                print(f"[DEBUG] Trade count sources - Trainer cumulative: {session_trades}, Environment current: {env_trades}, Episode list length: {len(getattr(trainer, 'episode_trades', []))}")
+                trainer._last_logged_trade_counts = (session_trades, env_trades)
+            
+            # Initialize db_total_trades for debug logging
+            db_total_trades = None
+            db_winning_trades = None
+            db_losing_trades = None
+            
+            # Get trade counts from trading journal
+            # For fresh training, filter by training_start_timestamp to show only current session
+            # For resumed training, show all-time totals
+            # Use timeout to avoid blocking during pretraining
+            # SKIP database queries if trainer is not active (idle/pretraining state) to avoid blocking
+            # ALSO SKIP if we're in a timeout situation (to prevent cascading timeouts)
+            trainer_timestep_check = getattr(trainer, 'timestep', 0)
+            skip_db_queries = (trainer_timestep_check == 0 and not training_is_active)
+            
+            # CRITICAL: Skip database queries entirely if training just started (timestep < 100)
+            # This prevents timeouts during initialization
+            if trainer_timestep_check < 100:
+                skip_db_queries = True
+            
+            # Check timeout before doing database queries
+            timeout_response = check_timeout()
+            if timeout_response:
+                # Skip database queries if we're already taking too long
+                skip_db_queries = True
+            
+            if not skip_db_queries:
+                try:
+                    import sqlite3
+                    from src.trading_journal import TradingJournal
+                    # Ensure database is initialized
+                    journal = TradingJournal()
+                    db_path = project_root / "logs/trading_journal.db"
+                    if db_path.exists():
+                        # Use timeout for database connection to avoid blocking
+                        conn = sqlite3.connect(str(db_path), timeout=2.0)  # 2 second timeout
+                        cursor = conn.cursor()
+                        cursor.execute("PRAGMA journal_mode=WAL")  # Ensure WAL mode for faster reads
+                        
+                        # Get training start timestamp from current system object (already loaded above)
+                        # Use system variable from line 1446, don't re-fetch
+                        training_start_ts = system.get("checkpoint_resume_timestamp") or system.get("training_start_timestamp")
+                        
+                        # Filter by training start timestamp if available (fresh training)
+                        if training_start_ts:
+                            # Fresh training - only show trades from current session
+                            cursor.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ?", (training_start_ts,))
+                            db_total_trades = cursor.fetchone()[0] or 0
+                            
+                            cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1 AND timestamp >= ?", (training_start_ts,))
+                            db_winning_trades = cursor.fetchone()[0] or 0
+                            
+                            cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 0 AND timestamp >= ?", (training_start_ts,))
+                            db_losing_trades = cursor.fetchone()[0] or 0
+                        else:
+                            # No timestamp filter - show all-time totals (fallback)
+                            cursor.execute("SELECT COUNT(*) FROM trades")
+                            db_total_trades = cursor.fetchone()[0] or 0
+                            
+                            cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 1")
+                            db_winning_trades = cursor.fetchone()[0] or 0
+                            
+                            cursor.execute("SELECT COUNT(*) FROM trades WHERE is_win = 0")
+                            db_losing_trades = cursor.fetchone()[0] or 0
+                        
+                        conn.close()
+                except sqlite3.OperationalError as e:
+                    # Database locked or timeout - skip database queries, use trainer metrics
+                    # This is expected during pretraining when database might be busy
+                    pass
+                except Exception as e:
+                    # Other database errors - skip and use trainer metrics
+                    pass
+            
+            # Use database counts (filtered by session if fresh training)
+            # Priority: Database > Trainer cumulative > Environment (current episode only)
+            if db_total_trades is not None and db_total_trades > 0:
+                # Database has trades - use it (most reliable)
+                total_trades = db_total_trades
+                total_winning_trades = db_winning_trades if db_winning_trades is not None else 0
+                total_losing_trades = db_losing_trades if db_losing_trades is not None else 0
+            elif session_trades > 0:
+                # Database empty but trainer has cumulative counts - use trainer
                 total_trades = session_trades
                 total_winning_trades = session_winning
                 total_losing_trades = session_losing
             elif env_trades > 0:
                 # Fallback: Only environment has trades (current episode only)
+                # This is less ideal but better than showing 0
                 total_trades = env_trades
                 total_winning_trades = env_winning
                 total_losing_trades = env_losing
@@ -2026,206 +2535,222 @@ async def training_status():
                 total_trades = 0
                 total_winning_trades = 0
                 total_losing_trades = 0
-        
-        overall_win_rate = float(total_winning_trades / total_trades * 100) if total_trades > 0 else 0.0
-        
-        # DEBUG: Log trade counts being returned to frontend (every 10 API calls to reduce noise)
-        if not hasattr(trainer, '_trade_counts_log_counter'):
-            trainer._trade_counts_log_counter = 0
-        trainer._trade_counts_log_counter += 1
-        
-        # Store db_total_trades for debug logging (will be set in try block above)
-        db_trades_debug = locals().get('db_total_trades', 'N/A')
-        
-        if trainer._trade_counts_log_counter % 10 == 0 or (total_trades > 0 and trainer._trade_counts_log_counter <= 5):
-            print(f"[DEBUG API] Returning trade counts - total_trades={total_trades}, winning={total_winning_trades}, losing={total_losing_trades}, win_rate={overall_win_rate:.1f}%")
-            print(f"[DEBUG API] Sources - DB={db_trades_debug}, Trainer cumulative={session_trades}, Env current={env_trades}")
-        
-        # Calculate mean PnL and equity across recent episodes
-        # Use last 10 episodes if available from CURRENT SESSION
-        # Fallback to database if trainer lists are empty (resumed from checkpoint)
-        mean_pnl_10 = 0.0
-        mean_equity_10 = 0.0
-        mean_win_rate_10 = 0.0
-        
-        # Try to get from trainer's episode lists first
-        if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls and len(trainer.episode_pnls) > 0:
-            recent_pnls = trainer.episode_pnls[-10:] if len(trainer.episode_pnls) >= 10 else trainer.episode_pnls
-            mean_pnl_10 = float(sum(recent_pnls) / len(recent_pnls)) if recent_pnls else 0.0
-        
-        if hasattr(trainer, 'episode_equities') and trainer.episode_equities and len(trainer.episode_equities) > 0:
-            recent_equities = trainer.episode_equities[-10:] if len(trainer.episode_equities) >= 10 else trainer.episode_equities
-            mean_equity_10 = float(sum(recent_equities) / len(recent_equities)) if recent_equities else 0.0
-        
-        if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates and len(trainer.episode_win_rates) > 0:
-            recent_win_rates = trainer.episode_win_rates[-10:] if len(trainer.episode_win_rates) >= 10 else trainer.episode_win_rates
-            mean_win_rate_10 = float(sum(recent_win_rates) / len(recent_win_rates)) if recent_win_rates else 0.0
-        
-        # FALLBACK: If trainer lists are empty (resumed from checkpoint), calculate from database
-        # Group trades by episode and calculate per-episode metrics
-        if mean_pnl_10 == 0.0 and mean_equity_10 == 0.0 and training_is_active:
-            try:
-                import sqlite3
-                from src.trading_journal import TradingJournal
-                # Ensure database is initialized
-                journal = TradingJournal()
-                db_path = project_root / "logs/trading_journal.db"
-                if db_path.exists():
-                    conn = sqlite3.connect(str(db_path))
-                    cursor = conn.cursor()
-                    
-                    # Get recent trades grouped by episode (assuming episode is in trades table)
-                    # Calculate per-episode PnL, equity, win rate from last N trades
-                    cursor.execute("""
-                        SELECT episode, 
-                               SUM(net_pnl) as episode_pnl,
-                               COUNT(*) as trades,
-                               SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins
-                        FROM trades
-                        WHERE episode IS NOT NULL
-                        GROUP BY episode
-                        ORDER BY episode DESC
-                        LIMIT 10
-                    """)
-                    recent_episodes = cursor.fetchall()
-                    
-                    if recent_episodes:
-                        episode_pnls_db = [row[1] for row in recent_episodes if row[1] is not None]
-                        episode_win_rates_db = []
-                        episode_equities_db = []
+            
+            overall_win_rate = float(total_winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+            
+            # DEBUG: Log trade counts being returned to frontend (every 10 API calls to reduce noise)
+            if not hasattr(trainer, '_trade_counts_log_counter'):
+                trainer._trade_counts_log_counter = 0
+            trainer._trade_counts_log_counter += 1
+            
+            # Store db_total_trades for debug logging (will be set in try block above)
+            db_trades_debug = locals().get('db_total_trades', 'N/A')
+            
+            if trainer._trade_counts_log_counter % 10 == 0 or (total_trades > 0 and trainer._trade_counts_log_counter <= 5):
+                print(f"[DEBUG API] Returning trade counts - total_trades={total_trades}, winning={total_winning_trades}, losing={total_losing_trades}, win_rate={overall_win_rate:.1f}%")
+                print(f"[DEBUG API] Sources - DB={db_trades_debug}, Trainer cumulative={session_trades}, Env current={env_trades}")
+            
+            # Calculate mean PnL and equity across recent episodes
+            # Use last 10 episodes if available from CURRENT SESSION
+            # Fallback to database if trainer lists are empty (resumed from checkpoint)
+            mean_pnl_10 = 0.0
+            mean_equity_10 = 0.0
+            mean_win_rate_10 = 0.0
+            
+            # Try to get from trainer's episode lists first
+            if hasattr(trainer, 'episode_pnls') and trainer.episode_pnls and len(trainer.episode_pnls) > 0:
+                recent_pnls = trainer.episode_pnls[-10:] if len(trainer.episode_pnls) >= 10 else trainer.episode_pnls
+                mean_pnl_10 = float(sum(recent_pnls) / len(recent_pnls)) if recent_pnls else 0.0
+            
+            if hasattr(trainer, 'episode_equities') and trainer.episode_equities and len(trainer.episode_equities) > 0:
+                recent_equities = trainer.episode_equities[-10:] if len(trainer.episode_equities) >= 10 else trainer.episode_equities
+                mean_equity_10 = float(sum(recent_equities) / len(recent_equities)) if recent_equities else 0.0
+            
+            if hasattr(trainer, 'episode_win_rates') and trainer.episode_win_rates and len(trainer.episode_win_rates) > 0:
+                recent_win_rates = trainer.episode_win_rates[-10:] if len(trainer.episode_win_rates) >= 10 else trainer.episode_win_rates
+                mean_win_rate_10 = float(sum(recent_win_rates) / len(recent_win_rates)) if recent_win_rates else 0.0
+            
+            # FALLBACK: If trainer lists are empty (resumed from checkpoint), calculate from database
+            # Group trades by episode and calculate per-episode metrics
+            # CRITICAL: Skip this expensive query if timestep is low (early training) to prevent timeouts
+            if mean_pnl_10 == 0.0 and mean_equity_10 == 0.0 and training_is_active and trainer_timestep_check >= 1000:
+                try:
+                    import sqlite3
+                    from src.trading_journal import TradingJournal
+                    # Ensure database is initialized
+                    journal = TradingJournal()
+                    db_path = project_root / "logs/trading_journal.db"
+                    if db_path.exists():
+                        # Use timeout to prevent blocking
+                        conn = sqlite3.connect(str(db_path), timeout=1.0)
+                        cursor = conn.cursor()
                         
-                        for row in recent_episodes:
-                            episode, ep_pnl, trades, wins = row
-                            if trades and trades > 0:
-                                win_rate = (wins / trades) * 100
-                                episode_win_rates_db.append(win_rate)
+                        # Get recent trades grouped by episode (assuming episode is in trades table)
+                        # Calculate per-episode PnL, equity, win rate from last N trades
+                        cursor.execute("""
+                            SELECT episode, 
+                                   SUM(net_pnl) as episode_pnl,
+                                   COUNT(*) as trades,
+                                   SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins
+                            FROM trades
+                            WHERE episode IS NOT NULL
+                            GROUP BY episode
+                            ORDER BY episode DESC
+                            LIMIT 10
+                        """)
+                        recent_episodes = cursor.fetchall()
+                        
+                        if recent_episodes:
+                            episode_pnls_db = [row[1] for row in recent_episodes if row[1] is not None]
+                            episode_win_rates_db = []
+                            episode_equities_db = []
                             
-                            # Calculate equity (need initial capital - assume 100k)
-                            # This is approximate - actual equity would need to track capital changes
-                            if ep_pnl:
-                                # For mean calculation, we can use final equity estimates
-                                # This is a simplified calculation
-                                episode_equities_db.append(100000.0 + ep_pnl)
+                            for row in recent_episodes:
+                                episode, ep_pnl, trades, wins = row
+                                if trades and trades > 0:
+                                    win_rate = (wins / trades) * 100
+                                    episode_win_rates_db.append(win_rate)
+                                
+                                # Calculate equity (need initial capital - assume 100k)
+                                # This is approximate - actual equity would need to track capital changes
+                                if ep_pnl:
+                                    # For mean calculation, we can use final equity estimates
+                                    # This is a simplified calculation
+                                    episode_equities_db.append(100000.0 + ep_pnl)
+                            
+                            if episode_pnls_db:
+                                mean_pnl_10 = float(sum(episode_pnls_db) / len(episode_pnls_db))
+                            if episode_win_rates_db:
+                                mean_win_rate_10 = float(sum(episode_win_rates_db) / len(episode_win_rates_db))
+                            if episode_equities_db:
+                                mean_equity_10 = float(sum(episode_equities_db) / len(episode_equities_db))
                         
-                        if episode_pnls_db:
-                            mean_pnl_10 = float(sum(episode_pnls_db) / len(episode_pnls_db))
-                        if episode_win_rates_db:
-                            mean_win_rate_10 = float(sum(episode_win_rates_db) / len(episode_win_rates_db))
-                        if episode_equities_db:
-                            mean_equity_10 = float(sum(episode_equities_db) / len(episode_equities_db))
-                    
-                    conn.close()
-            except Exception as e:
-                # Database fallback failed - use zeros
-                print(f"[WARN] Failed to calculate mean metrics from database: {e}")
-                pass
-        
-        # DEBUG: Add diagnostic information for timestep issue
-        debug_info = {}
-        if trainer:
-            debug_info = {
-                "timestep_raw": trainer.timestep,
-                "episode_raw": trainer.episode,
-                "current_episode_length": getattr(trainer, 'current_episode_length', 0),
-                "episode_lengths_count": len(trainer.episode_lengths) if hasattr(trainer, 'episode_lengths') else 0,
-                "last_episode_length": trainer.episode_lengths[-1] if hasattr(trainer, 'episode_lengths') and trainer.episode_lengths else 0,
-                "training_loop_active": hasattr(trainer, 'timestep') and trainer.timestep >= 0,
+                        conn.close()
+                except Exception as e:
+                    # Database fallback failed - use zeros
+                    print(f"[WARN] Failed to calculate mean metrics from database: {e}")
+                    pass
+            
+            # DEBUG: Add diagnostic information for timestep issue
+            debug_info = {}
+            if trainer:
+                debug_info = {
+                    "timestep_raw": trainer.timestep,
+                    "episode_raw": trainer.episode,
+                    "current_episode_length": getattr(trainer, 'current_episode_length', 0),
+                    "episode_lengths_count": len(trainer.episode_lengths) if hasattr(trainer, 'episode_lengths') else 0,
+                    "last_episode_length": trainer.episode_lengths[-1] if hasattr(trainer, 'episode_lengths') and trainer.episode_lengths else 0,
+                    "training_loop_active": hasattr(trainer, 'timestep') and trainer.timestep >= 0,
+                    "total_timesteps": trainer.total_timesteps,
+                }
+                # Check if timestep is stuck
+                if trainer.episode > 0 and trainer.timestep == 0:
+                    debug_info["warning"] = "Timestep is 0 but episodes are progressing - training loop may not be executing properly"
+            
+            metrics = {
+                "episode": current_episode_number,  # Show current episode (completed + in-progress)
+                "completed_episodes": trainer.episode,  # Number of fully completed episodes
+                "timestep": trainer.timestep,
                 "total_timesteps": trainer.total_timesteps,
+                "progress_percent": float(trainer.timestep / trainer.total_timesteps * 100) if trainer.total_timesteps > 0 else 0.0,
+                "debug": debug_info,  # Add debug info to API response
+                "latest_reward": display_reward,  # Show current or latest completed reward
+                "current_episode_reward": current_episode_reward,  # Current in-progress reward
+                "mean_reward_10": mean_reward_10,
+                "latest_episode_length": display_length,  # Show current or latest completed length
+                "current_episode_length": current_episode_length,  # Current in-progress length
+                "mean_episode_length": mean_episode_length,
+                "total_episodes": len(trainer.episode_rewards),
+                # Trading metrics
+                "current_episode_trades": display_trades,
+                "current_episode_pnl": display_pnl,
+                "current_episode_equity": display_equity,
+                "current_episode_win_rate": display_win_rate * 100,  # Convert to percentage
+                "current_episode_max_drawdown": display_max_drawdown * 100,  # Convert to percentage
+                "total_trades": total_trades,  # All-time from database
+                "total_winning_trades": total_winning_trades,  # All-time from database
+                "total_losing_trades": total_losing_trades,  # All-time from database
+                "overall_win_rate": overall_win_rate,  # All-time from database
+                # Also include session-only counts for comparison
+                "session_trades": session_trades,
+                "session_winning_trades": session_winning,
+                "session_losing_trades": session_losing,
+                "mean_pnl_10": mean_pnl_10,
+                "mean_equity_10": mean_equity_10,
+                "mean_win_rate_10": mean_win_rate_10 * 100,  # Convert to percentage
+                # Risk/reward metrics for profitability monitoring
+                "avg_win": float(getattr(trainer, 'current_avg_win', 0.0)),
+                "avg_loss": float(getattr(trainer, 'current_avg_loss', 0.0)),
+                "risk_reward_ratio": float(getattr(trainer, 'current_risk_reward_ratio', 0.0)),
             }
-            # Check if timestep is stuck
-            if trainer.episode > 0 and trainer.timestep == 0:
-                debug_info["warning"] = "Timestep is 0 but episodes are progressing - training loop may not be executing properly"
-        
-        metrics = {
-            "episode": current_episode_number,  # Show current episode (completed + in-progress)
-            "completed_episodes": trainer.episode,  # Number of fully completed episodes
-            "timestep": trainer.timestep,
-            "total_timesteps": trainer.total_timesteps,
-            "progress_percent": float(trainer.timestep / trainer.total_timesteps * 100) if trainer.total_timesteps > 0 else 0.0,
-            "debug": debug_info,  # Add debug info to API response
-            "latest_reward": display_reward,  # Show current or latest completed reward
-            "current_episode_reward": current_episode_reward,  # Current in-progress reward
-            "mean_reward_10": mean_reward_10,
-            "latest_episode_length": display_length,  # Show current or latest completed length
-            "current_episode_length": current_episode_length,  # Current in-progress length
-            "mean_episode_length": mean_episode_length,
-            "total_episodes": len(trainer.episode_rewards),
-            # Trading metrics
-            "current_episode_trades": display_trades,
-            "current_episode_pnl": display_pnl,
-            "current_episode_equity": display_equity,
-            "current_episode_win_rate": display_win_rate * 100,  # Convert to percentage
-            "current_episode_max_drawdown": display_max_drawdown * 100,  # Convert to percentage
-            "total_trades": total_trades,  # All-time from database
-            "total_winning_trades": total_winning_trades,  # All-time from database
-            "total_losing_trades": total_losing_trades,  # All-time from database
-            "overall_win_rate": overall_win_rate,  # All-time from database
-            # Also include session-only counts for comparison
-            "session_trades": session_trades,
-            "session_winning_trades": session_winning,
-            "session_losing_trades": session_losing,
-            "mean_pnl_10": mean_pnl_10,
-            "mean_equity_10": mean_equity_10,
-            "mean_win_rate_10": mean_win_rate_10 * 100,  # Convert to percentage
-            # Risk/reward metrics for profitability monitoring
-            "avg_win": float(getattr(trainer, 'current_avg_win', 0.0)),
-            "avg_loss": float(getattr(trainer, 'current_avg_loss', 0.0)),
-            "risk_reward_ratio": float(getattr(trainer, 'current_risk_reward_ratio', 0.0)),
-        }
-        
-        # Get latest training metrics if available (from last update)
-        if hasattr(trainer, 'last_update_metrics') and trainer.last_update_metrics:
-            metrics["training_metrics"] = trainer.last_update_metrics
-        
-        # Determine status based on trainer activity
-        # If trainer is active (timestep < total_timesteps), show as running
-        if trainer_active:
-            status = "running"
-            message = "Training in progress"
-        elif system.get("completed", False):
-            status = "completed" if not system.get("error") else "error"
-            message = system.get("error") or "Training completed successfully"
-        else:
-            # Trainer exists but might be in transition state
-            status = system.get("status", "running")
-            message = "Training in progress"
-        
-        # Include actual training mode being used by the trainer
-        performance_mode = getattr(trainer, 'performance_mode', 'quiet')
-        
-        # Check settings.json for turbo_training_mode to ensure accuracy
-        # Turbo mode overrides performance_mode in settings
-        import json
-        from pathlib import Path
-        settings_file = Path("settings.json")
-        if settings_file.exists():
-            try:
-                with open(settings_file, 'r') as f:
-                    settings = json.load(f)
-                    if settings.get("turbo_training_mode", False):
-                        performance_mode = "turbo"
-            except:
-                pass
-        
-        training_mode_info = {
-            "performance_mode": performance_mode,
-        }
-        
-        # Debug: Log what mode we're reporting
-        if not hasattr(trainer, '_last_logged_mode') or trainer._last_logged_mode != performance_mode:
-            print(f"[INFO] Training status API: Reporting mode = {performance_mode}, status = {status}")
-            trainer._last_logged_mode = performance_mode
-        
-        # Include checkpoint resume timestamp if available
-        checkpoint_resume_timestamp = system.get("checkpoint_resume_timestamp")
-        
-        return {
-            "status": status,
-            "message": message,
-            "metrics": metrics,
-            "training_mode": training_mode_info,
-            "checkpoint_resume_timestamp": checkpoint_resume_timestamp
-        }
+            
+            # Get latest training metrics if available (from last update)
+            if hasattr(trainer, 'last_update_metrics') and trainer.last_update_metrics:
+                metrics["training_metrics"] = trainer.last_update_metrics
+            
+            # Determine status based on trainer activity
+            # If trainer is active (timestep > 0 and timestep < total_timesteps), show as running
+            # Use training_is_active (calculated above) instead of trainer_active (never updated)
+            if training_is_active:
+                status = "running"
+                message = "Training in progress"
+            elif system.get("completed", False):
+                status = "completed" if not system.get("error") else "error"
+                message = system.get("error") or "Training completed successfully"
+            else:
+                # Trainer exists but might be in transition state
+                status = system.get("status", "running")
+                message = "Training in progress"
+            
+            # Include actual training mode being used by the trainer
+            performance_mode = getattr(trainer, 'performance_mode', 'performance')
+            
+            # Check settings.json for turbo_training_mode to ensure accuracy
+            # Turbo mode overrides performance_mode in settings
+            import json
+            from pathlib import Path
+            settings_file = Path("settings.json")
+            if settings_file.exists():
+                try:
+                    with open(settings_file, 'r') as f:
+                        settings = json.load(f)
+                        if settings.get("turbo_training_mode", False):
+                            performance_mode = "turbo"
+                except:
+                    pass
+            
+            training_mode_info = {
+                "performance_mode": performance_mode,
+            }
+            
+            # Debug: Log what mode we're reporting
+            if not hasattr(trainer, '_last_logged_mode') or trainer._last_logged_mode != performance_mode:
+                print(f"[INFO] Training status API: Reporting mode = {performance_mode}, status = {status}")
+                trainer._last_logged_mode = performance_mode
+            
+            # Include checkpoint resume timestamp if available
+            checkpoint_resume_timestamp = system.get("checkpoint_resume_timestamp")
+            
+            return {
+                "status": status,
+                "message": message,
+                "metrics": metrics,
+                "training_mode": training_mode_info,
+                "checkpoint_resume_timestamp": checkpoint_resume_timestamp
+            }
+        except Exception as e:
+            # If accessing trainer attributes fails, return minimal response immediately
+            # Don't wait - return cached values from system
+            print(f"[WARN] Error accessing trainer metrics (returning cached): {e}")
+            # Return cached values instead of error
+            return {
+                "status": system.get("status", "running"),
+                "message": "Training in progress",
+                "metrics": {
+                    "timestep": system.get("last_timestep", 0),
+                    "episode": system.get("last_episode", 0)
+                }
+            }
     
     # Fallback if trainer not available yet - check system status
     fallback_status = system.get("status", "idle")
@@ -2240,22 +2765,356 @@ async def training_status():
     }
 
 
+@app.get("/api/training/analyze-performance")
+async def analyze_trading_performance():
+    """
+    Analyze trading performance from journal database.
+    Returns diagnostic metrics to identify issues with win rate, direction, strategy compliance, etc.
+    """
+    import sqlite3
+    import pandas as pd
+    from pathlib import Path
+    
+    db_path = Path("logs/trading_journal.db")
+    
+    if not db_path.exists():
+        return {
+            "status": "error",
+            "message": "Trading journal database not found",
+            "data": None
+        }
+    
+    try:
+        # Add timeout to prevent hanging
+        conn = sqlite3.connect(str(db_path), timeout=10.0)
+        conn.execute("PRAGMA busy_timeout = 10000")  # 10 second timeout
+        
+        result = {}
+        
+        # 1. Overall Statistics
+        query = """
+            SELECT 
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN is_win = 0 THEN 1 ELSE 0 END) as losses,
+                AVG(CASE WHEN is_win = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate_pct,
+                AVG(net_pnl) as avg_pnl,
+                AVG(CASE WHEN is_win = 1 THEN net_pnl ELSE NULL END) as avg_win,
+                AVG(CASE WHEN is_win = 0 THEN ABS(net_pnl) ELSE NULL END) as avg_loss,
+                SUM(net_pnl) as total_pnl
+            FROM trades
+        """
+        df = pd.read_sql_query(query, conn)
+        if len(df) > 0:
+            row = df.iloc[0]
+            # Safely extract values with None checks
+            avg_win = float(row['avg_win']) if pd.notna(row['avg_win']) else 0.0
+            avg_loss = float(row['avg_loss']) if pd.notna(row['avg_loss']) else 0.0
+            total_pnl = float(row['total_pnl']) if pd.notna(row['total_pnl']) else 0.0
+            avg_pnl = float(row['avg_pnl']) if pd.notna(row['avg_pnl']) else 0.0
+            win_rate_pct = float(row['win_rate_pct']) if pd.notna(row['win_rate_pct']) else 0.0
+            
+            # Calculate risk_reward_ratio safely
+            risk_reward_ratio = 0.0
+            if pd.notna(row['avg_win']) and pd.notna(row['avg_loss']) and row['avg_loss'] > 0:
+                risk_reward_ratio = float(row['avg_win'] / row['avg_loss'])
+            
+            overall = {
+                "total_trades": int(row['total_trades']) if pd.notna(row['total_trades']) else 0,
+                "wins": int(row['wins']) if pd.notna(row['wins']) else 0,
+                "losses": int(row['losses']) if pd.notna(row['losses']) else 0,
+                "win_rate": win_rate_pct,
+                "avg_pnl": avg_pnl,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "total_pnl": total_pnl,
+                "risk_reward_ratio": risk_reward_ratio
+            }
+            result["overall"] = overall
+        
+        # 2. Exit Reason Breakdown
+        query = """
+            SELECT 
+                exit_reason,
+                COUNT(*) as count,
+                AVG(CASE WHEN is_win = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate_pct,
+                AVG(net_pnl) as avg_pnl,
+                SUM(net_pnl) as total_pnl
+            FROM trades
+            WHERE exit_reason IS NOT NULL
+            GROUP BY exit_reason
+            ORDER BY count DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        exit_reasons = []
+        total_exits = df['count'].sum() if len(df) > 0 else 1
+        for _, row in df.iterrows():
+            count_val = int(row['count']) if pd.notna(row['count']) else 0
+            exit_reasons.append({
+                "exit_reason": str(row['exit_reason']),
+                "count": count_val,
+                "percentage": float(count_val / total_exits * 100) if total_exits > 0 else 0.0,
+                "win_rate": float(row['win_rate_pct']) if pd.notna(row['win_rate_pct']) else 0.0,
+                "avg_pnl": float(row['avg_pnl']) if pd.notna(row['avg_pnl']) else 0.0,
+                "total_pnl": float(row['total_pnl']) if pd.notna(row['total_pnl']) else 0.0
+            })
+        result["exit_reasons"] = exit_reasons
+        
+        # 3. Direction Breakdown
+        query = """
+            SELECT 
+                direction,
+                COUNT(*) as total,
+                SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+                AVG(CASE WHEN is_win = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate_pct,
+                AVG(CASE WHEN is_win = 1 THEN net_pnl ELSE NULL END) as avg_win,
+                AVG(CASE WHEN is_win = 0 THEN ABS(net_pnl) ELSE NULL END) as avg_loss,
+                SUM(net_pnl) as total_pnl
+            FROM trades
+            WHERE direction IS NOT NULL
+            GROUP BY direction
+            ORDER BY total DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        directions = []
+        for _, row in df.iterrows():
+            directions.append({
+                "direction": str(row['direction']),
+                "total": int(row['total']) if pd.notna(row['total']) else 0,
+                "wins": int(row['wins']) if pd.notna(row['wins']) else 0,
+                "win_rate": float(row['win_rate_pct']) if pd.notna(row['win_rate_pct']) else 0.0,
+                "avg_win": float(row['avg_win']) if pd.notna(row['avg_win']) else 0.0,
+                "avg_loss": float(row['avg_loss']) if pd.notna(row['avg_loss']) else 0.0,
+                "total_pnl": float(row['total_pnl']) if pd.notna(row['total_pnl']) else 0.0
+            })
+        result["directions"] = directions
+        
+        # 4. Strategy Compliance Breakdown
+        query = """
+            SELECT 
+                CASE WHEN strategy_compliant = 1 THEN 'Compliant' ELSE 'Non-Compliant' END as compliance,
+                COUNT(*) as total,
+                SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+                AVG(CASE WHEN is_win = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate_pct,
+                AVG(net_pnl) as avg_pnl
+            FROM trades
+            WHERE strategy_compliant IS NOT NULL
+            GROUP BY strategy_compliant
+            ORDER BY total DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        compliance = []
+        for _, row in df.iterrows():
+            compliance.append({
+                "compliance": str(row['compliance']),
+                "total": int(row['total']) if pd.notna(row['total']) else 0,
+                "wins": int(row['wins']) if pd.notna(row['wins']) else 0,
+                "win_rate": float(row['win_rate_pct']) if pd.notna(row['win_rate_pct']) else 0.0,
+                "avg_pnl": float(row['avg_pnl']) if pd.notna(row['avg_pnl']) else 0.0
+            })
+        result["strategy_compliance"] = compliance
+        
+        # 5. Recent Trades (Last 20)
+        query = """
+            SELECT 
+                trade_id,
+                episode,
+                direction,
+                entry_price,
+                exit_price,
+                position_size,
+                net_pnl,
+                is_win,
+                exit_reason,
+                strategy_compliant
+            FROM trades
+            ORDER BY timestamp DESC
+            LIMIT 20
+        """
+        df = pd.read_sql_query(query, conn)
+        recent_trades = []
+        for _, row in df.iterrows():
+            recent_trades.append({
+                "trade_id": int(row['trade_id']) if pd.notna(row['trade_id']) else 0,
+                "episode": int(row['episode']) if pd.notna(row['episode']) else 0,
+                "direction": str(row['direction']) if pd.notna(row['direction']) else "UNKNOWN",
+                "entry_price": float(row['entry_price']) if pd.notna(row['entry_price']) else 0.0,
+                "exit_price": float(row['exit_price']) if pd.notna(row['exit_price']) else 0.0,
+                "position_size": float(row['position_size']) if pd.notna(row['position_size']) else 0.0,
+                "net_pnl": float(row['net_pnl']) if pd.notna(row['net_pnl']) else 0.0,
+                "is_win": bool(row['is_win'] == 1) if pd.notna(row['is_win']) else False,
+                "exit_reason": str(row['exit_reason']) if pd.notna(row['exit_reason']) else "UNKNOWN",
+                "strategy_compliant": bool(row['strategy_compliant'] == 1) if pd.notna(row['strategy_compliant']) else None
+            })
+        result["recent_trades"] = recent_trades
+        
+        # 6. Commission Impact
+        query = """
+            SELECT 
+                AVG(commission) as avg_commission,
+                AVG(CASE WHEN is_win = 1 THEN commission ELSE NULL END) as avg_commission_win,
+                AVG(CASE WHEN is_win = 0 THEN commission ELSE NULL END) as avg_commission_loss,
+                SUM(commission) as total_commission,
+                COUNT(*) as total_trades
+            FROM trades
+        """
+        df = pd.read_sql_query(query, conn)
+        if len(df) > 0:
+            row = df.iloc[0]
+            total_commission = float(row['total_commission']) if pd.notna(row['total_commission']) else 0.0
+            total_trades = int(row['total_trades']) if pd.notna(row['total_trades']) else 0
+            
+            result["commission"] = {
+                "avg_commission": float(row['avg_commission']) if pd.notna(row['avg_commission']) else 0.0,
+                "avg_commission_win": float(row['avg_commission_win']) if pd.notna(row['avg_commission_win']) else 0.0,
+                "avg_commission_loss": float(row['avg_commission_loss']) if pd.notna(row['avg_commission_loss']) else 0.0,
+                "total_commission": total_commission,
+                "commission_per_trade": float(total_commission / total_trades) if total_trades > 0 else 0.0
+            }
+        
+        # 7. Price Movement Analysis
+        query = """
+            SELECT 
+                direction,
+                AVG((exit_price - entry_price) / entry_price * 100) as avg_price_move_pct,
+                AVG(CASE WHEN is_win = 1 THEN (exit_price - entry_price) / entry_price * 100 ELSE NULL END) as avg_win_move_pct,
+                AVG(CASE WHEN is_win = 0 THEN (exit_price - entry_price) / entry_price * 100 ELSE NULL END) as avg_loss_move_pct
+            FROM trades
+            WHERE direction IS NOT NULL
+            GROUP BY direction
+        """
+        df = pd.read_sql_query(query, conn)
+        price_movements = []
+        for _, row in df.iterrows():
+            direction = str(row['direction']) if pd.notna(row['direction']) else "UNKNOWN"
+            avg_move = float(row['avg_price_move_pct']) if pd.notna(row['avg_price_move_pct']) else 0.0
+            avg_win_move = float(row['avg_win_move_pct']) if pd.notna(row['avg_win_move_pct']) else 0.0
+            avg_loss_move = float(row['avg_loss_move_pct']) if pd.notna(row['avg_loss_move_pct']) else 0.0
+            
+            warnings = []
+            if direction == 'LONG' and avg_move < 0:
+                warnings.append("LONG trades showing negative price moves (price going down)")
+            elif direction == 'SHORT' and avg_move > 0:
+                warnings.append("SHORT trades showing positive price moves (price going up)")
+            
+            price_movements.append({
+                "direction": direction,
+                "avg_price_move_pct": avg_move,
+                "avg_win_move_pct": avg_win_move,
+                "avg_loss_move_pct": avg_loss_move,
+                "warnings": warnings
+            })
+        result["price_movements"] = price_movements
+        
+        conn.close()
+        
+        # Validate result has minimum data
+        if not result.get("overall") or result["overall"].get("total_trades", 0) == 0:
+            return {
+                "status": "warning",
+                "message": "No trades found in journal. Analysis requires at least 1 trade.",
+                "data": {
+                    "overall": {
+                        "total_trades": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "win_rate": 0.0,
+                        "avg_pnl": 0.0,
+                        "avg_win": 0.0,
+                        "avg_loss": 0.0,
+                        "total_pnl": 0.0,
+                        "risk_reward_ratio": 0.0
+                    },
+                    "exit_reasons": [],
+                    "directions": [],
+                    "strategy_compliance": [],
+                    "recent_trades": [],
+                    "commission": {
+                        "avg_commission": 0.0,
+                        "total_commission": 0.0
+                    },
+                    "price_movements": []
+                }
+            }
+        
+        return {
+            "status": "success",
+            "message": "Analysis complete",
+            "data": result
+        }
+        
+    except sqlite3.OperationalError as e:
+        # Database locked or timeout
+        error_msg = str(e)
+        if "locked" in error_msg.lower() or "timeout" in error_msg.lower():
+            return {
+                "status": "error",
+                "message": "Database is busy. Please try again in a moment.",
+                "data": None
+            }
+        return {
+            "status": "error",
+            "message": f"Database error: {error_msg}",
+            "data": None
+        }
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[ERROR] Trading Performance Diagnostic failed: {error_trace}")
+        return {
+            "status": "error",
+            "message": f"Analysis failed: {str(e)}",
+            "data": None
+        }
+
 @app.post("/api/training/stop")
 async def stop_training():
     """Stop training"""
     if "training" not in active_systems:
         raise HTTPException(status_code=400, detail="No training in progress")
     
-    # Note: Actual stopping would require more complex coordination
-    active_systems.pop("training", None)
+    system = active_systems["training"]
+    trainer = system.get("trainer")
+    thread = system.get("thread")
+    
+    # Set stop flag on trainer if it has one
+    if trainer:
+        try:
+            # Try to set a stop flag on the trainer
+            if hasattr(trainer, 'stop_training'):
+                trainer.stop_training = True
+                print("[INFO] Stop flag set on trainer")
+            # Also try to set on environment if available
+            if hasattr(trainer, 'env') and trainer.env:
+                if hasattr(trainer.env, 'stop_training'):
+                    trainer.env.stop_training = True
+        except Exception as e:
+            print(f"[WARN] Could not set stop flag on trainer: {e}")
+    
+    # Mark as stopped in active_systems
+    if "training" in active_systems:
+        active_systems["training"]["status"] = "stopped"
+        active_systems["training"]["completed"] = True
+        active_systems["training"]["stopped"] = True
+    
+    # Remove from active_systems after a short delay to allow cleanup
+    # This allows the status endpoint to see it was stopped
+    import asyncio
+    async def cleanup_after_stop():
+        await asyncio.sleep(1)  # Give time for status to update
+        if "training" in active_systems:
+            active_systems.pop("training", None)
+    
+    # Schedule cleanup (don't await - let it run in background)
+    asyncio.create_task(cleanup_after_stop())
     
     await broadcast_message({
         "type": "training",
         "status": "stopped",
-        "message": "Training stopped"
+        "message": "Training stop requested"
     })
     
-    return {"status": "stopped", "message": "Training stopped"}
+    return {"status": "stopped", "message": "Training stop requested. Training will stop at next checkpoint."}
 
 
 @app.post("/api/backtest/run")
@@ -2307,11 +3166,13 @@ async def run_backtest(request: BacktestRequest, background_tasks: BackgroundTas
 async def list_models():
     """List available trained models and Ollama models"""
     models_dir = Path("models")
+    archive_dir = models_dir / "Archive"
     
     # Get trained RL models
     trained_models = []
     checkpoints = []
     if models_dir.exists():
+        # First, check main models directory
         for file in models_dir.glob("*.pt"):
             stat = file.stat()
             model_info = {
@@ -2319,7 +3180,8 @@ async def list_models():
                 "path": str(file),
                 "type": "trained",
                 "size": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "archived": False
             }
             
             # Classify as checkpoint or regular model
@@ -2334,6 +3196,77 @@ async def list_models():
             else:
                 model_info["is_checkpoint"] = False
                 trained_models.append(model_info)
+        
+        # Also check Archive subdirectories for checkpoints
+        if archive_dir.exists():
+            import re
+            for archive_folder in archive_dir.iterdir():
+                if archive_folder.is_dir():
+                    for file in archive_folder.glob("checkpoint*.pt"):
+                        try:
+                            stat = file.stat()
+                            model_info = {
+                                "name": file.name,
+                                "path": str(file),
+                                "type": "trained",
+                                "size": stat.st_size,
+                                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                                "archived": True,
+                                "archive_folder": archive_folder.name,
+                                "is_checkpoint": True
+                            }
+                            # Try to extract timestep from checkpoint filename
+                            # Handle multiple formats: checkpoint_1000.pt, checkpoint_episode_10_t10.pt
+                            match = re.search(r'checkpoint_(?:episode_\d+_t)?(\d+)\.pt', file.name)
+                            if match:
+                                model_info["timestep"] = int(match.group(1))
+                            else:
+                                # Fallback: use file modification time as timestep
+                                model_info["timestep"] = int(stat.st_mtime)
+                            checkpoints.append(model_info)
+                        except Exception as e:
+                            # Skip files that can't be read
+                            continue
+        
+        # CRITICAL FIX: Also check pretraining subdirectories for checkpoints
+        # Pretraining checkpoints are saved to models/pretraining/supervised/ and models/pretraining/unsupervised/
+        pretraining_dirs = [
+            models_dir / "pretraining" / "supervised",
+            models_dir / "pretraining" / "unsupervised"
+        ]
+        for pretraining_dir in pretraining_dirs:
+            if pretraining_dir.exists():
+                # Find all checkpoint files (checkpoint_epoch_X.pt, checkpoint_emergency_epoch_X.pt, checkpoint_final.pt)
+                for file in pretraining_dir.glob("checkpoint*.pt"):
+                    try:
+                        stat = file.stat()
+                        pretraining_type = "supervised" if "supervised" in str(pretraining_dir) else "unsupervised"
+                        model_info = {
+                            "name": file.name,
+                            "path": str(file),
+                            "type": "pretraining",
+                            "pretraining_type": pretraining_type,
+                            "size": stat.st_size,
+                            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                            "archived": False,
+                            "is_checkpoint": True
+                        }
+                        # Extract epoch from checkpoint filename
+                        # Formats: checkpoint_epoch_5.pt, checkpoint_emergency_epoch_10.pt, checkpoint_final.pt
+                        match = re.search(r'checkpoint_(?:emergency_)?epoch_(\d+)\.pt', file.name)
+                        if match:
+                            model_info["epoch"] = int(match.group(1))
+                            model_info["timestep"] = int(match.group(1))  # Use epoch as timestep for sorting
+                        elif "final" in file.name:
+                            model_info["epoch"] = 9999  # Final checkpoint gets highest epoch number
+                            model_info["timestep"] = 9999
+                        else:
+                            # Fallback: use file modification time
+                            model_info["timestep"] = int(stat.st_mtime)
+                        checkpoints.append(model_info)
+                    except Exception as e:
+                        # Skip files that can't be read
+                        continue
     
     # Get Ollama models
     ollama_models = []
@@ -2365,6 +3298,89 @@ async def list_models():
         "ollama_count": len(ollama_models),
         "checkpoint_count": len(checkpoints)
     }
+
+
+@app.post("/api/models/checkpoint/restore-latest")
+async def restore_latest_checkpoint():
+    """Restore the latest checkpoint from Archive to models/ directory"""
+    try:
+        # Import the restore function
+        import sys
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent
+        sys.path.insert(0, str(project_root))
+        
+        from restore_latest_checkpoint import restore_latest_checkpoint
+        
+        # Call the restore function with return_dict=True for API response
+        result = restore_latest_checkpoint(return_dict=True)
+        
+        if result.get("success"):
+            # Refresh models list after restore
+            # The frontend should call /api/models/list to refresh
+            
+            return {
+                "success": True,
+                "message": result.get("message", "Checkpoint restored successfully"),
+                "path": result.get("path"),
+                "timestep": result.get("timestep"),
+                "archived": result.get("archived", False),
+                "modified": result.get("modified")
+            }
+        else:
+            return {
+                "success": False,
+                "error": result.get("error", "Failed to restore checkpoint"),
+                "message": result.get("error", "Failed to restore checkpoint")
+            }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Error restoring checkpoint: {str(e)}"
+        }
+
+
+@app.post("/api/models/checkpoint/restore-latest")
+async def restore_latest_checkpoint_endpoint():
+    """Restore the latest checkpoint from Archive to models/ directory"""
+    try:
+        # Import the restore function
+        import sys
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent
+        sys.path.insert(0, str(project_root))
+        
+        from restore_latest_checkpoint import restore_latest_checkpoint
+        
+        # Call the restore function with return_dict=True for API response
+        result = restore_latest_checkpoint(return_dict=True)
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": result.get("message", "Checkpoint restored successfully"),
+                "path": result.get("path"),
+                "timestep": result.get("timestep"),
+                "archived": result.get("archived", False),
+                "modified": result.get("modified")
+            }
+        else:
+            return {
+                "success": False,
+                "error": result.get("error", "Failed to restore checkpoint"),
+                "message": result.get("error", "Failed to restore checkpoint")
+            }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Error restoring checkpoint: {str(e)}"
+        }
 
 
 @app.get("/api/models/checkpoint/info")
@@ -2408,22 +3424,58 @@ async def get_checkpoint_info(checkpoint_path: str):
         episode = checkpoint.get("episode", 0)
         
         # If not in checkpoint metadata, try to infer from state dict
-        if hidden_dims is None and "actor_state_dict" in checkpoint:
-            actor_state = checkpoint["actor_state_dict"]
+        # Check both RL checkpoints (actor_state_dict) and pretraining checkpoints (model_state_dict)
+        state_dict_key = None
+        if "actor_state_dict" in checkpoint:
+            state_dict_key = "actor_state_dict"
+        elif "model_state_dict" in checkpoint:
+            state_dict_key = "model_state_dict"
+        
+        if hidden_dims is None and state_dict_key:
+            actor_state = checkpoint[state_dict_key]
             inferred_dims = []
+            feature_prefix = None
             
-            # Infer from feature_layers
-            layer_idx = 0
-            while f"feature_layers.{layer_idx}.weight" in actor_state:
-                layer_shape = actor_state[f"feature_layers.{layer_idx}.weight"].shape
-                inferred_dims.append(layer_shape[0])
-                layer_idx += 3  # Skip ReLU and Dropout
+            # Try multiple possible prefixes for feature layers
+            for candidate in ["feature_layers", "encoder_based_ac.shared_layers", "shared_layers"]:
+                if f"{candidate}.0.weight" in actor_state:
+                    feature_prefix = candidate
+                    break
             
-            if inferred_dims:
-                hidden_dims = inferred_dims
-                # Get state_dim from first layer
-                if "feature_layers.0.weight" in actor_state:
-                    state_dim = actor_state["feature_layers.0.weight"].shape[1]
+            if feature_prefix:
+                layer_idx = 0
+                # Try different step sizes (3 for Linear+ReLU+Dropout, or 1 if no ReLU/Dropout)
+                step_sizes = [3, 2, 1]
+                for step_size in step_sizes:
+                    inferred_dims = []
+                    layer_idx = 0
+                    while f"{feature_prefix}.{layer_idx}.weight" in actor_state:
+                        layer_shape = actor_state[f"{feature_prefix}.{layer_idx}.weight"].shape
+                        inferred_dims.append(int(layer_shape[0]))
+                        layer_idx += step_size
+                    if inferred_dims:
+                        break
+                
+                if inferred_dims:
+                    hidden_dims = inferred_dims
+                    if state_dim is None and feature_prefix in ["feature_layers", "shared_layers"]:
+                        first_layer_shape = actor_state[f"{feature_prefix}.0.weight"].shape
+                        if len(first_layer_shape) >= 2:
+                            state_dim = int(first_layer_shape[1])
+            else:
+                # Try to infer from any Linear layer weights
+                # Look for patterns like "*.0.weight", "*.1.weight", etc.
+                layer_keys = [k for k in actor_state.keys() if ".weight" in k and "feature" in k.lower()]
+                if layer_keys:
+                    # Try to extract layer dimensions
+                    dims = []
+                    for key in sorted(layer_keys):
+                        if ".weight" in key:
+                            shape = actor_state[key].shape
+                            if len(shape) >= 2:
+                                dims.append(int(shape[0]))
+                    if dims:
+                        hidden_dims = dims[:3]  # Take first 3 layers
         
         return {
             "path": str(checkpoint_file),
@@ -2935,14 +3987,43 @@ async def systems_status():
         adaptive_params = {}
         last_adjustment = None
         adjustment_count = 0
+        recent_adaptive_logs = []  # PHASE 6: Initialize for log database integration
         
         # Check if adaptive training is being used
         if "training" in active_systems:
             system = active_systems["training"]
             trainer = system.get("trainer")
-            if trainer and hasattr(trainer, 'adaptive_trainer') and trainer.adaptive_trainer:
+            # Use try-except to prevent blocking on trainer attribute access
+            try:
+                has_adaptive = trainer and hasattr(trainer, 'adaptive_trainer') and trainer.adaptive_trainer
+            except:
+                has_adaptive = False
+            
+            if has_adaptive:
                 adaptive_status = "active"
                 adaptive_message = "Adaptive learning is active"
+                
+                # PHASE 6: Also get recent adaptive learning activity from log database
+                recent_adaptive_logs = []
+                try:
+                    from src.log_database import LogDatabase
+                    log_db = LogDatabase()
+                    # Get recent adaptive adjustment messages from log database
+                    adaptive_logs = log_db.query_logs(
+                        limit=10,
+                        categories=["adaptive_adjustment", "adaptive_stop_loss", "adaptive_enabled"]
+                    )
+                    recent_adaptive_logs = [
+                        {
+                            "timestamp": log.get("timestamp", ""),
+                            "message": log.get("message", "")[:200],  # Truncate long messages
+                            "category": log.get("category", "")
+                        }
+                        for log in adaptive_logs
+                    ]
+                except Exception as log_err:
+                    # Log database not available or error - continue without it
+                    pass
                 
                 # Get current parameters
                 if adaptive_config_path.exists():
@@ -2959,7 +4040,10 @@ async def systems_status():
                                 
                                 # CRITICAL FIX: Filter adjustments to current training session
                                 # Use episode number to filter (more reliable than timestamp when timestep is stuck)
-                                current_episode = trainer.episode if trainer else 0
+                                try:
+                                    current_episode = trainer.episode if trainer else 0
+                                except:
+                                    current_episode = 0
                                 session_adjustments = []
                                 
                                 # Get training start episode (if available from system)
@@ -3026,16 +4110,30 @@ async def systems_status():
             adaptive_status = "inactive"
             adaptive_message = "No training in progress"
         
+        # Get enabled status from trainer if available
+        enabled = False
+        if "training" in active_systems:
+            system = active_systems["training"]
+            trainer = system.get("trainer")
+            try:
+                if trainer and hasattr(trainer, 'adaptive_trainer') and trainer.adaptive_trainer:
+                    enabled = True
+            except:
+                enabled = False
+        
         components["adaptive_learning"] = {
             "status": adaptive_status,
+            "enabled": enabled,  # Explicitly set enabled flag
             "message": adaptive_message,
             "current_parameters": adaptive_params,
             "last_adjustment": last_adjustment,
-            "total_adjustments": adjustment_count
+            "total_adjustments": adjustment_count,
+            "recent_logs": recent_adaptive_logs  # PHASE 6: Include recent log activity from Real-Time Log Monitoring
         }
     except Exception as e:
         components["adaptive_learning"] = {
             "status": "error",
+            "enabled": False,
             "message": f"Error checking adaptive learning: {str(e)}"
         }
     
@@ -3065,15 +4163,19 @@ async def systems_status():
                         training_status = "unknown"
                         training_message = f"Training status: {status_info}"
                     
-                    # Check GPU usage
+                    # Check GPU usage (with timeout protection)
                     try:
                         import torch
                         if torch.cuda.is_available():
                             gpu_status = "available"
-                            if hasattr(trainer, 'device') and 'cuda' in str(trainer.device):
-                                gpu_status = "active"
-                                training_message += " (GPU)"
-                            else:
+                            try:
+                                if hasattr(trainer, 'device') and 'cuda' in str(trainer.device):
+                                    gpu_status = "active"
+                                    training_message += " (GPU)"
+                                else:
+                                    gpu_status = "available_not_used"
+                                    training_message += " (CPU)"
+                            except:
                                 gpu_status = "available_not_used"
                                 training_message += " (CPU)"
                         else:
@@ -3165,8 +4267,12 @@ async def systems_status():
         data_files_count = 0
         
         if raw_data_path.exists():
-            # Check for data files
-            data_files = list(raw_data_path.glob("*.csv")) + list(raw_data_path.glob("*.json"))
+            # Check for data files - include CSV, JSON, and TXT files (NT8 exports are typically .txt)
+            data_files = (
+                list(raw_data_path.glob("*.csv")) + 
+                list(raw_data_path.glob("*.json")) + 
+                list(raw_data_path.glob("*.txt"))
+            )
             data_files_count = len(data_files)
             
             if data_files_count > 0:
@@ -3314,30 +4420,64 @@ async def get_performance(since: Optional[str] = None):
             }
         
         # Build query with optional timestamp filter
-        conn = sqlite3.connect(str(db_path))
-        if since:
-            # Filter trades since the specified timestamp
-            # CRITICAL FIX: Log the filter to verify it's working
-            print(f"[PERFORMANCE API] Filtering trades since: {since}", flush=True)
-            query = """
-                SELECT 
-                    pnl, net_pnl, is_win, entry_price, exit_price, timestamp
-                FROM trades
-                WHERE timestamp >= ?
-                ORDER BY timestamp DESC
-            """
-            trades_df = pd.read_sql_query(query, conn, params=(since,))
-            print(f"[PERFORMANCE API] Found {len(trades_df)} trades after filtering (since {since})", flush=True)
-        else:
-            # Read all trades from journal (real-time data)
-            query = """
-                SELECT 
-                    pnl, net_pnl, is_win, entry_price, exit_price, timestamp
-                FROM trades
-                ORDER BY timestamp DESC
-            """
-            trades_df = pd.read_sql_query(query, conn)
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=10.0)
+            conn.execute("PRAGMA busy_timeout = 10000")  # 10 second timeout
+            
+            if since:
+                # Filter trades since the specified timestamp
+                # CRITICAL FIX: Log the filter to verify it's working
+                print(f"[PERFORMANCE API] Filtering trades since: {since}", flush=True)
+                query = """
+                    SELECT 
+                        pnl, net_pnl, is_win, entry_price, exit_price, timestamp
+                    FROM trades
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp DESC
+                """
+                trades_df = pd.read_sql_query(query, conn, params=(since,))
+                print(f"[PERFORMANCE API] Found {len(trades_df)} trades after filtering (since {since})", flush=True)
+            else:
+                # Read all trades from journal (real-time data)
+                query = """
+                    SELECT 
+                        pnl, net_pnl, is_win, entry_price, exit_price, timestamp
+                    FROM trades
+                    ORDER BY timestamp DESC
+                """
+                trades_df = pd.read_sql_query(query, conn)
+        except Exception as db_error:
+            print(f"[PERFORMANCE API] Database error: {db_error}", flush=True)
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+            return {
+                "status": "error",
+                "message": f"Database connection failed: {str(db_error)}",
+                "metrics": {
+                    "total_pnl": 0.0,
+                    "sharpe_ratio": 0.0,
+                    "sortino_ratio": 0.0,
+                    "win_rate": 0.0,
+                    "profit_factor": 0.0,
+                    "max_drawdown": 0.0,
+                    "total_trades": 0,
+                    "average_trade": 0.0,
+                    "source": "journal",
+                    "mean_pnl_10": 0.0,
+                    "risk_reward_ratio": 0.0,
+                    "filtered_since": None
+                }
+            }
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass  # Ignore errors when closing
         
         if len(trades_df) == 0:
             # No trades yet
@@ -3367,28 +4507,30 @@ async def get_performance(since: Optional[str] = None):
         loss_count = len(losing_trades)
         overall_win_rate = float(win_count / total_trades) if total_trades > 0 else 0.0
         
-        # PnL metrics
-        total_pnl = float(trades_df['net_pnl'].sum())
-        average_trade = float(trades_df['net_pnl'].mean())
+        # PnL metrics - handle None/NaN values safely
+        total_pnl = float(trades_df['net_pnl'].sum()) if pd.notna(trades_df['net_pnl'].sum()) else 0.0
+        average_trade = float(trades_df['net_pnl'].mean()) if pd.notna(trades_df['net_pnl'].mean()) else 0.0
         
         # Recent 10 trades for mean PnL
         recent_trades = trades_df.head(10) if len(trades_df) >= 10 else trades_df
-        mean_pnl_10 = float(recent_trades['net_pnl'].mean()) if len(recent_trades) > 0 else 0.0
+        mean_pnl_10 = float(recent_trades['net_pnl'].mean()) if len(recent_trades) > 0 and pd.notna(recent_trades['net_pnl'].mean()) else 0.0
         
-        # Risk metrics
-        avg_win = float(winning_trades['net_pnl'].mean()) if len(winning_trades) > 0 else 0.0
-        avg_loss = float(losing_trades['net_pnl'].mean()) if len(losing_trades) > 0 else 0.0
+        # Risk metrics - handle None/NaN values safely
+        avg_win = float(winning_trades['net_pnl'].mean()) if len(winning_trades) > 0 and pd.notna(winning_trades['net_pnl'].mean()) else 0.0
+        avg_loss = float(losing_trades['net_pnl'].mean()) if len(losing_trades) > 0 and pd.notna(losing_trades['net_pnl'].mean()) else 0.0
         
-        # Profit factor
+        # Profit factor - handle None/NaN values safely
         if avg_loss < 0:  # Losses are negative
-            gross_profit = float(winning_trades['net_pnl'].sum()) if len(winning_trades) > 0 else 0.0
-            gross_loss = abs(float(losing_trades['net_pnl'].sum())) if len(losing_trades) > 0 else 0.0
+            gross_profit_val = winning_trades['net_pnl'].sum() if len(winning_trades) > 0 else 0.0
+            gross_loss_val = losing_trades['net_pnl'].sum() if len(losing_trades) > 0 else 0.0
+            gross_profit = float(gross_profit_val) if pd.notna(gross_profit_val) else 0.0
+            gross_loss = abs(float(gross_loss_val)) if pd.notna(gross_loss_val) else 0.0
             profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
         else:
             profit_factor = 0.0
         
-        # Risk/reward ratio
-        risk_reward_ratio = abs(avg_win / avg_loss) if avg_loss < 0 else 0.0
+        # Risk/reward ratio - handle None/NaN values safely
+        risk_reward_ratio = abs(avg_win / avg_loss) if avg_loss < 0 and pd.notna(avg_win) and pd.notna(avg_loss) else 0.0
         
         # CRITICAL FIX #5: Sharpe ratio (from percentage returns, not raw PnL)
         # Get initial capital from config (default 100000.0)
@@ -3407,9 +4549,11 @@ async def get_performance(since: Optional[str] = None):
             pnl_values = trades_df['net_pnl'].values
             returns = pnl_values / initial_capital  # Percentage returns
             
-            # Calculate mean and std of returns
-            mean_return = float(np.mean(returns))
-            std_return = float(np.std(returns))
+            # Calculate mean and std of returns - handle NaN values
+            mean_return_val = np.mean(returns)
+            std_return_val = np.std(returns)
+            mean_return = float(mean_return_val) if pd.notna(mean_return_val) else 0.0
+            std_return = float(std_return_val) if pd.notna(std_return_val) else 0.0
             
             # Risk-free rate (default 0.0 for trading, can be configured)
             risk_free_rate = 0.0
@@ -3429,9 +4573,11 @@ async def get_performance(since: Optional[str] = None):
             pnl_values = trades_df['net_pnl'].values
             returns = pnl_values / initial_capital  # Percentage returns
             
-            mean_return = float(np.mean(returns))
+            mean_return_val = np.mean(returns)
+            mean_return = float(mean_return_val) if pd.notna(mean_return_val) else 0.0
             downside_returns = returns[returns < 0]
-            downside_std = float(np.std(downside_returns)) if len(downside_returns) > 0 else 0.0
+            downside_std_val = np.std(downside_returns) if len(downside_returns) > 0 else 0.0
+            downside_std = float(downside_std_val) if pd.notna(downside_std_val) else 0.0
             
             # Sortino ratio = (mean_return - risk_free_rate) / downside_std * sqrt(periods_per_year)
             risk_free_rate = 0.0
@@ -3442,11 +4588,11 @@ async def get_performance(since: Optional[str] = None):
         else:
             sortino_ratio = 0.0
         
-        # Max drawdown (cumulative)
+        # Max drawdown (cumulative) - handle None/NaN values safely
         cumulative = trades_df['net_pnl'].cumsum()
         running_max = cumulative.expanding().max()
         drawdown = cumulative - running_max
-        max_drawdown = float(abs(drawdown.min())) if len(drawdown) > 0 else 0.0
+        max_drawdown = float(abs(drawdown.min())) if len(drawdown) > 0 and pd.notna(drawdown.min()) else 0.0
         
         metrics = {
             "total_pnl": total_pnl,
@@ -3507,6 +4653,164 @@ async def get_journal_statistics():
         return {"status": "error", "message": str(e)}
 
 
+# ML/DL Insights API Endpoints (Phase 1)
+@app.get("/api/insights/analyze")
+async def get_insights_analysis():
+    """Get comprehensive ML/DL insights analysis"""
+    try:
+        # Load settings to check if insights are enabled
+        settings_path = project_root / "data" / "settings.json"
+        ml_insights_enabled = False
+        pattern_analysis_enabled = False
+        anomaly_detection_enabled = False
+        recommendations_enabled = False
+        
+        if settings_path.exists():
+            with open(settings_path, 'r') as f:
+                settings = json.load(f)
+                ml_insights_config = settings.get('ml_insights', {})
+                ml_insights_enabled = ml_insights_config.get('enabled', False)
+                pattern_analysis_enabled = ml_insights_config.get('pattern_analysis', {}).get('enabled', False)
+                anomaly_detection_enabled = ml_insights_config.get('anomaly_detection', {}).get('enabled', False)
+                recommendations_enabled = ml_insights_config.get('recommendations', {}).get('enabled', False)
+        
+        # If not enabled, return disabled status
+        if not ml_insights_enabled:
+            return {
+                "status": "disabled",
+                "message": "ML/DL Insights are disabled in settings",
+                "enabled": False
+            }
+        
+        # Run insights analysis
+        from src.insights.insights_analyzer import InsightsAnalyzer
+        from pathlib import Path
+        
+        # Check if LLM explanations are enabled
+        llm_explanations_enabled = False
+        if settings_path.exists():
+            with open(settings_path, 'r') as f:
+                settings = json.load(f)
+                ml_insights_config = settings.get('ml_insights', {})
+                llm_explanations_enabled = ml_insights_config.get('llm_explanations', {}).get('enabled', False)
+        
+        # Get existing reasoning engine if available (optional)
+        reasoning_engine = None
+        try:
+            from src.reasoning_engine import ReasoningEngine
+            reasoning_config = settings.get('reasoning', {}) if settings_path.exists() else {}
+            if reasoning_config.get('enabled', False):
+                import os
+                api_key = reasoning_config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("GROK_API_KEY")
+                reasoning_engine = ReasoningEngine(
+                    provider_type=reasoning_config.get("provider", "ollama"),
+                    model=reasoning_config.get("model", "deepseek-r1:8b"),
+                    api_key=api_key,
+                    base_url=reasoning_config.get("base_url"),
+                    timeout=int(reasoning_config.get("timeout", 2.0) * 60)
+                )
+        except Exception as e:
+            print(f"Warning: Could not initialize reasoning engine for explanations: {e}")
+        
+        analyzer = InsightsAnalyzer(
+            db_path=Path("logs/trading_journal.db"),
+            min_trades=20,
+            enabled=ml_insights_enabled,
+            pattern_analysis_enabled=pattern_analysis_enabled,
+            anomaly_detection_enabled=anomaly_detection_enabled,
+            recommendations_enabled=recommendations_enabled,
+            llm_explanations_enabled=llm_explanations_enabled,
+            reasoning_engine=reasoning_engine
+        )
+        
+        findings = analyzer.analyze()
+        
+        if findings is None:
+            return {
+                "status": "insufficient_data",
+                "message": "Insufficient trades for analysis (minimum 20 required)",
+                "enabled": True
+            }
+        
+        # Convert findings to dict
+            findings_dict = {
+                "sign_reversal_detected": findings.sign_reversal_detected,
+                "sign_reversal_direction": findings.sign_reversal_direction,
+                "reversal_exit_rate": findings.reversal_exit_rate,
+                "direction_win_rate_gap": findings.direction_win_rate_gap,
+                "commission_impact_ratio": findings.commission_impact_ratio,
+                "compliance_win_rate_gap": findings.compliance_win_rate_gap,
+                "overall_win_rate": findings.overall_win_rate,
+                "risk_reward_ratio": findings.risk_reward_ratio,
+                "total_trades": findings.total_trades,
+                "critical_issues": findings.critical_issues,
+                "pattern_analysis_enabled": findings.pattern_analysis_enabled,
+                "pattern_analysis_available": findings.pattern_analysis_available,
+                "key_patterns": findings.key_patterns,
+                "feature_importance": findings.feature_importance,
+                "anomaly_detection_enabled": findings.anomaly_detection_enabled,
+                "anomaly_detection_available": findings.anomaly_detection_available,
+                "anomaly_count": findings.anomaly_count,
+                "recent_anomalies": findings.recent_anomalies,
+                "recommendations_enabled": findings.recommendations_enabled,
+                "recommendations_available": findings.recommendations_available,
+                "recommendations": findings.recommendations,
+                "root_cause_analysis_available": findings.root_cause_analysis_available,
+                "failure_modes": findings.failure_modes,
+                "root_causes": findings.root_causes,
+                # Phase 2: Enhanced ML insights
+                "ml_insights": getattr(findings, 'ml_insights', []),
+                "model_metrics": getattr(findings, 'model_metrics', {}),
+                "clusters": getattr(findings, 'clusters', {}),
+                # Phase 6: LLM Explanations
+                "llm_explanations_enabled": getattr(findings, 'llm_explanations_enabled', False),
+                "recommendation_explanations": getattr(findings, 'recommendation_explanations', {}),
+                "pattern_explanations": getattr(findings, 'pattern_explanations', {}),
+                "anomaly_explanations": getattr(findings, 'anomaly_explanations', {}),
+                "root_cause_explanations": getattr(findings, 'root_cause_explanations', {})
+            }
+        
+        return {
+            "status": "success",
+            "findings": findings_dict,
+            "enabled": True
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/insights/status")
+async def get_insights_status():
+    """Get ML/DL Insights system status"""
+    try:
+        settings_path = project_root / "data" / "settings.json"
+        status = {
+            "enabled": False,
+            "pattern_analysis_enabled": False,
+            "anomaly_detection_enabled": False,
+            "recommendations_enabled": False,
+            "auto_apply_recommendations": False
+        }
+        
+        if settings_path.exists():
+            with open(settings_path, 'r') as f:
+                settings = json.load(f)
+                ml_insights_config = settings.get('ml_insights', {})
+                status["enabled"] = ml_insights_config.get('enabled', False)
+                status["pattern_analysis_enabled"] = ml_insights_config.get('pattern_analysis', {}).get('enabled', False)
+                status["anomaly_detection_enabled"] = ml_insights_config.get('anomaly_detection', {}).get('enabled', False)
+                status["recommendations_enabled"] = ml_insights_config.get('recommendations', {}).get('enabled', False)
+                status["auto_apply_recommendations"] = ml_insights_config.get('recommendations', {}).get('auto_apply', False)
+        
+        return {"status": "success", "insights_status": status}
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/api/monitoring/forecast-performance")
 async def get_forecast_performance(since: Optional[str] = None):
     """Get forecast features performance analysis"""
@@ -3535,8 +4839,13 @@ async def get_forecast_performance(since: Optional[str] = None):
                 reward_config.get('include_regime_features', False) or
                 env_config.get('include_regime_features', False)
             )
+            # Check if strategy validator is enabled (adds +8 strategy features)
+            strategy_validator_config = reward_config.get('strategy_validator', {})
+            strategy_enabled = strategy_validator_config.get('enabled', False) if isinstance(strategy_validator_config, dict) else False
+            
             state_features = env_config.get('state_features', 900)
-            expected_state_dim = 900 + (5 if regime_enabled else 0) + (3 if forecast_enabled else 0)
+            # Calculate expected: base (900) + regime (+5) + forecast (+3) + strategy (+8)
+            expected_state_dim = 900 + (5 if regime_enabled else 0) + (3 if forecast_enabled else 0) + (8 if strategy_enabled else 0)
             
             config_info = {
                 "forecast_enabled": forecast_enabled,
@@ -3666,238 +4975,103 @@ async def get_forecast_performance(since: Optional[str] = None):
 
 
 @app.get("/api/monitoring/logs")
-async def get_log_messages(limit: int = 100, last_seen: Optional[str] = None):
+async def get_log_messages(limit: int = 100, last_seen: Optional[str] = None, category: Optional[str] = None):
     """
-    Get recent log messages matching key patterns (critical 0% win rate, adaptive learning, etc.)
-    Similar to monitor_backend_logs.py functionality but as an API endpoint.
+    Get recent log messages from database (PHASE 6: Database-backed logging).
+    
+    Replaces file parsing with database queries for better performance and scalability.
     
     Args:
         limit: Maximum number of log messages to return
         last_seen: Timestamp of last seen message (ISO format) to only return new messages
+        category: Filter by specific category (optional)
         
     Returns:
-        Dict with log messages categorized by type
+        Dict with log messages categorized by type (same format as before for backward compatibility)
     """
-    import re
     from collections import defaultdict
     
     try:
-        log_files = []
+        # PHASE 6: Use database instead of file parsing
+        try:
+            from src.log_database import LogDatabase
+            log_db = LogDatabase()
+        except Exception as db_err:
+            # Fallback to file parsing if database not available
+            return {
+                "status": "error",
+                "message": f"Database not available: {db_err}",
+                "messages": [],
+                "summary": {}
+            }
         
-        # Check backend_logs.txt (from --save-logs)
-        backend_log = project_root / "backend_logs.txt"
-        if backend_log.exists():
-            log_files.append(backend_log)
-        
-        # Check training log directories
-        logs_dir = project_root / "logs"
-        if logs_dir.exists():
-            training_dirs = sorted(
-                logs_dir.glob("ppo_training_*"),
-                key=lambda x: x.stat().st_mtime if x.exists() else 0,
-                reverse=True
-            )
-            if training_dirs:
-                log_dir = training_dirs[0]
-                log_files.extend(list(log_dir.glob("*.log")) + list(log_dir.glob("*.txt")))
-        
-        # Define CRITICAL patterns only (from monitor_backend_logs.py)
-        # Exclude trade and GPU noise - focus on adaptive learning and critical events
-        patterns = {
-            "critical_0_percent": [
-                r'\[CRITICAL\]\s*0%\s*WIN\s*RATE\s*DETECTED',
-                r'CRITICAL.*0%\s*WIN\s*RATE',
-                r'0%\s*WIN\s*RATE\s*DETECTED\s*\(Quick\s*Adjustment',
-                r'FIX 4.*FORCING.*EVALUATION.*0%.*win.*rate'
-            ],
-            "adaptive_adjustment": [
-                r'\[ADAPT\]\s*Quick\s*adjustment',
-                r'\[CRITICAL\]\s*0%\s*WIN\s*RATE\s*DETECTED.*Quick\s*Adjustment',
-                r'Entropy:.*->.*\(increased\s*exploration\)',
-                r'Inaction\s*Penalty:.*->.*\(encouraging\s*trading\)',
-                r'Confidence:.*->.*\(relaxed\)',
-                r'Quality:.*->.*\(relaxed\)',
-                r'EXPLORATION INCREASED|INACTION PENALTY INCREASED',
-                r'ADAPTIVE LEARNING FIX WORKING'
-            ],
-            "adaptive_stop_loss": [
-                r'\[ADAPTIVE STOP LOSS\]',
-                r'Adaptive\s*value:.*Change:',
-                r'ADAPTIVE STOP LOSS.*Overriding'
-            ],
-            "short_position": [
-                r'SHORT\s*@',
-                r'\[TRADE OPEN\].*SHORT',
-                r'Model Action=-.*SHORT',
-                r'DEBUG TRADE.*Action=-.*SHORT'
-            ],
-            "overconfident_model": [
-                r'\[ACTION DISTRIBUTION\].*Episode End Statistics',
-                r'WARNING:.*% of actions are near maximum.*overconfident',
-                r'⚠️.*WARNING:.*actions are near maximum',
-                r'100\.0% of actions are near maximum'
-            ],
-            "directional_bias": [
-                r'WARNING:.*% of actions are (LONG|SHORT).*directional bias',
-                r'DIRECTIONAL BIAS DETECTED',
-                r'\[CRITICAL\] DIRECTIONAL BIAS',
-                r'directional bias detected!'
-            ],
-            "rapid_drawdown": [
-                r'\[CRITICAL\] RAPID DRAWDOWN DETECTED',
-                r'RAPID DRAWDOWN RESPONSE',
-                r'drawdown.*10\.0%',
-                r'Drawdown:.*10\.[0-9]+%'
-            ],
-            "reward_collapse": [
-                r'\[CRITICAL\] REWARD COLLAPSE DETECTED',
-                r'REWARD COLLAPSE RESPONSE',
-                r'Mean Reward.*Last 20.*-0\.[5-9]',
-                r'reward collapse'
+        # Build category filter
+        categories = None
+        if category:
+            categories = [category]
+        else:
+            # Get all critical categories (same as before)
+            categories = [
+                "critical_0_percent",
+                "adaptive_adjustment",
+                "adaptive_stop_loss",
+                "overconfident_model",
+                "directional_bias",
+                "rapid_drawdown",
+                "reward_collapse",
+                "adaptive_enabled",
+                "strategy_violation"  # PHASE 6: Added strategy violation category
             ]
-        }
         
-        # Exclusion patterns - skip lines matching these (GPU, trade noise, etc.)
-        # BUT allow ACTION DISTRIBUTION warnings (overconfident model) - they're critical
-        exclusion_patterns = [
-            r'GPU|CUDA|cuda|gpu|memory|Memory',
-            r'\[TRADE OPEN\].*LONG',  # Only show SHORT, exclude LONG trades
-            r'\[TRADE CLOSE\]',  # Exclude trade close messages
-            r'DEBUG TRADE.*Action=1\.000',  # Exclude LONG action messages
-            r'Episode reset',  # Too noisy (but ACTION DISTRIBUTION is allowed)
-            r'\[DEBUG\]\s*Episode\s*reset',
-            r'Starting at step',  # Too noisy
-            # Don't exclude ACTION DISTRIBUTION - we want to capture overconfident warnings
-            r'INFO:.*GET.*api',  # Exclude API request logs
-            r'INFO:.*POST.*api',
-            r'WebSocket.*accepted',
-            r'connection open'
-        ]
+        # Query database with timeout protection
+        try:
+            import sqlite3
+            # Query logs (timeout is handled in LogDatabase.query_logs)
+            db_messages = log_db.query_logs(
+                limit=limit * 2,  # Get more to filter and sort
+                since_timestamp=last_seen,
+                categories=categories
+            )
+        except sqlite3.OperationalError as db_err:
+            # Database locked or timeout - return empty result instead of error
+            error_msg = str(db_err)
+            if "locked" in error_msg.lower() or "timeout" in error_msg.lower():
+                print(f"[WARN] Log database query timeout/locked: {db_err}")
+            else:
+                print(f"[WARN] Log database operational error: {db_err}")
+            db_messages = []
+        except Exception as db_err:
+            # Other database errors - return empty result
+            print(f"[WARN] Log database query error: {db_err}")
+            import traceback
+            traceback.print_exc()
+            db_messages = []
         
+        # Convert to expected format (backward compatibility)
         messages_by_category = defaultdict(list)
         all_messages = []
         
-        # Read recent lines from each log file
-        for log_file in log_files[:5]:  # Limit to first 5 files
-            if not log_file.exists():
-                continue
-            
-            try:
-                # Read last N lines (configurable, default to last 1000 lines)
-                max_lines_to_read = 1000
-                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
-                    recent_lines = [l.rstrip('\n\r') for l in (lines[-max_lines_to_read:] if len(lines) > max_lines_to_read else lines)]
-                    
-                    # Extract timestamp if available (format: [HH:MM:SS] or ISO format)
-                    for line in recent_lines:
-                        if not line.strip():
-                            continue
-                        
-                        # Skip lines matching exclusion patterns (GPU, trade noise, etc.)
-                        skip_line = False
-                        for exclusion_pattern in exclusion_patterns:
-                            if re.search(exclusion_pattern, line, re.IGNORECASE):
-                                skip_line = True
-                                break
-                        
-                        if skip_line:
-                            continue
-                        
-                        # Extract timestamp
-                        timestamp_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]|(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', line)
-                        timestamp = timestamp_match.group(1) or timestamp_match.group(2) if timestamp_match else None
-                        
-                        # Check if we should skip (based on last_seen timestamp)
-                        if last_seen and timestamp:
-                            try:
-                                if timestamp < last_seen:
-                                    continue
-                            except:
-                                pass  # If comparison fails, include the message
-                        
-                        # Special handling for ACTION DISTRIBUTION (multi-line messages)
-                        if 'ACTION DISTRIBUTION' in line.upper() or 'Episode End Statistics' in line:
-                            # Find current line index and capture following lines
-                            try:
-                                line_idx = recent_lines.index(line)
-                                context_lines = [line]
-                                # Capture up to 15 following lines for full statistics
-                                for i in range(1, min(15, len(recent_lines) - line_idx)):
-                                    if line_idx + i < len(recent_lines):
-                                        next_line = recent_lines[line_idx + i]
-                                        if next_line.strip():
-                                            # Stop if we hit another timestamp (new log entry)
-                                            if re.search(r'\[(\d{2}:\d{2}:\d{2})\]', next_line):
-                                                break
-                                            # Always include the line if it's part of statistics or warning
-                                            # Check if it looks like a statistics line (has numbers, colons, percentages, etc.)
-                                            if any(keyword in next_line.upper() for keyword in [
-                                                'TOTAL', 'MEAN', 'STD', 'RANGE', 'POSITIVE', 'NEGATIVE', 
-                                                'NEUTRAL', 'WARNING', 'OVERCONFIDENT', 'NEAR MAXIMUM', 
-                                                '100%', 'STATISTICS', ':', '%'
-                                            ]) or 'WARNING' in next_line.upper() or '⚠️' in next_line:
-                                                context_lines.append(next_line)
-                                            # Also stop if we've captured enough lines or hit an empty line followed by non-statistics
-                                            elif len(context_lines) > 10:
-                                                break
-                                                
-                                combined_message = '\n'.join(context_lines)
-                                # Only include if it contains the overconfidence warning (check for warning about 100% or near max)
-                                if 'WARNING' in combined_message.upper() and (
-                                    'overconfident' in combined_message.lower() or 
-                                    'near maximum' in combined_message.lower() or 
-                                    '100.0%' in combined_message or
-                                    re.search(r'100\.0?%\s+of\s+actions', combined_message, re.IGNORECASE)
-                                ):
-                                    msg_obj = {
-                                        "timestamp": timestamp or "",
-                                        "message": combined_message[:1000],  # Allow more for multi-line
-                                        "category": "overconfident_model",
-                                        "file": log_file.name
-                                    }
-                                    messages_by_category["overconfident_model"].append(msg_obj)
-                                    all_messages.append(msg_obj)
-                            except (ValueError, IndexError):
-                                pass  # Skip if can't process
-                            continue  # Skip to next line since we've handled ACTION DISTRIBUTION
-                        
-                        # Search for other CRITICAL patterns
-                        category = None
-                        for cat, cat_patterns in patterns.items():
-                            # Skip overconfident_model - handled above
-                            if cat == "overconfident_model":
-                                continue
-                            for pattern in cat_patterns:
-                                if re.search(pattern, line, re.IGNORECASE):
-                                    category = cat
-                                    break
-                            if category:
-                                break
-                        
-                        # ONLY include messages that match critical patterns
-                        if category:
-                            msg_obj = {
-                                "timestamp": timestamp or "",
-                                "message": line[:500],  # Truncate very long lines
-                                "category": category,
-                                "file": log_file.name
-                            }
-                            messages_by_category[category].append(msg_obj)
-                            all_messages.append(msg_obj)
-                            
-            except Exception as e:
-                # Skip files that can't be read
-                continue
+        for msg in db_messages:
+            msg_category = msg.get("category") or "unknown"
+            msg_obj = {
+                "timestamp": msg.get("timestamp", ""),
+                "message": msg.get("message", "")[:500],  # Truncate very long lines
+                "category": msg_category,
+                "file": msg.get("source_file", "unknown")
+            }
+            messages_by_category[msg_category].append(msg_obj)
+            all_messages.append(msg_obj)
         
-        # Sort all messages by timestamp (newest first) and limit
-        # Prioritize critical messages first (rapid drawdown, 0% win rate, reward collapse, directional bias, overconfident model)
+        # Sort all messages by timestamp (newest first) and prioritize critical categories
+        # Same priority order as before for consistency
         all_messages.sort(key=lambda x: (
             0 if x.get("category") == "rapid_drawdown" else (
                 1 if x.get("category") == "critical_0_percent" else (
                     2 if x.get("category") == "reward_collapse" else (
                         3 if x.get("category") == "directional_bias" else (
-                            4 if x.get("category") == "overconfident_model" else 5
+                            4 if x.get("category") == "overconfident_model" else (
+                                5 if x.get("category") == "strategy_violation" else 6
+                            )
                         )
                     )
                 )
@@ -3906,7 +5080,7 @@ async def get_log_messages(limit: int = 100, last_seen: Optional[str] = None):
         ), reverse=True)
         all_messages = all_messages[:limit]
         
-        # Get summary counts (only for critical categories)
+        # Get summary counts
         summary = {
             "total_messages": len(all_messages),
             "by_category": {cat: len(msgs) for cat, msgs in messages_by_category.items()},
@@ -3917,7 +5091,7 @@ async def get_log_messages(limit: int = 100, last_seen: Optional[str] = None):
             "status": "success",
             "messages": all_messages,
             "summary": summary,
-            "log_files_checked": [str(f.name) for f in log_files[:5]]
+            "source": "database"  # Indicate we're using database
         }
         
     except Exception as e:
@@ -3975,9 +5149,10 @@ async def restore_data_files(source: Optional[str] = None):
 async def preprocess_data():
     """
     Pre-process all data files and create cache files for fast training initialization.
+    Since preprocessing is fast, runs synchronously and returns results immediately.
     
     Returns:
-        Dict with preprocessing results
+        Dict with preprocessing status and results
     """
     try:
         import subprocess
@@ -3994,16 +5169,35 @@ async def preprocess_data():
                 "result": {}
             }
         
-        # Run the script and capture output
+        print(f"[INFO] Starting data preprocessing...")
+        start_time = time.time()
+        
+        # Run the script synchronously (it's fast, so no need for background)
+        # Use the same Python executable and environment
         process = subprocess.Popen(
             [sys.executable, str(script_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(project_root)
+            cwd=str(project_root),
+            env=os.environ.copy()  # Pass current environment
         )
         
-        stdout, stderr = process.communicate()
+        # Wait for completion with a reasonable timeout (5 minutes)
+        try:
+            stdout, stderr = process.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            return {
+                "status": "error",
+                "message": "Preprocessing timed out after 5 minutes",
+                "stdout": stdout,
+                "stderr": stderr,
+                "result": {}
+            }
+        
+        elapsed = time.time() - start_time
         
         # Check if processed files were created
         processed_dir = project_root / "data" / "processed"
@@ -4015,21 +5209,103 @@ async def preprocess_data():
                 str(f.name) for f in processed_dir.glob("*.pkl")
             ]
         
-        return {
+        # Store status for status endpoint
+        active_systems["preprocessing"] = {
             "status": "success" if process.returncode == 0 else "error",
             "return_code": process.returncode,
             "stdout": stdout,
             "stderr": stderr,
             "cache_files": cache_files,
-            "message": "Preprocessing completed successfully" if process.returncode == 0 else f"Preprocessing failed with return code {process.returncode}"
+            "completed": True,
+            "start_time": start_time,
+            "elapsed_seconds": elapsed
         }
+        
+        if process.returncode == 0:
+            print(f"[INFO] Preprocessing completed successfully in {elapsed:.1f}s")
+            print(f"[INFO] Created {len(cache_files)} cache files")
+            return {
+                "status": "success",
+                "message": f"Data preprocessing completed successfully in {elapsed:.1f}s. {len(cache_files)} cache files created.",
+                "return_code": process.returncode,
+                "stdout": stdout[-2000:] if len(stdout) > 2000 else stdout,  # Last 2000 chars
+                "stderr": stderr[-2000:] if len(stderr) > 2000 else stderr,  # Last 2000 chars
+                "cache_files": cache_files,
+                "elapsed_seconds": elapsed,
+                "result": {
+                    "cache_files": cache_files,
+                    "return_code": process.returncode
+                }
+            }
+        else:
+            print(f"[ERROR] Preprocessing failed with return code {process.returncode}")
+            print(f"[ERROR] stderr: {stderr[-500:] if stderr else 'No error output'}")
+            return {
+                "status": "error",
+                "message": f"Preprocessing failed with return code {process.returncode}",
+                "return_code": process.returncode,
+                "stdout": stdout[-2000:] if len(stdout) > 2000 else stdout,
+                "stderr": stderr[-2000:] if len(stderr) > 2000 else stderr,
+                "cache_files": cache_files,
+                "elapsed_seconds": elapsed,
+                "result": {}
+            }
         
     except Exception as e:
         import traceback
-        traceback.print_exc()
+        error_trace = traceback.format_exc()
+        print(f"[ERROR] Preprocessing exception: {e}")
+        print(error_trace)
         return {
             "status": "error",
-            "message": str(e),
+            "message": f"Preprocessing failed: {str(e)}",
+            "error": str(e),
+            "traceback": error_trace,
+            "result": {}
+        }
+
+
+@app.get("/api/data/preprocess/status")
+async def preprocess_data_status():
+    """
+    Get the current status of data preprocessing.
+    
+    Returns:
+        Dict with preprocessing status, progress, and results if completed
+    """
+    if "preprocessing" not in active_systems:
+        return {
+            "status": "idle",
+            "message": "No preprocessing in progress",
+            "result": {}
+        }
+    
+    preprocessing = active_systems["preprocessing"]
+    start_time = preprocessing.get("start_time", 0)
+    elapsed = time.time() - start_time if start_time > 0 else 0
+    
+    if preprocessing.get("completed", False):
+        # Preprocessing is done
+        return {
+            "status": preprocessing.get("status", "unknown"),
+            "message": preprocessing.get("status") == "success" and "Preprocessing completed successfully" or "Preprocessing failed",
+            "elapsed_seconds": int(elapsed),
+            "return_code": preprocessing.get("return_code"),
+            "stdout": preprocessing.get("stdout", ""),
+            "stderr": preprocessing.get("stderr", ""),
+            "cache_files": preprocessing.get("cache_files", []),
+            "error": preprocessing.get("error"),
+            "result": {
+                "cache_files": preprocessing.get("cache_files", []),
+                "return_code": preprocessing.get("return_code")
+            }
+        }
+    else:
+        # Preprocessing is still running
+        return {
+            "status": "running",
+            "message": f"Preprocessing in progress... ({int(elapsed)}s elapsed)",
+            "elapsed_seconds": int(elapsed),
             "result": {}
         }
 
@@ -4549,7 +5825,7 @@ async def assess_monte_carlo_risk(request: MonteCarloRiskRequest):
     
     Returns risk metrics including VaR, expected PnL, win probability, and optimal position size.
     """
-    if not MONTE_CARLO_AVAILABLE:
+    if not MONTE_CARLO_AVAILABLE or MonteCarloRiskAnalyzer is None:
         raise HTTPException(
             status_code=503,
             detail="Monte Carlo risk assessment not available. Ensure scipy is installed."
@@ -4575,8 +5851,10 @@ async def assess_monte_carlo_risk(request: MonteCarloRiskRequest):
         if price_data is None or len(price_data) < 10:
             # Use synthetic data if no real data available
             # Note: np is already imported at module level (line 26), no need for local import
+            # Use current_price if provided, otherwise default to 5000
+            base_price = request.current_price if request.current_price and request.current_price > 0 else 5000.0
             dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
-            synthetic_prices = request.current_price * (1 + np.random.randn(100).cumsum() * 0.01)
+            synthetic_prices = base_price * (1 + np.random.randn(100).cumsum() * 0.01)
             price_data = pd.DataFrame({
                 'close': synthetic_prices,
                 'open': synthetic_prices,
@@ -4634,6 +5912,10 @@ async def assess_monte_carlo_risk(request: MonteCarloRiskRequest):
         }
         
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[ERROR] Monte Carlo risk assessment failed: {e}")
+        print(f"[ERROR] Traceback: {error_trace}")
         raise HTTPException(
             status_code=500,
             detail=f"Monte Carlo risk assessment failed: {str(e)}"
@@ -4751,10 +6033,10 @@ async def predict_volatility_endpoint(request: VolatilityPredictionRequest):
     
     Returns volatility forecasts and trading recommendations.
     """
-    if not VOLATILITY_PREDICTOR_AVAILABLE:
+    if not VOLATILITY_PREDICTOR_AVAILABLE or VolatilityPredictor is None:
         raise HTTPException(
             status_code=503,
-            detail="Volatility prediction not available"
+            detail="Volatility prediction not available. Ensure required dependencies are installed."
         )
     
     try:
@@ -4812,6 +6094,10 @@ async def predict_volatility_endpoint(request: VolatilityPredictionRequest):
         }
         
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[ERROR] Volatility prediction failed: {e}")
+        print(f"[ERROR] Traceback: {error_trace}")
         raise HTTPException(
             status_code=500,
             detail=f"Volatility prediction failed: {str(e)}"
@@ -4833,10 +6119,10 @@ async def get_adaptive_position_sizing(request: AdaptiveSizingRequest):
         base_position: Base position size from RL agent (-1.0 to 1.0)
         current_price: Current market price (optional, for context)
     """
-    if not VOLATILITY_PREDICTOR_AVAILABLE:
+    if not VOLATILITY_PREDICTOR_AVAILABLE or VolatilityPredictor is None:
         raise HTTPException(
             status_code=503,
-            detail="Volatility prediction not available"
+            detail="Volatility prediction not available. Ensure required dependencies are installed."
         )
     
     try:
@@ -5413,6 +6699,341 @@ async def api_capability_feedback(request: CapabilityFeedbackRequest):
         },
     )
     return {"status": "ok"}
+
+
+# ============================================================================
+# Deep Research API Endpoints
+# ============================================================================
+
+@app.get("/api/research/list")
+async def list_research(
+    search: Optional[str] = None,
+    source: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    dateRange: Optional[str] = None,
+    max_results: int = 50
+):
+    """List research items from knowledge base"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        # Query knowledge base
+        results = system.query_knowledge_base(
+            query=search,
+            source_type=source if source != "all" else None,
+            limit=max_results
+        )
+        
+        # Format for frontend
+        research_items = []
+        for item in results:
+            research_items.append({
+                "id": item.get("item_id", "unknown"),
+                "title": item.get("title", "Unknown"),
+                "source_type": item.get("source_type", "unknown"),
+                "source_url": item.get("url", ""),
+                "date_published": item.get("date", datetime.now()).isoformat() if item.get("date") else None,
+                "date_analyzed": item.get("ingested_at", datetime.now()).isoformat() if item.get("ingested_at") else None,
+                "category": item.get("categories", [""])[0] if item.get("categories") else "unknown",
+                "impact_score": item.get("impact_score", {}).get("overall_score", 0.5) if isinstance(item.get("impact_score"), dict) else item.get("impact_score", 0.5),
+                "relevance_score": item.get("relevance_score", 0.5),
+                "status": item.get("status", "not_reviewed"),
+                "authors": item.get("authors", []),
+                "abstract": item.get("abstract", "")[:200] + "..." if item.get("abstract") else "",
+                "executive_summary": item.get("executive_summary", ""),
+                "technical_details": item.get("technical_details"),
+                "recommendations": item.get("recommendations", []),
+                "implementation_plan_path": item.get("implementation_plan_path")
+            })
+        
+        return JSONResponse(content={
+            "status": "success",
+            "research_items": research_items,
+            "total": len(research_items)
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.get("/api/research/{item_id}")
+async def get_research_detail(item_id: str):
+    """Get detailed research item information"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        # Get from knowledge base
+        results = system.query_knowledge_base(query=None, limit=1000)
+        item = next((r for r in results if r.get("item_id") == item_id), None)
+        
+        if not item:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "Research item not found"}
+            )
+        
+        # Format for frontend
+        research = {
+            "id": item.get("item_id", "unknown"),
+            "title": item.get("title", "Unknown"),
+            "source_type": item.get("source_type", "unknown"),
+            "source_url": item.get("url", ""),
+            "date_published": item.get("date", datetime.now()).isoformat() if item.get("date") else None,
+            "date_analyzed": item.get("ingested_at", datetime.now()).isoformat() if item.get("ingested_at") else None,
+            "category": item.get("categories", [""])[0] if item.get("categories") else "unknown",
+            "impact_score": item.get("impact_score", {}).get("overall_score", 0.5) if isinstance(item.get("impact_score"), dict) else item.get("impact_score", 0.5),
+            "relevance_score": item.get("relevance_score", 0.5),
+            "status": item.get("status", "not_reviewed"),
+            "authors": item.get("authors", []),
+            "abstract": item.get("abstract", ""),
+            "executive_summary": item.get("executive_summary", ""),
+            "technical_details": item.get("technical_details"),
+            "recommendations": item.get("recommendations", []),
+            "implementation_plan_path": item.get("implementation_plan_path"),
+            "synthesis": item.get("synthesis"),
+            "architecture_comparison": item.get("architecture_comparison")
+        }
+        
+        return JSONResponse(content={
+            "status": "success",
+            "research": research
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.post("/api/research/search")
+async def search_research(request: Dict[str, Any]):
+    """Search for research across sources"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        query = request.get("query", "")
+        sources = request.get("sources", [])
+        max_results = request.get("max_results", 20)
+        
+        # Search across sources
+        results = system.search(
+            query=query,
+            sources=sources if sources else None,
+            max_results=max_results
+        )
+        
+        # Format results
+        research_items = []
+        for item in results:
+            research_items.append({
+                "id": f"{item.source_type}:{item.source_id}",
+                "title": item.title,
+                "source_type": item.source_type,
+                "source_url": item.url if hasattr(item, 'url') else "",
+                "date_published": item.date.isoformat() if item.date else None,
+                "abstract": (item.abstract or item.content or "")[:200] + "..." if (item.abstract or item.content) else "",
+                "category": "unknown",
+                "impact_score": 0.5,
+                "status": "not_reviewed"
+            })
+        
+        return JSONResponse(content={
+            "status": "success",
+            "research_items": research_items,
+            "total": len(research_items)
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.post("/api/research/fetch")
+async def fetch_research(request: Dict[str, Any]):
+    """Fetch and analyze a specific research item"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        source_type = request.get("source_type")
+        source_id = request.get("source_id")
+        store = request.get("store", True)
+        generate_plan = request.get("generate_plan", False)
+        generate_doc = request.get("generate_doc", False)
+        
+        if not source_type or not source_id:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "source_type and source_id required"}
+            )
+        
+        # Fetch item
+        item = system.fetch(source_type, source_id, store_result=store)
+        
+        if not item:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "Research item not found"}
+            )
+        
+        # Analyze if requested
+        analysis = None
+        if store:
+            analysis = system.analyze_and_generate(
+                item=item,
+                generate_plan=generate_plan,
+                generate_doc=generate_doc,
+                check_alert=True,
+                deep_analysis=True,
+                compare_with_codebase=True
+            )
+        
+        return JSONResponse(content={
+            "status": "success",
+            "item": {
+                "id": f"{item.source_type}:{item.source_id}",
+                "title": item.title,
+                "source_type": item.source_type,
+                "source_id": item.source_id,
+                "abstract": item.abstract or "",
+                "date": item.date.isoformat() if item.date else None
+            },
+            "analysis": analysis
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.post("/api/research/feedback")
+async def add_research_feedback(request: Dict[str, Any]):
+    """Add feedback for a research item"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        item_id = request.get("item_id")
+        feedback_type = request.get("feedback_type")
+        metadata = request.get("metadata", {})
+        notes = request.get("notes")
+        
+        if not item_id or not feedback_type:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "item_id and feedback_type required"}
+            )
+        
+        system.add_feedback(
+            item_id=item_id,
+            feedback_type=feedback_type,
+            metadata=metadata,
+            notes=notes
+        )
+        
+        return JSONResponse(content={
+            "status": "success",
+            "message": "Feedback added successfully"
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.get("/api/research/stats")
+async def get_research_stats():
+    """Get Deep Research system statistics"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        stats = system.get_statistics()
+        feedback_stats = system.get_feedback_statistics()
+        
+        return JSONResponse(content={
+            "status": "success",
+            "stats": {
+                "total_items": stats.get("total_items", 0),
+                "by_source": stats.get("by_source", {}),
+                "vector_store_items": stats.get("vector_store_items", 0),
+                "code_snippets": stats.get("code_snippets", 0),
+                "citation_graph": stats.get("citation_graph", {}),
+                "feedback": feedback_stats
+            }
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.post("/api/research/semantic-search")
+async def semantic_search_research(request: Dict[str, Any]):
+    """Semantic search over research content"""
+    system = get_deep_research_system()
+    if not system:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Deep Research System not available"}
+        )
+    
+    try:
+        query = request.get("query", "")
+        top_k = request.get("top_k", 10)
+        
+        if not query:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "query required"}
+            )
+        
+        results = system.semantic_search(query=query, top_k=top_k)
+        
+        return JSONResponse(content={
+            "status": "success",
+            "results": results
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
 
 if __name__ == "__main__":
     uvicorn.run("src.api_server:app", host="0.0.0.0", port=8200, log_level="info", reload=False)
